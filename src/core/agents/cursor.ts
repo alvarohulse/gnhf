@@ -299,6 +299,9 @@ function usageFromRecord(usage: JsonRecord): TokenUsage | null {
     cacheReadTokens: cacheReadTokens ?? 0,
     cacheCreationTokens: cacheCreationTokens ?? 0,
     ...(hasValidReportedCost ? { reportedCostUsd } : {}),
+    ...(inputTokens === undefined || outputTokens === undefined
+      ? { tokensAvailable: false }
+      : {}),
   };
 }
 
@@ -396,6 +399,7 @@ export class CursorAgent implements Agent {
         outputTokens: 0,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       };
 
       child.stderr!.on("data", (data: Buffer) => {

@@ -517,6 +517,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         cacheReadTokens: result.usage.cacheReadTokens,
         cacheCreationTokens: result.usage.cacheCreationTokens,
         reportedCostUsd: result.usage.reportedCostUsd ?? null,
+        tokensAvailable: result.usage.tokensAvailable !== false,
         estimated: result.usage.estimated ?? false,
       });
 

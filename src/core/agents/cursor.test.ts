@@ -364,6 +364,72 @@ describe("CursorAgent", () => {
     });
   });
 
+  it("marks token usage unavailable when Cursor reports only cost", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const content = JSON.stringify({
+      success: true,
+      summary: "ok",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+    const promise = new CursorAgent().run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "assistant",
+      message: { content },
+    });
+    emitJson(proc, {
+      type: "result",
+      subtype: "success",
+      result: content,
+      usage: { cost_usd: 0.25 },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reportedCostUsd: 0.25,
+        tokensAvailable: false,
+      },
+    });
+  });
+
+  it("marks token usage unavailable when Cursor omits its usage receipt", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const content = JSON.stringify({
+      success: true,
+      summary: "ok",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+    const promise = new CursorAgent().run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "assistant",
+      message: { content },
+    });
+    emitJson(proc, {
+      type: "result",
+      subtype: "success",
+      result: content,
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        tokensAvailable: false,
+      },
+    });
+  });
+
   it("rejects stale structured output when the last assistant message is prose", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
