@@ -500,6 +500,7 @@ describe("ClaudeAgent", () => {
       type: "result",
       subtype: "success",
       is_error: false,
+      total_cost_usd: 0.42,
       usage: {
         input_tokens: 100,
         cache_read_input_tokens: 50,
@@ -528,6 +529,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 200,
       cacheReadTokens: 50,
       cacheCreationTokens: 10,
+      reportedCostUsd: 0.42,
     });
   });
 

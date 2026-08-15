@@ -1082,9 +1082,17 @@ describe("cli", () => {
     expect((schema.properties as Record<string, unknown>).scope).toBeDefined();
   });
 
-  it("passes max iteration and token caps to the orchestrator", async () => {
+  it("passes iteration, token, and reported-cost caps to the orchestrator", async () => {
     const { orchestratorCtor } = await runCliWithMocks(
-      ["ship it", "--max-iterations", "12", "--max-tokens", "3456"],
+      [
+        "ship it",
+        "--max-iterations",
+        "12",
+        "--max-tokens",
+        "3456",
+        "--max-reported-cost-usd",
+        "7.25",
+      ],
       {
         agent: "claude",
         agentPathOverride: {},
@@ -1099,7 +1107,21 @@ describe("cli", () => {
     expect(orchestratorCtor.mock.calls[0]?.[6]).toEqual({
       maxIterations: 12,
       maxTokens: 3456,
+      maxReportedCostUsd: 7.25,
     });
+  });
+
+  it("rejects a non-finite reported-cost cap", async () => {
+    await expect(
+      runCliWithMocks(["ship it", "--max-reported-cost-usd", "NaN"], {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: false,
+      }),
+    ).rejects.toThrow("process.exit unexpectedly called with 1");
   });
 
   it("passes push mode to the orchestrator when --push is set", async () => {

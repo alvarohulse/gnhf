@@ -102,6 +102,15 @@ function parseNonNegativeInteger(value: string): number {
   return parsed;
 }
 
+function parseNonNegativeNumber(value: string): number {
+  const parsed = Number(value);
+  if (value.trim() === "" || !Number.isFinite(parsed) || parsed < 0) {
+    throw new InvalidArgumentError("must be a non-negative finite number");
+  }
+
+  return parsed;
+}
+
 function parseMeteorFrequency(value: string): number {
   const parsed = parseNonNegativeInteger(value);
   if (parsed > MAX_METEOR_FREQUENCY) {
@@ -638,6 +647,11 @@ program
     parseNonNegativeInteger,
   )
   .option(
+    "--max-reported-cost-usd <amount>",
+    "Abort after the harness reports this total cost in USD",
+    parseNonNegativeNumber,
+  )
+  .option(
     "--stop-when <condition>",
     'End when the agent reports this condition, after any commit-failure repair; resumes reuse it, pass a new value to overwrite or "" to clear',
   )
@@ -680,6 +694,7 @@ program
         agent?: string;
         maxIterations?: number;
         maxTokens?: number;
+        maxReportedCostUsd?: number;
         stopWhen?: string;
         preventSleep?: boolean;
         worktree: boolean;
@@ -1083,6 +1098,7 @@ program
         startIteration,
         maxIterations: options.maxIterations,
         maxTokens: options.maxTokens,
+        maxReportedCostUsd: options.maxReportedCostUsd,
         stopWhen: effectiveStopWhen,
         commitMessage: effectiveCommitMessage,
         preventSleep: config.preventSleep,
@@ -1119,6 +1135,9 @@ program
         {
           maxIterations: options.maxIterations,
           maxTokens: options.maxTokens,
+          ...(options.maxReportedCostUsd !== undefined
+            ? { maxReportedCostUsd: options.maxReportedCostUsd }
+            : {}),
           stopWhen: effectiveStopWhen,
           ...(options.push ? { push: true } : {}),
           ...(options.worktree ? { preserveWorkspaceOnForceStop: true } : {}),
@@ -1272,6 +1291,7 @@ program
           failCount: finalState.failCount,
           totalInputTokens: finalState.totalInputTokens,
           totalOutputTokens: finalState.totalOutputTokens,
+          reportedCostUsd: finalState.reportedCostUsd,
           commitCount: finalState.commitCount,
           worktreePath,
         });

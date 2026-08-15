@@ -315,6 +315,7 @@ describe("CursorAgent", () => {
         outputTokens: 20,
         cacheReadTokens: 80,
         cacheWriteTokens: 5,
+        cost_usd: 0.25,
       },
     });
     proc.emit("close", 0);
@@ -331,6 +332,7 @@ describe("CursorAgent", () => {
         outputTokens: 20,
         cacheReadTokens: 80,
         cacheCreationTokens: 5,
+        reportedCostUsd: 0.25,
       },
     });
     expect(onMessage).toHaveBeenCalledWith("working...");
@@ -341,6 +343,7 @@ describe("CursorAgent", () => {
       outputTokens: 20,
       cacheReadTokens: 80,
       cacheCreationTokens: 5,
+      reportedCostUsd: 0.25,
     });
   });
 

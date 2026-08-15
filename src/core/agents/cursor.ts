@@ -269,12 +269,23 @@ function usageFromRecord(usage: JsonRecord): TokenUsage | null {
     "cache_creation_tokens",
     "cache_creation_input_tokens",
   ]);
+  const reportedCostUsd = numberField(usage, [
+    "costUsd",
+    "cost_usd",
+    "totalCostUsd",
+    "total_cost_usd",
+  ]);
+  const hasValidReportedCost =
+    reportedCostUsd !== undefined &&
+    Number.isFinite(reportedCostUsd) &&
+    reportedCostUsd >= 0;
 
   if (
     inputTokens === undefined &&
     outputTokens === undefined &&
     cacheReadTokens === undefined &&
-    cacheCreationTokens === undefined
+    cacheCreationTokens === undefined &&
+    !hasValidReportedCost
   ) {
     return null;
   }
@@ -284,6 +295,7 @@ function usageFromRecord(usage: JsonRecord): TokenUsage | null {
     outputTokens: outputTokens ?? 0,
     cacheReadTokens: cacheReadTokens ?? 0,
     cacheCreationTokens: cacheCreationTokens ?? 0,
+    ...(hasValidReportedCost ? { reportedCostUsd } : {}),
   };
 }
 

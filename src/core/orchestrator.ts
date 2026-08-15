@@ -46,6 +46,7 @@ export interface OrchestratorState {
   currentIteration: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  reportedCostUsd: number | null;
   // Sticky flag: true when at least one iteration's usage was reported as
   // estimated (e.g. an ACP adapter that doesn't emit usage_update). Once set,
   // it stays set for the rest of the run so totals are presented honestly.
@@ -74,6 +75,7 @@ export interface OrchestratorEvents {
 export interface RunLimits {
   maxIterations?: number;
   maxTokens?: number;
+  maxReportedCostUsd?: number;
   stopWhen?: string;
   push?: boolean;
   preserveWorkspaceOnForceStop?: boolean;
@@ -105,6 +107,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private pendingAbortReason: string | null = null;
   private pendingCommitFailure: string | null = null;
   private activeIterationTokensEstimated = false;
+  private reportedCostUnavailable = false;
   private loopDone = false;
   private stoppedEventEmitted = false;
 
@@ -117,6 +120,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     currentIteration: 0,
     totalInputTokens: 0,
     totalOutputTokens: 0,
+    reportedCostUsd: null,
     tokensEstimated: false,
     commitCount: 0,
     iterations: [],
@@ -257,6 +261,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       startIteration: this.state.currentIteration,
       maxIterations: this.limits.maxIterations,
       maxTokens: this.limits.maxTokens,
+      maxReportedCostUsd: this.limits.maxReportedCostUsd,
       push: this.limits.push === true,
       maxConsecutiveFailures: this.config.maxConsecutiveFailures,
       baseCommit: this.runInfo.baseCommit,
@@ -296,6 +301,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           consecutiveFailures: this.state.consecutiveFailures,
           totalInputTokens: this.state.totalInputTokens,
           totalOutputTokens: this.state.totalOutputTokens,
+          reportedCostUsd: this.state.reportedCostUsd,
           git: this.snapshotGitState(),
         });
 
@@ -424,6 +430,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         failCount: this.state.failCount,
         totalInputTokens: this.state.totalInputTokens,
         totalOutputTokens: this.state.totalOutputTokens,
+        reportedCostUsd: this.state.reportedCostUsd,
         commitCount: this.state.commitCount,
       });
     }
@@ -432,6 +439,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private async runIteration(prompt: string): Promise<RunIterationResult> {
     const baseInputTokens = this.state.totalInputTokens;
     const baseOutputTokens = this.state.totalOutputTokens;
+    const baseReportedCostUsd = this.state.reportedCostUsd ?? 0;
+    let iterationReportedCostAvailable = false;
 
     this.activeAbortController = new AbortController();
     this.pendingAbortReason = null;
@@ -440,10 +449,19 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     const onUsage = (usage: TokenUsage) => {
       this.state.totalInputTokens = baseInputTokens + usage.inputTokens;
       this.state.totalOutputTokens = baseOutputTokens + usage.outputTokens;
+      if (
+        usage.reportedCostUsd !== undefined &&
+        !this.reportedCostUnavailable
+      ) {
+        iterationReportedCostAvailable = true;
+        this.state.reportedCostUsd =
+          baseReportedCostUsd + usage.reportedCostUsd;
+      }
       this.activeIterationTokensEstimated = usage.estimated === true;
       this.emit("state", this.getState());
 
-      const reason = this.getTokenAbortReason();
+      const reason =
+        this.getTokenAbortReason() ?? this.getReportedCostAbortReason();
       if (
         reason &&
         this.activeAbortController &&
@@ -481,6 +499,14 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
       this.activeIterationTokensEstimated = false;
       if (result.usage.estimated) this.state.tokensEstimated = true;
+      if (result.usage.reportedCostUsd === undefined) {
+        this.reportedCostUnavailable = true;
+        this.state.reportedCostUsd = null;
+      } else if (!this.reportedCostUnavailable) {
+        iterationReportedCostAvailable = true;
+        this.state.reportedCostUsd =
+          baseReportedCostUsd + result.usage.reportedCostUsd;
+      }
 
       appendDebugLog("agent:run:end", {
         iteration: this.state.currentIteration,
@@ -490,6 +516,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         outputTokens: result.usage.outputTokens,
         cacheReadTokens: result.usage.cacheReadTokens,
         cacheCreationTokens: result.usage.cacheCreationTokens,
+        reportedCostUsd: result.usage.reportedCostUsd ?? null,
         estimated: result.usage.estimated ?? false,
       });
 
@@ -524,6 +551,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       };
     } catch (err) {
       const elapsedMs = Date.now() - agentStartedAt;
+      if (!iterationReportedCostAvailable) {
+        this.reportedCostUnavailable = true;
+        this.state.reportedCostUsd = null;
+      }
       if (this.activeIterationTokensEstimated) {
         this.state.tokensEstimated = true;
         this.activeIterationTokensEstimated = false;
@@ -747,7 +778,7 @@ ${this.pendingCommitFailure}
       return `max iterations reached (${this.limits.maxIterations})`;
     }
 
-    return this.getTokenAbortReason();
+    return this.getTokenAbortReason() ?? this.getReportedCostAbortReason();
   }
 
   private getPostIterationAbortReason(): string | null {
@@ -758,7 +789,7 @@ ${this.pendingCommitFailure}
       return `max iterations reached (${this.limits.maxIterations})`;
     }
 
-    return this.getTokenAbortReason();
+    return this.getTokenAbortReason() ?? this.getReportedCostAbortReason();
   }
 
   private getTokenAbortReason(): string | null {
@@ -769,6 +800,18 @@ ${this.pendingCommitFailure}
     if (totalTokens < this.limits.maxTokens) return null;
 
     return `max tokens reached (${totalTokens}/${this.limits.maxTokens})`;
+  }
+
+  private getReportedCostAbortReason(): string | null {
+    if (
+      this.limits.maxReportedCostUsd === undefined ||
+      this.state.reportedCostUsd === null ||
+      this.state.reportedCostUsd < this.limits.maxReportedCostUsd
+    ) {
+      return null;
+    }
+
+    return `max reported cost reached ($${this.state.reportedCostUsd.toFixed(2)}/$${this.limits.maxReportedCostUsd.toFixed(2)})`;
   }
 
   private finishGracefulStop(): void {

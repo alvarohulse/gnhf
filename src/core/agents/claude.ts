@@ -40,7 +40,7 @@ interface ClaudeResultEvent {
   type: "result";
   subtype: string;
   is_error?: boolean;
-  total_cost_usd: number;
+  total_cost_usd?: number;
   usage: {
     input_tokens: number;
     cache_read_input_tokens: number;
@@ -541,6 +541,13 @@ export class ClaudeAgent implements Agent {
         const usage = toTokenUsage(
           latestResultUsage ?? terminalResultEvent.usage,
         );
+        if (
+          terminalResultEvent.total_cost_usd !== undefined &&
+          Number.isFinite(terminalResultEvent.total_cost_usd) &&
+          terminalResultEvent.total_cost_usd >= 0
+        ) {
+          usage.reportedCostUsd = terminalResultEvent.total_cost_usd;
+        }
 
         onUsage?.(usage);
         resolve({ output, usage });

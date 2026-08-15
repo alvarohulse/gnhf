@@ -532,6 +532,147 @@ describe("Orchestrator stop limits", () => {
     });
   });
 
+  it("aborts when harness-reported cost reaches the configured cap", async () => {
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(
+        (_prompt, _cwd, options) =>
+          new Promise<AgentResult>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              reject(new Error("Agent was aborted"));
+            });
+            options?.onUsage?.({
+              inputTokens: 7,
+              outputTokens: 4,
+              cacheReadTokens: 0,
+              cacheCreationTokens: 0,
+              reportedCostUsd: 1.25,
+            });
+          }),
+      ),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxReportedCostUsd: 1 },
+    );
+
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(mockCommitAll).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith(
+      "max reported cost reached ($1.25/$1.00)",
+    );
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      reportedCostUsd: 1.25,
+    });
+  });
+
+  it("continues under other limits when the harness reports no cost", async () => {
+    const agent: Agent = {
+      name: "cursor",
+      run: vi.fn(async () => createSuccessResult()),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1, maxReportedCostUsd: 0 },
+    );
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      lastMessage: "max iterations reached (1)",
+      reportedCostUsd: null,
+    });
+  });
+
+  it("sums final harness-reported cost across iterations", async () => {
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: {
+          ...createSuccessResult().usage,
+          reportedCostUsd: 0.4,
+        },
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 2, maxReportedCostUsd: 5 },
+    );
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(2);
+    expect(orchestrator.getState().reportedCostUsd).toBeCloseTo(0.8);
+  });
+
+  it("keeps total cost unknown after an iteration reports no cost", async () => {
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    const agent: Agent = {
+      name: "cursor",
+      run: vi.fn(async () => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error("transient error");
+        }
+        return {
+          ...createSuccessResult(),
+          usage: {
+            ...createSuccessResult().usage,
+            reportedCostUsd: 0.4,
+          },
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 2, maxReportedCostUsd: 5 },
+    );
+
+    const startPromise = orchestrator.start();
+    await vi.waitFor(() => {
+      expect(agent.run).toHaveBeenCalledTimes(1);
+    });
+    await vi.waitFor(() => {
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await startPromise;
+
+    expect(orchestrator.getState().reportedCostUsd).toBeNull();
+  });
+
   it("marks in-flight usage as estimated until authoritative usage arrives", async () => {
     const observedEstimatedStates: boolean[] = [];
     const agent: Agent = {
