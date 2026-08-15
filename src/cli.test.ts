@@ -1397,9 +1397,9 @@ describe("cli", () => {
         /^\/repo-gnhf-worktrees\/ship-it-[0-9a-f]+$/,
       ),
     });
-    expect(writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0]).toBeLessThan(
-      createAgent.mock.invocationCallOrder[0]!,
-    );
+    expect(
+      writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0],
+    ).toBeLessThan(createAgent.mock.invocationCallOrder[0]!);
   });
 
   it("does not emit run:start from the Linux sleep-prevention wrapper process", async () => {
