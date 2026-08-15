@@ -85,6 +85,7 @@ interface CliMockOverrides {
   };
   stdinIsTTY?: boolean;
   consoleErrorSink?: unknown[][];
+  writeConfiguredWorktreeReceipt?: ReturnType<typeof vi.fn>;
 }
 
 async function runCliWithMocks(
@@ -119,6 +120,8 @@ async function runCliWithMocks(
   const startSleepPrevention =
     overrides.startSleepPrevention ??
     vi.fn(() => Promise.resolve({ type: "skipped", reason: "unsupported" }));
+  const writeConfiguredWorktreeReceipt =
+    overrides.writeConfiguredWorktreeReceipt ?? vi.fn();
   const telemetry = overrides.telemetry ?? {
     track: vi.fn(),
     pageview: vi.fn(),
@@ -219,6 +222,9 @@ async function runCliWithMocks(
   vi.doMock("./core/sleep.js", () => ({
     startSleepPrevention,
   }));
+  vi.doMock("./core/worktree-receipt.js", () => ({
+    writeConfiguredWorktreeReceipt,
+  }));
   vi.doMock("./core/telemetry.js", () => ({
     initDefaultTelemetry: vi.fn(),
     getDefaultTelemetry: vi.fn(() => telemetry),
@@ -313,6 +319,7 @@ async function runCliWithMocks(
     readStdinText,
     startSleepPrevention,
     telemetry,
+    writeConfiguredWorktreeReceipt,
   };
 }
 
@@ -1366,6 +1373,32 @@ describe("cli", () => {
     expect(createWorktree).toHaveBeenCalledTimes(1);
     expect(startSleepPrevention.mock.invocationCallOrder[0]).toBeLessThan(
       createWorktree.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("records the worktree before creating the agent", async () => {
+    const writeConfiguredWorktreeReceipt = vi.fn();
+    const { createAgent } = await runCliWithMocks(
+      ["ship it", "--worktree", "--preserve-worktree"],
+      {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: false,
+      },
+      { writeConfiguredWorktreeReceipt },
+    );
+
+    expect(writeConfiguredWorktreeReceipt).toHaveBeenCalledWith({
+      runInfo: stubRunInfo,
+      worktreePath: expect.stringMatching(
+        /^\/repo-gnhf-worktrees\/ship-it-[0-9a-f]+$/,
+      ),
+    });
+    expect(writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0]).toBeLessThan(
+      createAgent.mock.invocationCallOrder[0]!,
     );
   });
 

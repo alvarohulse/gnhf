@@ -63,6 +63,7 @@ import {
 } from "./core/commit-message.js";
 import { Orchestrator } from "./core/orchestrator.js";
 import { renderExitSummary } from "./core/exit-summary.js";
+import { writeConfiguredWorktreeReceipt } from "./core/worktree-receipt.js";
 import { MockOrchestrator } from "./mock-orchestrator.js";
 import { Renderer } from "./renderer.js";
 import { slugifyPrompt } from "./utils/slugify.js";
@@ -1068,6 +1069,10 @@ program
         }
 
         runInfo = initializeNewBranch(prompt, cwd, schemaOptions);
+      }
+
+      if (worktreePath !== null) {
+        writeConfiguredWorktreeReceipt({ runInfo, worktreePath });
       }
 
       await startConfiguredSleepPrevention();
