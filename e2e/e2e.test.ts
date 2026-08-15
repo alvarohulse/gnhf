@@ -520,6 +520,53 @@ describe("gnhf e2e", () => {
   }, 30_000);
 
   it.skipIf(process.platform === "win32")(
+    "preserves and records a zero-commit worktree when explicitly requested",
+    async () => {
+      const cwd = createRepo();
+      tempDirs.push(cwd);
+      const logDir = mkdtempSync(join(tmpdir(), "gnhf-e2e-logs-"));
+      tempDirs.push(logDir);
+      const mockLogPath = join(logDir, "mock-opencode.jsonl");
+      const worktreeParent = `${cwd}-gnhf-worktrees`;
+      tempDirs.push(worktreeParent);
+
+      const result = await runCli(
+        cwd,
+        [
+          "preserve empty worktree",
+          "--agent",
+          "opencode",
+          "--max-iterations",
+          "0",
+          "--prevent-sleep",
+          "off",
+          "--worktree",
+          "--preserve-worktree",
+        ],
+        { env: createTestEnv(mockLogPath, tempDirs) },
+      );
+
+      expect(result.code).toBe(0);
+      const worktreeDirs = readdirSync(worktreeParent);
+      expect(worktreeDirs).toHaveLength(1);
+      const worktreePath = join(worktreeParent, worktreeDirs[0]!);
+      expect(result.stderr).toContain(`worktree preserved at ${worktreePath}`);
+
+      const debugEvents = readJsonLines(
+        join(worktreePath, ".gnhf", "runs", worktreeDirs[0]!, "gnhf.log"),
+      );
+      expect(debugEvents).toContainEqual(
+        expect.objectContaining({
+          event: "worktree:preserved",
+          worktreePath,
+          reason: "requested",
+        }),
+      );
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
     "runs one iteration in --worktree mode and preserves the worktree with commits",
     async () => {
       const cwd = createRepo();

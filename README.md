@@ -186,6 +186,7 @@ Pass `--worktree` to run each agent in an isolated [git worktree](https://git-sc
 - Worktrees with commits are **preserved** after the run so you can review, merge, or cherry-pick the work. gnhf prints the path and cleanup command.
 - Re-running the same prompt with `--worktree` resumes a preserved matching worktree when possible; otherwise gnhf creates a suffixed worktree such as `<run-slug>-1` if the original name is unavailable.
 - Worktrees with **no commits** are automatically removed on exit unless a pending commit failure left uncommitted work to inspect or repair.
+- Add `--preserve-worktree` to keep the worktree on every exit path, including a zero-commit run. This flag requires `--worktree`; gnhf prints and records the retained path.
 - `--worktree` must be run from a non-gnhf branch (typically `main`).
 
 ## CLI Reference
@@ -209,6 +210,7 @@ If you run `gnhf` on an existing `gnhf/` branch with a different prompt, gnhf as
 | `--stop-when <cond>`     | End when the agent reports this condition, after any commit-failure repair; persists across resume | unlimited              |
 | `--prevent-sleep <mode>` | Prevent system sleep during the run (`on`/`off` or `true`/`false`)                                 | config file (`on`)     |
 | `--worktree`             | Run in a separate git worktree (enables multiple agents concurrently)                              | `false`                |
+| `--preserve-worktree`    | Keep the generated worktree after every exit path; requires `--worktree`                            | `false`                |
 | `--current-branch`       | Run on the current branch instead of creating a `gnhf/` branch                                     | `false`                |
 | `--push`                 | Push the current branch after each successful iteration                                            | `false`                |
 | `--meteor-frequency <n>` | Set TUI meteor frequency from 0 to 5 (`0` disables meteors)                                        | `3`                    |

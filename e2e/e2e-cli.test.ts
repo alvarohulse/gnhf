@@ -210,6 +210,19 @@ describe.concurrent("gnhf e2e cli", () => {
     });
   }, 15_000);
 
+  it("rejects --preserve-worktree without --worktree", async () => {
+    await withTemp(async (temp) => {
+      const cwd = createRepo(temp);
+
+      const result = await runCli(cwd, ["ship it", "--preserve-worktree"]);
+
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain(
+        "Cannot use --preserve-worktree without --worktree",
+      );
+    });
+  }, 15_000);
+
   it("uses config.agent when --agent flag is omitted", async () => {
     await withTemp(async (temp) => {
       const cwd = createRepo(temp);

@@ -585,6 +585,11 @@ program
     false,
   )
   .option(
+    "--preserve-worktree",
+    "Keep the generated worktree after every exit path (requires --worktree)",
+    false,
+  )
+  .option(
     "--current-branch",
     "Run on the current branch instead of creating a gnhf branch",
     false,
@@ -611,6 +616,7 @@ program
         stopWhen?: string;
         preventSleep?: boolean;
         worktree: boolean;
+        preserveWorktree: boolean;
         currentBranch: boolean;
         push: boolean;
         meteorFrequency: number;
@@ -695,12 +701,17 @@ program
       let effectiveCwd = cwd;
       let worktreePath: string | null = null;
       let worktreeCleanup: (() => void) | null = null;
+      let worktreePreservationReason: "requested" | "resumed" | null = null;
 
       const currentBranch = getCurrentBranch(cwd);
       const onGnhfBranch = currentBranch.startsWith("gnhf/");
 
       if (options.currentBranch && options.worktree) {
         console.error("Cannot combine --current-branch and --worktree.");
+        process.exit(1);
+      }
+      if (options.preserveWorktree && !options.worktree) {
+        console.error("Cannot use --preserve-worktree without --worktree.");
         process.exit(1);
       }
 
@@ -739,6 +750,12 @@ program
         effectiveCwd = wt.effectiveCwd;
         worktreePath = wt.worktreePath;
 
+        if (options.preserveWorktree) {
+          worktreePreservationReason = "requested";
+        } else if (wt.resumed) {
+          worktreePreservationReason = "resumed";
+        }
+
         if (wt.resumed) {
           // Preserved worktree is always kept on exit regardless of this
           // invocation's commit count; previous commits are already there.
@@ -753,7 +770,7 @@ program
             `\n  gnhf: resuming preserved worktree at ${worktreePath}` +
               `\n  gnhf: continuing run ${runInfo.runId} from iteration ${startIteration}\n`,
           );
-        } else {
+        } else if (!options.preserveWorktree) {
           worktreeCleanup = () => {
             try {
               removeWorktree(cwd, wt.worktreePath);
@@ -1151,11 +1168,19 @@ program
         }
 
         if (worktreePath) {
-          if (
-            finalState.commitCount > 0 ||
-            finalState.hasPendingCommitFailure
-          ) {
+          const preservationReason =
+            worktreePreservationReason ??
+            (finalState.commitCount > 0
+              ? "committed"
+              : finalState.hasPendingCommitFailure
+                ? "pending-commit"
+                : null);
+          if (preservationReason !== null) {
             worktreeCleanup = null;
+            appendDebugLog("worktree:preserved", {
+              worktreePath,
+              reason: preservationReason,
+            });
             console.error(
               `\n  gnhf: worktree preserved at ${worktreePath}` +
                 `\n  gnhf: merge the branch and remove with: git worktree remove "${worktreePath}"\n`,
