@@ -116,6 +116,10 @@ export function ensureCleanWorkingTree(cwd: string): void {
   }
 }
 
+export function hasWorkingTreeChanges(cwd: string): boolean {
+  return git(["status", "--porcelain"], cwd).length > 0;
+}
+
 export function createBranch(branchName: string, cwd: string): void {
   git(["checkout", "-b", branchName], cwd);
 }

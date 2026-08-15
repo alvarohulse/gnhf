@@ -50,6 +50,10 @@ import {
 } from "./core/run.js";
 import { readStdinText } from "./core/stdin.js";
 import { startSleepPrevention } from "./core/sleep.js";
+import {
+  getWorktreePreservationReason,
+  type WorktreePreservationReason,
+} from "./core/worktree-preservation.js";
 import { createAgent } from "./core/agents/factory.js";
 import { getDefaultTelemetry, initDefaultTelemetry } from "./core/telemetry.js";
 import {
@@ -701,7 +705,34 @@ program
       let effectiveCwd = cwd;
       let worktreePath: string | null = null;
       let worktreeCleanup: (() => void) | null = null;
-      let worktreePreservationReason: "requested" | "resumed" | null = null;
+      let worktreePreservationReason:
+        | WorktreePreservationReason
+        | "requested"
+        | "resumed"
+        | null = null;
+      let worktreePreservationNoticeEmitted = false;
+      let readPendingCommitFailure = () => false;
+      const preserveWorktree = (
+        preservationReason:
+          | WorktreePreservationReason
+          | "requested"
+          | "resumed",
+      ) => {
+        if (worktreePath === null || worktreePreservationNoticeEmitted) {
+          return;
+        }
+        worktreeCleanup = null;
+        worktreePreservationReason = preservationReason;
+        worktreePreservationNoticeEmitted = true;
+        appendDebugLog("worktree:preserved", {
+          worktreePath,
+          reason: preservationReason,
+        });
+        console.error(
+          `\n  gnhf: worktree preserved at ${worktreePath}` +
+            `\n  gnhf: merge the branch and remove with: git worktree remove "${worktreePath}"\n`,
+        );
+      };
 
       const currentBranch = getCurrentBranch(cwd);
       const onGnhfBranch = currentBranch.startsWith("gnhf/");
@@ -724,7 +755,7 @@ program
         effectiveCommitMessage,
       );
 
-      let runInfo;
+      let runInfo: RunInfo;
       let startIteration = 0;
 
       if (options.worktree) {
@@ -756,6 +787,13 @@ program
           worktreePreservationReason = "resumed";
         }
 
+        if (worktreePreservationReason !== null) {
+          const exitPreservationReason = worktreePreservationReason;
+          process.on("exit", () => {
+            preserveWorktree(exitPreservationReason);
+          });
+        }
+
         if (wt.resumed) {
           // Preserved worktree is always kept on exit regardless of this
           // invocation's commit count; previous commits are already there.
@@ -784,9 +822,19 @@ program
           // crash to .catch to die to process.exit(1)).
           const exitCleanup = worktreeCleanup;
           process.on("exit", () => {
-            if (worktreeCleanup === exitCleanup) {
-              exitCleanup();
+            if (worktreeCleanup !== exitCleanup) {
+              return;
             }
+            const preservationReason = getWorktreePreservationReason(
+              runInfo.baseCommit,
+              wt.worktreePath,
+              readPendingCommitFailure(),
+            );
+            if (preservationReason !== null) {
+              preserveWorktree(preservationReason);
+              return;
+            }
+            exitCleanup();
           });
         }
       } else if (options.currentBranch) {
@@ -997,6 +1045,8 @@ program
           ...(options.push ? { push: true } : {}),
         },
       );
+      readPendingCommitFailure = () =>
+        orchestrator.getState().hasPendingCommitFailure === true;
       let shutdownSignal: NodeJS.Signals | null = null;
       let forceShutdownRequested = false;
 
@@ -1082,6 +1132,18 @@ program
           console.error(
             `\n  gnhf: shutdown timed out after ${FORCE_EXIT_TIMEOUT_MS / 1000}s, forcing exit\n`,
           );
+          if (worktreePath !== null) {
+            const preservationReason =
+              worktreePreservationReason ??
+              getWorktreePreservationReason(
+                runInfo.baseCommit,
+                worktreePath,
+                readPendingCommitFailure(),
+              );
+            if (preservationReason !== null) {
+              preserveWorktree(preservationReason);
+            }
+          }
           process.exit(getSignalExitCode(shutdownSignal ?? "SIGINT"));
         }
       } finally {
@@ -1170,21 +1232,13 @@ program
         if (worktreePath) {
           const preservationReason =
             worktreePreservationReason ??
-            (finalState.commitCount > 0
-              ? "committed"
-              : finalState.hasPendingCommitFailure
-                ? "pending-commit"
-                : null);
-          if (preservationReason !== null) {
-            worktreeCleanup = null;
-            appendDebugLog("worktree:preserved", {
+            getWorktreePreservationReason(
+              runInfo.baseCommit,
               worktreePath,
-              reason: preservationReason,
-            });
-            console.error(
-              `\n  gnhf: worktree preserved at ${worktreePath}` +
-                `\n  gnhf: merge the branch and remove with: git worktree remove "${worktreePath}"\n`,
+              finalState.hasPendingCommitFailure === true,
             );
+          if (preservationReason !== null) {
+            preserveWorktree(preservationReason);
           } else {
             worktreeCleanup?.();
             worktreeCleanup = null;

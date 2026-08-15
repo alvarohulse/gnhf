@@ -65,6 +65,8 @@ interface CliMockOverrides {
   listWorktreePaths?: ReturnType<typeof vi.fn>;
   worktreeExists?: ReturnType<typeof vi.fn>;
   getBranchDiffStats?: ReturnType<typeof vi.fn>;
+  getBranchCommitCount?: ReturnType<typeof vi.fn>;
+  hasWorkingTreeChanges?: ReturnType<typeof vi.fn>;
   peekRunMetadata?: ReturnType<typeof vi.fn>;
   resumeRun?: ReturnType<typeof vi.fn>;
   getLastIterationNumber?: ReturnType<typeof vi.fn>;
@@ -81,6 +83,7 @@ interface CliMockOverrides {
     close: ReturnType<typeof vi.fn>;
   };
   stdinIsTTY?: boolean;
+  consoleErrorSink?: unknown[][];
 }
 
 async function runCliWithMocks(
@@ -92,7 +95,11 @@ async function runCliWithMocks(
   const stdoutWrite = vi
     .spyOn(process.stdout, "write")
     .mockImplementation(() => true);
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+  const consoleError = vi
+    .spyOn(console, "error")
+    .mockImplementation((...args: unknown[]) => {
+      overrides.consoleErrorSink?.push(args);
+    });
   const exitSpy = vi.spyOn(process, "exit").mockImplementation(((
     code?: string | number | null,
   ) => {
@@ -196,6 +203,9 @@ async function runCliWithMocks(
         linesAdded: 1284,
         linesDeleted: 412,
       })),
+    getBranchCommitCount: overrides.getBranchCommitCount ?? vi.fn(() => 0),
+    hasWorkingTreeChanges:
+      overrides.hasWorkingTreeChanges ?? vi.fn(() => false),
   }));
   vi.doMock("./core/run.js", () => ({
     setupRun,
@@ -3213,6 +3223,76 @@ describe("cli", () => {
     );
 
     expect(removeWorktree).not.toHaveBeenCalled();
+  });
+
+  it("uses Git history to preserve committed work before forced exit", async () => {
+    vi.useFakeTimers();
+    const removeWorktree = vi.fn();
+    const consoleErrorSink: unknown[][] = [];
+    const exitHandlers: Array<() => void> = [];
+    const processOn = vi.spyOn(process, "on");
+    processOn.mockImplementation(((event: string, handler: () => void) => {
+      if (event === "exit") {
+        exitHandlers.push(handler);
+      }
+      return process;
+    }) as typeof process.on);
+
+    try {
+      const cliPromise = runCliWithMocks(
+        ["ship it", "--worktree"],
+        {
+          agent: "claude",
+          agentPathOverride: {},
+          agentArgsOverride: {},
+          acpRegistryOverrides: {},
+          maxConsecutiveFailures: 3,
+          preventSleep: false,
+        },
+        {
+          consoleErrorSink,
+          getBranchCommitCount: vi.fn(() => 1),
+          hasWorkingTreeChanges: vi.fn(() => false),
+          orchestratorStart: vi.fn(() => new Promise<void>(() => {})),
+          orchestratorGetState: vi.fn(() => ({
+            status: "running" as const,
+            currentIteration: 1,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+            commitCount: 0,
+            iterations: [],
+            successCount: 1,
+            failCount: 0,
+            consecutiveFailures: 0,
+            startTime: new Date("2026-01-01T00:00:00Z"),
+            waitingUntil: null,
+            lastMessage: null,
+          })),
+          removeWorktree,
+        },
+      );
+      const exitPromise = expect(cliPromise).rejects.toThrow(
+        "process.exit unexpectedly called with 1",
+      );
+
+      await vi.waitFor(() => {
+        expect(exitHandlers).toHaveLength(1);
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await exitPromise;
+
+      for (const handler of exitHandlers) {
+        handler();
+      }
+
+      expect(removeWorktree).not.toHaveBeenCalled();
+      expect(consoleErrorSink.flat().join("\n")).toContain(
+        "worktree preserved at",
+      );
+    } finally {
+      processOn.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("resumes a preserved suffixed worktree instead of creating another one", async () => {
