@@ -143,6 +143,23 @@ describe("CursorAgent", () => {
     expect(proc.stdin.end).toHaveBeenCalled();
   });
 
+  it("stays inside an external supervisor process group", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CursorAgent({
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+
+    agent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "cursor-agent",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
+    );
+  });
+
   it("uses a shell on Windows for cmd wrapper paths", () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);

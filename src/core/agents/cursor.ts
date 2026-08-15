@@ -100,6 +100,7 @@ interface CursorAgentDeps {
   finalResultGraceMs?: number;
   platform?: NodeJS.Platform;
   schema?: AgentOutputSchema;
+  supervisedProcessGroup?: boolean;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -156,6 +157,7 @@ function shouldUseWindowsShell(
 function terminateCursorProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
+  detached: boolean,
 ): void {
   if (platform === "win32" && child.pid) {
     try {
@@ -168,7 +170,7 @@ function terminateCursorProcess(
     return;
   }
 
-  if (child.pid) {
+  if (detached && child.pid) {
     try {
       process.kill(-child.pid, "SIGTERM");
       return;
@@ -183,14 +185,15 @@ function terminateCursorProcess(
 async function shutdownCursorProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
+  detached: boolean,
 ): Promise<void> {
   if (platform === "win32") {
-    terminateCursorProcess(child, platform);
+    terminateCursorProcess(child, platform, detached);
     return;
   }
 
   await shutdownChildProcess(child, {
-    detached: true,
+    detached,
   });
 }
 
@@ -336,6 +339,7 @@ export class CursorAgent implements Agent {
   private bin: string;
   private extraArgs?: string[];
   private finalResultGraceMs: number;
+  private detached: boolean;
   private platform: NodeJS.Platform;
   private schema: AgentOutputSchema;
 
@@ -344,6 +348,10 @@ export class CursorAgent implements Agent {
     this.finalResultGraceMs =
       deps.finalResultGraceMs ?? DEFAULT_FINAL_RESULT_EXIT_GRACE_MS;
     this.platform = deps.platform ?? process.platform;
+    const supervisedProcessGroup =
+      deps.supervisedProcessGroup ??
+      process.env.GNHF_SUPERVISED_PROCESS_GROUP === "1";
+    this.detached = this.platform !== "win32" && !supervisedProcessGroup;
     this.bin = deps.bin ?? resolveCursorBin(this.platform);
     this.schema =
       deps.schema ?? buildAgentOutputSchema({ includeStopField: false });
@@ -360,7 +368,7 @@ export class CursorAgent implements Agent {
       const logStream = logPath ? createWriteStream(logPath) : null;
       const child = spawn(this.bin, buildCursorArgs(this.extraArgs), {
         cwd,
-        detached: this.platform !== "win32",
+        detached: this.detached,
         shell: shouldUseWindowsShell(this.bin, this.platform),
         stdio: ["pipe", "pipe", "pipe"],
         env: process.env,
@@ -371,7 +379,7 @@ export class CursorAgent implements Agent {
 
       if (
         setupAbortHandler(signal, child, reject, () =>
-          terminateCursorProcess(child, this.platform),
+          terminateCursorProcess(child, this.platform, this.detached),
         )
       ) {
         return;
@@ -437,7 +445,7 @@ export class CursorAgent implements Agent {
           }
           finalResultCleanupTimer = setTimeout(() => {
             closedAfterFinalCleanup = true;
-            void shutdownCursorProcess(child, this.platform);
+            void shutdownCursorProcess(child, this.platform, this.detached);
           }, this.finalResultGraceMs);
         }
       });
