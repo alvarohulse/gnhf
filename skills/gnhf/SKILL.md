@@ -168,6 +168,7 @@ The supported `--agent` roster comes from `gnhf --help`; the [Agents table](../.
 ## Safety
 
 - Preserve user changes. Never run destructive git commands to clean up a GNHF branch.
+- Record the exact PID or process handle for every long-running process you start, then stop only those owned identities. Never use process-name, pattern-wide, or port-wide cleanup such as `pkill`, `killall`, `taskkill`, or `Stop-Process -Name`. This is a cleanup safeguard, not a process-security boundary.
 - In Companion mode, do not trust a worker's success summary without fresh verification.
 - Keep prompts outcome-based and evidence-based.
 - Use concrete stop conditions. Bad: "looks good". Good: "the target workflow succeeds, relevant checks pass, and no unrelated files changed."
