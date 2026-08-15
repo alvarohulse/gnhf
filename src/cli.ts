@@ -3,6 +3,7 @@ import {
   createReadStream,
   createWriteStream,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
@@ -75,6 +76,7 @@ const GNHF_REEXEC_STDIN_PROMPT = "GNHF_REEXEC_STDIN_PROMPT";
 const GNHF_REEXEC_STDIN_PROMPT_FILE = "GNHF_REEXEC_STDIN_PROMPT_FILE";
 const GNHF_REEXEC_STDIN_PROMPT_DIR_PREFIX = "gnhf-stdin-";
 const GNHF_REEXEC_STDIN_PROMPT_FILENAME = "prompt.txt";
+const PRESERVED_WORKTREE_RECORD_FILENAME = "preserved-worktree.json";
 const AGENT_NAME_SET = new Set<string>(AGENT_NAMES);
 const AGENT_NAME_LIST = `"${AGENT_NAMES.slice(0, -1).join('", "')}", or "${
   AGENT_NAMES[AGENT_NAMES.length - 1]
@@ -293,6 +295,61 @@ interface WorktreeRunResult {
   resumed: boolean;
 }
 
+function preserveWorktreeAfterSetupFailure(
+  worktreePath: string,
+  runId: string,
+  error: unknown,
+): void {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const recordPath = join(
+    worktreePath,
+    ".gnhf",
+    "runs",
+    runId,
+    PRESERVED_WORKTREE_RECORD_FILENAME,
+  );
+  let recordError: string | null = null;
+  try {
+    mkdirSync(dirname(recordPath), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      recordPath,
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          worktreePath,
+          reason: "setup-failed",
+          error: errorMessage,
+          recordedAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      )}\n`,
+      { encoding: "utf-8", mode: 0o600 },
+    );
+  } catch (recordFailure) {
+    recordError =
+      recordFailure instanceof Error
+        ? recordFailure.message
+        : String(recordFailure);
+  }
+
+  appendDebugLog("worktree:preserved", {
+    worktreePath,
+    reason: "setup-failed",
+    error: serializeError(error),
+    recordPath,
+    recordError,
+  });
+  console.error(
+    `\n  gnhf: worktree preserved at ${worktreePath}` +
+      `\n  gnhf: run metadata setup failed: ${errorMessage}` +
+      `\n  gnhf: preservation record: ${
+        recordError === null ? recordPath : `unavailable (${recordError})`
+      }` +
+      `\n  gnhf: remove only after review with: git worktree remove "${worktreePath}"\n`,
+  );
+}
+
 function initializeWorktreeRun(
   prompt: string,
   cwd: string,
@@ -390,13 +447,19 @@ function initializeWorktreeRun(
       }
     }
   }
-  const runInfo = setupRun(
-    createdRunId,
-    prompt,
-    baseCommit,
-    createdWorktreePath,
-    schemaOptions,
-  );
+  let runInfo: RunInfo;
+  try {
+    runInfo = setupRun(
+      createdRunId,
+      prompt,
+      baseCommit,
+      createdWorktreePath,
+      schemaOptions,
+    );
+  } catch (error) {
+    preserveWorktreeAfterSetupFailure(createdWorktreePath, createdRunId, error);
+    throw error;
+  }
   return {
     runInfo,
     worktreePath: createdWorktreePath,
@@ -1058,6 +1121,7 @@ program
           maxTokens: options.maxTokens,
           stopWhen: effectiveStopWhen,
           ...(options.push ? { push: true } : {}),
+          ...(options.worktree ? { preserveWorkspaceOnForceStop: true } : {}),
         },
       );
       readPendingCommitFailure = () =>
@@ -1148,16 +1212,7 @@ program
             `\n  gnhf: shutdown timed out after ${FORCE_EXIT_TIMEOUT_MS / 1000}s, forcing exit\n`,
           );
           if (worktreePath !== null) {
-            const preservationReason =
-              worktreePreservationReason ??
-              getWorktreePreservationReason(
-                runInfo.baseCommit,
-                worktreePath,
-                readPendingCommitFailure(),
-              );
-            if (preservationReason !== null) {
-              preserveWorktree(preservationReason);
-            }
+            preserveWorktree(worktreePreservationReason ?? "uncertain");
           }
           process.exit(getSignalExitCode(shutdownSignal ?? "SIGINT"));
         }

@@ -14,6 +14,9 @@ export function getWorktreePreservationReason(
   if (hasPendingCommitFailure) {
     return "pending-commit";
   }
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(baseCommit)) {
+    return "uncertain";
+  }
 
   try {
     if (getBranchCommitCount(baseCommit, cwd) > 0) {

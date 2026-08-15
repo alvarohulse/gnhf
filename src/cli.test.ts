@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { CONVENTIONAL_COMMIT_MESSAGE } from "./core/commit-message.js";
 import type { Config } from "./core/config.js";
@@ -61,6 +61,7 @@ interface CliMockOverrides {
   createBranch?: ReturnType<typeof vi.fn>;
   ensureCleanWorkingTree?: ReturnType<typeof vi.fn>;
   createWorktree?: ReturnType<typeof vi.fn>;
+  setupRun?: ReturnType<typeof vi.fn>;
   removeWorktree?: ReturnType<typeof vi.fn>;
   listWorktreePaths?: ReturnType<typeof vi.fn>;
   worktreeExists?: ReturnType<typeof vi.fn>;
@@ -125,7 +126,7 @@ async function runCliWithMocks(
   };
   let consoleErrorCalls: unknown[][] = [];
   let stdoutWriteCalls: unknown[][] = [];
-  const setupRun = vi.fn(() => stubRunInfo);
+  const setupRun = overrides.setupRun ?? vi.fn(() => stubRunInfo);
   const peekRunMetadata = overrides.peekRunMetadata ?? vi.fn(() => stubRunInfo);
   const resumeRun = overrides.resumeRun ?? vi.fn();
   const getLastIterationNumber =
@@ -3217,6 +3218,60 @@ describe("cli", () => {
     expect(listWorktreePaths).toHaveBeenCalledTimes(1);
   });
 
+  it("records and reports a worktree when run metadata setup fails", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "gnhf-setup-failure-"));
+    const repoRoot = join(tempDir, "repo");
+    const consoleErrorSink: unknown[][] = [];
+    let createdWorktreePath: string | null = null;
+    const createWorktree = vi.fn((_repo, worktreePath: string) => {
+      createdWorktreePath = worktreePath;
+      mkdirSync(worktreePath, { recursive: true });
+    });
+
+    try {
+      await expect(
+        runCliWithMocks(
+          ["ship it", "--worktree"],
+          {
+            agent: "claude",
+            agentPathOverride: {},
+            agentArgsOverride: {},
+            acpRegistryOverrides: {},
+            maxConsecutiveFailures: 3,
+            preventSleep: false,
+          },
+          {
+            consoleErrorSink,
+            createWorktree,
+            getRepoRootDir: vi.fn(() => repoRoot),
+            setupRun: vi.fn(() => {
+              throw new Error("metadata disk full");
+            }),
+          },
+        ),
+      ).rejects.toThrow("process.exit unexpectedly called with 1");
+
+      expect(createdWorktreePath).not.toBeNull();
+      expect(consoleErrorSink.flat().join("\n")).toContain(
+        `worktree preserved at ${createdWorktreePath}`,
+      );
+      const recordPath = join(
+        createdWorktreePath!,
+        ".gnhf",
+        "runs",
+        basename(createdWorktreePath!),
+        "preserved-worktree.json",
+      );
+      expect(JSON.parse(readFileSync(recordPath, "utf-8"))).toMatchObject({
+        worktreePath: createdWorktreePath,
+        reason: "setup-failed",
+        error: "metadata disk full",
+      });
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("preserves a new worktree with pending commit repair changes", async () => {
     const removeWorktree = vi.fn();
 
@@ -3254,7 +3309,7 @@ describe("cli", () => {
     expect(removeWorktree).not.toHaveBeenCalled();
   });
 
-  it("uses Git history to preserve committed work before forced exit", async () => {
+  it("preserves a clean worktree when shutdown times out", async () => {
     vi.useFakeTimers();
     const removeWorktree = vi.fn();
     const consoleErrorSink: unknown[][] = [];
@@ -3280,7 +3335,7 @@ describe("cli", () => {
         },
         {
           consoleErrorSink,
-          getBranchCommitCount: vi.fn(() => 1),
+          getBranchCommitCount: vi.fn(() => 0),
           hasWorkingTreeChanges: vi.fn(() => false),
           orchestratorStart: vi.fn(() => new Promise<void>(() => {})),
           orchestratorGetState: vi.fn(() => ({
@@ -3441,6 +3496,7 @@ describe("cli", () => {
         maxIterations: undefined,
         maxTokens: undefined,
         stopWhen: undefined,
+        preserveWorkspaceOnForceStop: true,
       });
     } finally {
       rmSync(tempDir, { recursive: true, force: true });

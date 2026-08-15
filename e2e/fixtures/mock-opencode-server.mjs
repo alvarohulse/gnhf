@@ -227,6 +227,9 @@ const server = createServer(async (req, res) => {
     appendLog("message:start", { sessionId, prompt });
 
     if (String(prompt).includes("slow cleanup")) {
+      if (String(prompt).includes("slow cleanup dirty")) {
+        applyWorkspaceChange(sessionId);
+      }
       req.on("close", () => {
         appendLog("message:closed", { sessionId });
       });
@@ -267,6 +270,9 @@ const server = createServer(async (req, res) => {
     appendLog("message:start", { sessionId, prompt });
 
     if (String(prompt).includes("slow cleanup")) {
+      if (String(prompt).includes("slow cleanup dirty")) {
+        applyWorkspaceChange(sessionId);
+      }
       req.on("close", () => {
         appendLog("message:closed", { sessionId });
       });

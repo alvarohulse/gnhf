@@ -76,6 +76,7 @@ export interface RunLimits {
   maxTokens?: number;
   stopWhen?: string;
   push?: boolean;
+  preserveWorkspaceOnForceStop?: boolean;
 }
 
 const STOP_CLOSE_AGENT_GRACE_MS = 250;
@@ -233,8 +234,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       } else {
         await this.closeAgent();
       }
-      resetHard(this.cwd);
-      this.pendingCommitFailure = null;
+      if (this.limits.preserveWorkspaceOnForceStop !== true) {
+        resetHard(this.cwd);
+        this.pendingCommitFailure = null;
+      }
       this.state.status = "stopped";
       this.emit("state", this.getState());
       this.emitStopped();

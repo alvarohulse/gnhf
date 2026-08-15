@@ -1011,7 +1011,7 @@ describe("Orchestrator stop limits", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
-  it("clears pending commit failure state after force-stop reset", async () => {
+  it("resets pending commit failure state after a default force stop", async () => {
     vi.useFakeTimers();
 
     let rejectRepair!: (error: Error) => void;
@@ -1056,6 +1056,53 @@ describe("Orchestrator stop limits", () => {
 
     expect(mockResetHard).toHaveBeenCalled();
     expect(orchestrator.getState().hasPendingCommitFailure).toBe(false);
+  });
+
+  it("preserves pending commit failure state for a worktree force stop", async () => {
+    vi.useFakeTimers();
+
+    let rejectRepair!: (error: Error) => void;
+    const agent: Agent = {
+      name: "claude",
+      run: vi
+        .fn()
+        .mockResolvedValueOnce(createSuccessResult("needs hook repair"))
+        .mockImplementationOnce(
+          (_prompt, _cwd, options) =>
+            new Promise<AgentResult>((_resolve, reject) => {
+              rejectRepair = reject;
+              options?.signal?.addEventListener("abort", () => {
+                reject(new Error("Agent was aborted"));
+              });
+            }),
+        ),
+      close: vi.fn(() => Promise.resolve()),
+    };
+    mockCommitAll.mockImplementationOnce(() => {
+      throw new CommitFailedError(new Error("hook failed"));
+    });
+
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { preserveWorkspaceOnForceStop: true },
+    );
+    const startPromise = orchestrator.start();
+
+    await vi.waitFor(() => {
+      expect(agent.run).toHaveBeenCalledTimes(2);
+    });
+    orchestrator.stop();
+    await vi.runAllTimersAsync();
+    rejectRepair(new Error("Agent was aborted"));
+    await startPromise;
+
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(orchestrator.getState().hasPendingCommitFailure).toBe(true);
   });
 
   it("preserves pending commit failure state when a repair iteration errors", async () => {

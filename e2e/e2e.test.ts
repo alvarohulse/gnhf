@@ -818,6 +818,64 @@ describe("gnhf e2e", () => {
     30_000,
   );
 
+  it.skipIf(process.platform === "win32")(
+    "preserves dirty work after a forced worktree shutdown",
+    async () => {
+      const cwd = createRepo();
+      tempDirs.push(cwd);
+      const logDir = mkdtempSync(join(tmpdir(), "gnhf-e2e-logs-"));
+      tempDirs.push(logDir);
+      const mockLogPath = join(logDir, "mock-opencode.jsonl");
+      const worktreeParent = `${cwd}-gnhf-worktrees`;
+      tempDirs.push(worktreeParent);
+
+      const child = spawn(
+        process.execPath,
+        [distCliPath, "slow cleanup dirty", "--agent", "opencode", "--worktree"],
+        {
+          cwd,
+          env: createTestEnv(mockLogPath, tempDirs),
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+      child.stdin.end();
+
+      const exitPromise = new Promise<RunResult>((resolveResult, reject) => {
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => {
+          stdout += chunk.toString();
+        });
+        child.stderr.on("data", (chunk) => {
+          stderr += chunk.toString();
+        });
+        child.on("error", reject);
+        child.on("close", (code, signal) => {
+          resolveResult({ code, signal, stdout, stderr });
+        });
+      });
+
+      await waitForLogEvent(mockLogPath, "workspace:changed");
+      child.kill("SIGINT");
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+      child.kill("SIGINT");
+
+      const result = await exitPromise;
+      expect(result.code).toBe(130);
+      const worktreeDirs = readdirSync(worktreeParent);
+      expect(worktreeDirs).toHaveLength(1);
+      const worktreePath = join(worktreeParent, worktreeDirs[0]!);
+      expect(readFileSync(join(worktreePath, "README.md"), "utf-8")).toContain(
+        "mock change",
+      );
+      expect(result.stderr).toContain(`worktree preserved at ${worktreePath}`);
+      expect(git(["status", "--porcelain"], worktreePath)).not.toBe("");
+      expect(git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)).toBe("main");
+      expect(git(["rev-list", "--count", "HEAD"], cwd)).toBe("1");
+    },
+    30_000,
+  );
+
   // Windows has no POSIX signals; child.kill("SIGINT") force-terminates the
   // process tree without triggering the graceful shutdown path this test covers.
   it.skipIf(process.platform === "win32")(

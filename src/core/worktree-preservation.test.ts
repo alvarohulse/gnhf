@@ -51,6 +51,15 @@ describe("getWorktreePreservationReason", () => {
     );
   });
 
+  it("preserves when the run base is empty or malformed", () => {
+    const cwd = createRepo();
+
+    expect(getWorktreePreservationReason("", cwd, false)).toBe("uncertain");
+    expect(
+      getWorktreePreservationReason("not-a-full-object-id", cwd, false),
+    ).toBe("uncertain");
+  });
+
   it("allows cleanup for a clean zero-commit worktree", () => {
     const cwd = createRepo();
     const baseCommit = git(cwd, ["rev-parse", "HEAD"]);
