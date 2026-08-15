@@ -1317,6 +1317,35 @@ describe("cli", () => {
     });
   });
 
+  it("starts Linux sleep re-execution before creating a worktree", async () => {
+    const createWorktree = vi.fn();
+    const startSleepPrevention = vi.fn(() =>
+      Promise.resolve({
+        type: "skipped" as const,
+        reason: "unavailable" as const,
+      }),
+    );
+
+    await runCliWithMocks(
+      ["ship it", "--worktree"],
+      {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: true,
+      },
+      { createWorktree, startSleepPrevention },
+    );
+
+    expect(startSleepPrevention).toHaveBeenCalledTimes(1);
+    expect(createWorktree).toHaveBeenCalledTimes(1);
+    expect(startSleepPrevention.mock.invocationCallOrder[0]).toBeLessThan(
+      createWorktree.mock.invocationCallOrder[0]!,
+    );
+  });
+
   it("does not emit run:start from the Linux sleep-prevention wrapper process", async () => {
     const appendDebugLog = vi.fn();
     const startSleepPrevention = vi.fn(() =>

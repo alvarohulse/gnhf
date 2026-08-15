@@ -701,6 +701,48 @@ program
         promptFromStdin = true;
       }
 
+      const sleepPreventionState: {
+        cleanup: (() => Promise<void>) | null;
+        started: boolean;
+      } = {
+        cleanup: null,
+        started: false,
+      };
+      const startConfiguredSleepPrevention = async () => {
+        if (sleepPreventionState.started || !config.preventSleep) {
+          return;
+        }
+        sleepPreventionState.started = true;
+
+        const persistedPrompt =
+          promptFromStdin && prompt !== undefined
+            ? persistStdinPromptForReexec(prompt)
+            : null;
+        let reexeced = false;
+        try {
+          const sleepPrevention =
+            initialSleepPrevention ??
+            (await startSleepPrevention(process.argv.slice(2), {
+              reexecEnv: persistedPrompt
+                ? {
+                    [GNHF_REEXEC_STDIN_PROMPT_FILE]: persistedPrompt.path,
+                  }
+                : undefined,
+            }));
+          if (sleepPrevention.type === "reexeced") {
+            reexeced = true;
+            process.exit(sleepPrevention.exitCode);
+          }
+          if (sleepPrevention.type === "active") {
+            sleepPreventionState.cleanup = sleepPrevention.cleanup;
+          }
+        } finally {
+          if (!reexeced) {
+            persistedPrompt?.cleanup();
+          }
+        }
+      };
+
       const cwd = process.cwd();
       let effectiveCwd = cwd;
       let worktreePath: string | null = null;
@@ -770,6 +812,8 @@ program
           );
           process.exit(1);
         }
+
+        await startConfiguredSleepPrevention();
 
         const wt = initializeWorktreeRun(
           prompt,
@@ -948,36 +992,7 @@ program
         runInfo = initializeNewBranch(prompt, cwd, schemaOptions);
       }
 
-      let sleepPreventionCleanup: (() => Promise<void>) | null = null;
-      if (config.preventSleep) {
-        const persistedPrompt =
-          promptFromStdin && prompt !== undefined
-            ? persistStdinPromptForReexec(prompt)
-            : null;
-        let reexeced = false;
-        try {
-          const sleepPrevention =
-            initialSleepPrevention ??
-            (await startSleepPrevention(process.argv.slice(2), {
-              reexecEnv: persistedPrompt
-                ? {
-                    [GNHF_REEXEC_STDIN_PROMPT_FILE]: persistedPrompt.path,
-                  }
-                : undefined,
-            }));
-          if (sleepPrevention.type === "reexeced") {
-            reexeced = true;
-            process.exit(sleepPrevention.exitCode);
-          }
-          if (sleepPrevention.type === "active") {
-            sleepPreventionCleanup = sleepPrevention.cleanup;
-          }
-        } finally {
-          if (!reexeced) {
-            persistedPrompt?.cleanup();
-          }
-        }
-      }
+      await startConfiguredSleepPrevention();
 
       const runMode: "new" | "resume" | "worktree" | "current-branch" =
         options.worktree
@@ -1149,7 +1164,7 @@ program
       } finally {
         process.off("SIGINT", handleSigInt);
         process.off("SIGTERM", handleSigTerm);
-        await sleepPreventionCleanup?.();
+        await sleepPreventionState.cleanup?.();
       }
 
       {
