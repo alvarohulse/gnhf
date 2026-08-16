@@ -482,7 +482,9 @@ function backfillLegacyBaseCommit(
   return baseCommit;
 }
 
-export function getLastIterationNumber(runInfo: RunInfo): number {
+export function getLastIterationNumber(
+  runInfo: Pick<RunInfo, "runDir">,
+): number {
   const files = readdirSync(runInfo.runDir);
   let max = 0;
   for (const f of files) {
@@ -492,7 +494,8 @@ export function getLastIterationNumber(runInfo: RunInfo): number {
       if (n > max) max = n;
     }
   }
-  return max;
+  const usageGeneration = readRunUsageState(runInfo)?.generation ?? 0;
+  return Math.max(max, usageGeneration);
 }
 
 export function readWorkspaceRecovery(
