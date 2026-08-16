@@ -1,0 +1,163 @@
+Target: 6bd4eaf7736f3585bb1bf3756596165ba6e4326c
+Built CLI: dist/cli.mjs
+Environment: disposable repositories inside the gate worktree, local agent fixtures, telemetry disabled, and no install, deployment, projection, network push, or canary
+
+=== Forced shutdown preserves dirty work, durable recovery state, and exact managed-process cleanup ===
+Command: gnhf "slow cleanup dirty current target" --agent opencode --prevent-sleep off --worktree, then two SIGINT signals
+Environment: GNHF_SUPERVISED_PROCESS_GROUP=1, GNHF_WORKTREE_RECEIPT_PATH=<fixture>/worktree-receipt.json
+Exit code: 130
+
+CLI permanent summary:
+  gnhf wrapped
+  opencode worked for 0s on gnhf/slow-cleanup-dirty-c-e8db97
+  iterations      1 total       0 good       0 failed
+  tokens          unavailable
+  branch diff     0 commits     +0           -0
+  gnhf: worktree preserved at <fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-c-e8db97
+
+Terminal worktree receipt:
+{
+  "schemaVersion": 1,
+  "receiptId": "<receipt-id>",
+  "runId": "slow-cleanup-dirty-c-e8db97",
+  "state": "shutdown",
+  "worktreePath": "<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-c-e8db97",
+  "baseCommit": "<base-commit>",
+  "disposition": "preserved",
+  "preservationReason": "pending-recovery"
+}
+
+Original HEAD unchanged: yes
+Original status: clean
+Preserved status: M README.md
+Preserved marker: - mock change <marker>
+Managed OpenCode process alive after shutdown: no
+Lifecycle evidence, in order:
+  signal:SIGINT
+  signal:SIGINT
+  session:abort
+  session:delete
+  server:shutdown (SIGTERM)
+  worktree:preserved (pending-recovery)
+  run:complete (stopped, tokens unavailable)
+
+=== Complete provider-token receipt enforces a lower cap across resume without another launch ===
+Initial command: gnhf "persist complete token receipt" --agent cursor --current-branch --prevent-sleep off --max-iterations 1 --max-tokens 100
+Resume command: gnhf "persist complete token receipt" --agent cursor --current-branch --prevent-sleep off --clear-max-iterations --max-tokens 19
+Initial exit code: 0
+Resume exit code: 0
+
+Initial CLI summary:
+  gnhf stopped
+  cursor ran for 0s before: max iterations reached (1)
+  iterations      1 total       1 good       0 failed
+  tokens          12 in         8 out
+  branch diff     1 commit      +1           -0
+
+Resume CLI summary:
+  gnhf stopped
+  cursor ran for 0s before: max tokens reached (20/19)
+  iterations      1 total       0 good       0 failed
+  tokens          12 in         8 out
+  branch diff     1 commit      +1           -0
+
+Agent invocations before and after resume: 1
+Fixture commit count: 2 (initial plus one successful agent iteration)
+Working tree status: clean
+Persisted runtime limits:
+{
+  "maxTokens": 19
+}
+Terminal usage receipt:
+{
+  "generation": 1,
+  "phase": "terminal",
+  "totalInputTokens": 12,
+  "totalOutputTokens": 8,
+  "totalTokens": 20,
+  "reportedCostUsd": 0.4,
+  "tokensUnavailable": false,
+  "reportedCostUnavailable": false,
+  "tokensEstimated": false,
+  "hasAuthoritativeTokenReceipt": true
+}
+
+=== Harness-reported cost receipt enforces a lower cap across resume without another launch ===
+Initial command: gnhf "persist reported cost receipt" --agent cursor --current-branch --prevent-sleep off --max-iterations 1 --max-reported-cost-usd 1
+Resume command: gnhf "persist reported cost receipt" --agent cursor --current-branch --prevent-sleep off --clear-max-iterations --max-reported-cost-usd 0.3
+Initial exit code: 0
+Resume exit code: 0
+
+Initial CLI summary:
+  gnhf stopped
+  cursor ran for 0s before: max iterations reached (1)
+  iterations      1 total       1 good       0 failed
+  tokens          12 in         8 out
+  branch diff     1 commit      +1           -0
+
+Resume CLI summary:
+  gnhf stopped
+  cursor ran for 0s before: max reported cost reached ($0.40/$0.30)
+  iterations      1 total       0 good       0 failed
+  tokens          12 in         8 out
+  branch diff     1 commit      +1           -0
+
+Agent invocations before and after resume: 1
+Fixture commit count: 2 (initial plus one successful agent iteration)
+Working tree status: clean
+Persisted runtime limits:
+{
+  "maxReportedCostUsd": 0.3
+}
+Terminal usage receipt:
+{
+  "generation": 1,
+  "phase": "terminal",
+  "totalInputTokens": 12,
+  "totalOutputTokens": 8,
+  "totalTokens": 20,
+  "reportedCostUsd": 0.4,
+  "tokensUnavailable": false,
+  "reportedCostUnavailable": false,
+  "tokensEstimated": false,
+  "hasAuthoritativeTokenReceipt": true
+}
+
+=== Explicit worktree preservation publishes a terminal owner receipt ===
+Command: gnhf "preserve current target worktree" --agent cursor --prevent-sleep off --max-iterations 0 --worktree --preserve-worktree
+Environment: GNHF_WORKTREE_RECEIPT_PATH=<fixture>/receipts/worktree.json
+Exit code: 0
+
+CLI permanent summary:
+  gnhf stopped
+  cursor ran for 0s before: max iterations reached (0)
+  iterations      0 total       0 good       0 failed
+  tokens          unavailable
+  branch diff     0 commits     +0           -0
+  gnhf: worktree preserved at <fixture>/repo-gnhf-worktrees/preserve-current-tar-f5d0e4
+
+Terminal worktree receipt:
+{
+  "schemaVersion": 1,
+  "receiptId": "<receipt-id>",
+  "runId": "preserve-current-tar-f5d0e4",
+  "state": "shutdown",
+  "worktreePath": "<fixture>/repo-gnhf-worktrees/preserve-current-tar-f5d0e4",
+  "baseCommit": "<base-commit>",
+  "disposition": "preserved",
+  "preservationReason": "requested"
+}
+
+Worktree exists: yes
+Worktree branch: gnhf/preserve-current-tar-f5d0e4
+Worktree status: clean
+Originating HEAD unchanged: yes
+Originating status: clean
+
+=== Push remains forbidden ===
+Command: gnhf "must never push" --agent cursor --current-branch --prevent-sleep off --push
+Exit code: 1
+CLI output: --push is disabled; gnhf never pushes user work.
+Local HEAD unchanged: yes
+Local status: clean
+Local bare remote refs after rejected push: none
