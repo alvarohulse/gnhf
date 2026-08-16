@@ -541,7 +541,7 @@ describe("startSleepPrevention", () => {
     const child = createChildProcess();
     const killProcess: typeof process.kill = vi.fn(
       (pid: number, signal?: string | number) => {
-        if (pid === -1234 && signal === "SIGTERM") {
+        if (pid === -1234 && signal === "SIGKILL") {
           queueMicrotask(() => {
             child.emit("close", 0, null);
           });
