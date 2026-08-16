@@ -207,6 +207,70 @@ describe("spawnManagedChildProcess", () => {
     expect(child.pid).toBe(supervisor.pid);
   });
 
+  it("records an unexpected Windows supervisor close before settling", () => {
+    const supervisor = Object.assign(createChildProcess(), {
+      stdin: new EventEmitter(),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      send: vi.fn(),
+    });
+    const tracker = new ChildProcessShutdownTracker();
+    const child = spawnManagedChildProcess(
+      vi.fn(() => supervisor),
+      "agent-cli.cmd",
+      ["--json"],
+      {
+        cwd: "C:\\repo",
+        detached: false,
+        shell: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+      tracker,
+      "win32",
+    );
+    let cleanupErrorAtClose: UnverifiedAgentCleanupError | null = null;
+    child.once("close", () => {
+      cleanupErrorAtClose = tracker.getUnverifiedCleanupError();
+    });
+
+    supervisor.emit("close", 1, null);
+
+    expect(cleanupErrorAtClose).toBeInstanceOf(UnverifiedAgentCleanupError);
+    expect(cleanupErrorAtClose).toHaveProperty(
+      "message",
+      "Could not verify descendant process cleanup for PID 1234 after supervisor-close",
+    );
+  });
+
+  it("accepts an owner-initiated Windows supervisor close", async () => {
+    const supervisor = Object.assign(createChildProcess(), {
+      stdin: new EventEmitter(),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      send: vi.fn(),
+    });
+    const tracker = new ChildProcessShutdownTracker();
+    const child = spawnManagedChildProcess(
+      vi.fn(() => supervisor),
+      "agent-cli.cmd",
+      ["--json"],
+      {
+        cwd: "C:\\repo",
+        detached: false,
+        shell: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+      tracker,
+      "win32",
+    );
+
+    await shutdownWindowsProcessTree(child, {
+      killTree: vi.fn(() => supervisor.emit("close", null, "SIGKILL")),
+    });
+
+    expect(tracker.getUnverifiedCleanupError()).toBeNull();
+  });
+
   it("preserves a Windows target result when cleanup becomes unverified", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "gnhf-managed-process-"));
     const logPath = join(tempDir, "gnhf.log");
