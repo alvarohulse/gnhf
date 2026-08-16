@@ -398,7 +398,7 @@ describe("AcpAgent", () => {
     expect(messages).not.toContain("usage updated: 100/1000");
   });
 
-  it("reports input-token usage from usage_update status events", async () => {
+  it("keeps ACP usage unavailable despite status events", async () => {
     const onUsage = vi.fn();
     const { runtime } = createFakeRuntime([
       {
@@ -426,22 +426,17 @@ describe("AcpAgent", () => {
 
     const result = await agent.run("p", "/w", { onUsage });
 
-    expect(result.usage.inputTokens).toBe(120);
-    expect(result.usage.tokensAvailable).toBe(false);
-    const reported = onUsage.mock.calls.map(
-      (args) => (args[0] as { inputTokens: number }).inputTokens,
-    );
-    // Once usage_update arrives, the reported `used` delta takes over and
-    // overrides the prompt-length estimate that fires at iteration start.
-    expect(reported).toContain(50);
-    expect(reported).toContain(120);
-    expect(reported[reported.length - 1]).toBe(120);
+    expect(result.usage).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      tokensAvailable: false,
+    });
+    expect(onUsage).not.toHaveBeenCalled();
   });
 
-  it("reports per-iteration deltas of `used` across iterations", async () => {
-    // ACP sessions are persistent, so `used` is cumulative across the run.
-    // Each iteration should report only the additional context tokens it
-    // consumed, not the whole conversation context.
+  it("keeps ACP usage unavailable across persistent turns", async () => {
     const { runtime } = createFakeRuntime([
       {
         events: [
@@ -475,8 +470,10 @@ describe("AcpAgent", () => {
     const first = await agent.run("p", "/w");
     const second = await agent.run("p", "/w");
 
-    expect(first.usage.inputTokens).toBe(100);
-    expect(second.usage.inputTokens).toBe(150); // 250 - 100
+    expect(first.usage.tokensAvailable).toBe(false);
+    expect(first.usage.inputTokens).toBe(0);
+    expect(second.usage.tokensAvailable).toBe(false);
+    expect(second.usage.inputTokens).toBe(0);
   });
 
   it("validates the parsed output against the schema", async () => {
@@ -677,35 +674,18 @@ describe("AcpAgent", () => {
     expect(result.output).toEqual(VALID_OUTPUT);
   });
 
-  it("estimates non-zero output tokens from streamed text_delta chunks", async () => {
-    const json = JSON.stringify(VALID_OUTPUT);
+  it("keeps ACP usage unavailable across text, thought, and tool events", async () => {
     const onUsage = vi.fn();
-    const { runtime } = createFakeRuntime([
-      {
-        events: [textDelta(json)],
-        result: { status: "completed" },
-      },
-    ]);
-    const agent = makeAgent(runtime);
-
-    const result = await agent.run("p", "/w", { onUsage });
-    // ACP only reports a cumulative `used` context value (not split
-    // input/output), so we estimate output tokens from streamed bytes.
-    expect(result.usage.outputTokens).toBeGreaterThan(0);
-  });
-
-  it("counts thought-stream text toward output tokens so reasoning agents don't sit at 0", async () => {
-    // Regression: agents that stream reasoning before answering (Gemini,
-    // GPT-5 reasoning models, etc.) used to leave the renderer at 0 output
-    // tokens for the entire thinking phase because only `output` stream
-    // chars were counted. Reasoning is real generated text that consumes
-    // output tokens, so it must count too.
-    const onUsage = vi.fn();
-    const longReasoning = "thinking ".repeat(200);
     const { runtime } = createFakeRuntime([
       {
         events: [
-          textDelta(longReasoning, "thought"),
+          textDelta("thinking", "thought"),
+          {
+            type: "tool_call",
+            text: "read foo",
+            tag: "tool_call",
+            toolCallId: "1",
+          },
           textDelta(JSON.stringify(VALID_OUTPUT)),
         ],
         result: { status: "completed" },
@@ -715,121 +695,14 @@ describe("AcpAgent", () => {
 
     const result = await agent.run("p", "/w", { onUsage });
 
-    const reportedOutputs = onUsage.mock.calls.map(
-      (args) => (args[0] as { outputTokens: number }).outputTokens,
-    );
-    // The renderer should have seen the output token count rise during the
-    // thinking phase, before the final JSON arrived.
-    const reasoningPhaseMax = Math.max(
-      0,
-      ...reportedOutputs.slice(0, reportedOutputs.length - 1),
-    );
-    expect(reasoningPhaseMax).toBeGreaterThan(0);
-    expect(result.usage.outputTokens).toBeGreaterThan(reasoningPhaseMax);
-  });
-
-  it("falls back to a prompt-length input-token estimate when no usage_update events are emitted", async () => {
-    const json = JSON.stringify(VALID_OUTPUT);
-    const { runtime } = createFakeRuntime([
-      {
-        events: [textDelta(json)],
-        result: { status: "completed" },
-      },
-    ]);
-    const agent = makeAgent(runtime);
-
-    const result = await agent.run("p", "/w");
-    // Many ACP adapters never emit usage_update; without an estimate the
-    // renderer would be stuck at 0 input tokens forever.
-    expect(result.usage.inputTokens).toBeGreaterThan(0);
-  });
-
-  it("marks usage as estimated when no usage_update events arrive", async () => {
-    const { runtime } = createFakeRuntime([
-      {
-        events: [textDelta(JSON.stringify(VALID_OUTPUT))],
-        result: { status: "completed" },
-      },
-    ]);
-    const agent = makeAgent(runtime);
-
-    const result = await agent.run("p", "/w");
-    // Without authoritative `used` from the adapter, both numbers are
-    // heuristics - the renderer should know to flag them as estimated.
-    expect(result.usage.estimated).toBe(true);
-  });
-
-  it("does not mark usage as estimated once usage_update has been received", async () => {
-    const { runtime } = createFakeRuntime([
-      {
-        events: [
-          {
-            type: "status",
-            text: "u",
-            tag: "usage_update",
-            used: 100,
-            size: 1000,
-          },
-          textDelta(JSON.stringify(VALID_OUTPUT)),
-        ],
-        result: { status: "completed" },
-      },
-    ]);
-    const agent = makeAgent(runtime);
-
-    const result = await agent.run("p", "/w");
-    expect(result.usage.estimated).toBeFalsy();
-  });
-
-  it("includes a per-tool-call cost in the input estimate when no usage_update fires", async () => {
-    // Adapters that don't emit usage_update leave us with no view into
-    // tool-result token cost, but each tool call typically dumps a chunk of
-    // input back into the model on the next round (file contents, command
-    // output). Counting tool calls in the heuristic gets us closer to reality
-    // than counting only the literal initial prompt.
-    const onUsage = vi.fn();
-    const { runtime: noToolRuntime } = createFakeRuntime([
-      {
-        events: [textDelta(JSON.stringify(VALID_OUTPUT))],
-        result: { status: "completed" },
-      },
-    ]);
-    const baseline = await makeAgent(noToolRuntime).run("p", "/w");
-
-    const { runtime } = createFakeRuntime([
-      {
-        events: [
-          {
-            type: "tool_call",
-            text: "read foo",
-            tag: "tool_call",
-            toolCallId: "1",
-          },
-          {
-            type: "tool_call",
-            text: "read foo",
-            tag: "tool_call_update",
-            toolCallId: "1",
-          },
-          {
-            type: "tool_call",
-            text: "edit foo",
-            tag: "tool_call",
-            toolCallId: "2",
-          },
-          textDelta(JSON.stringify(VALID_OUTPUT)),
-        ],
-        result: { status: "completed" },
-      },
-    ]);
-    const result = await makeAgent(runtime).run("p", "/w", { onUsage });
-
-    // Two distinct tool calls (the third event is a tool_call_update on an
-    // existing call and must not be double-counted).
-    expect(result.usage.inputTokens).toBeGreaterThan(
-      baseline.usage.inputTokens,
-    );
-    expect(result.usage.estimated).toBe(true);
+    expect(result.usage).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      tokensAvailable: false,
+    });
+    expect(onUsage).not.toHaveBeenCalled();
   });
 
   it("reuses the same session across multiple iterations", async () => {

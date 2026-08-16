@@ -19,7 +19,6 @@ import {
   type AgentOutputSchema,
   type AgentResult,
   type AgentRunOptions,
-  type TokenUsage,
 } from "./types.js";
 
 /**
@@ -130,23 +129,6 @@ function redactAcpErrorForThrow(error: unknown, target: string): unknown {
   return redactRawAcpTargetInValue(error, target);
 }
 
-// Rough character-to-token heuristic. ACP's runtime only surfaces a cumulative
-// `used` context size via usage_update status events, and many adapters never
-// emit those. Estimating from text length preserves a proportional provisional
-// value for both inputs and outputs regardless of adapter.
-function estimateTokens(charCount: number): number {
-  if (charCount <= 0) return 0;
-  return Math.ceil(charCount / 4);
-}
-
-// Per-tool-call input-cost heuristic for adapters that don't emit
-// usage_update. Each tool call typically returns a payload (file contents,
-// command output, edit confirmation) that flows back into the model context
-// as input on the next round. 2000 covers a mix of large reads and small
-// edits/bash invocations - rough, but orders of magnitude closer to reality
-// than counting only the literal initial prompt text.
-const ESTIMATED_TOKENS_PER_TOOL_CALL = 2000;
-
 export class AcpAgent implements Agent {
   readonly name: string;
 
@@ -163,10 +145,6 @@ export class AcpAgent implements Agent {
   private handle: AcpRuntimeHandle | null = null;
   private closing: Promise<void> | null = null;
   private closed = false;
-  // Tracks the most recent `used` value reported by the adapter's
-  // usage_update status events. The ACP session is persistent across
-  // iterations, so `used` is cumulative — we report per-iteration deltas.
-  private lastReportedUsed = 0;
 
   constructor(deps: AcpAgentDeps) {
     this.target = deps.target;
@@ -188,7 +166,7 @@ export class AcpAgent implements Agent {
       throw new Error("AcpAgent has been closed");
     }
 
-    const { signal, onMessage, onUsage, logPath } = options ?? {};
+    const { signal, onMessage, logPath } = options ?? {};
     if (signal?.aborted) {
       throw createAbortError();
     }
@@ -216,7 +194,6 @@ export class AcpAgent implements Agent {
     });
 
     const acpPrompt = buildAcpPrompt(prompt, this.schema);
-    const promptTokenEstimate = estimateTokens(acpPrompt.length);
 
     const startedAt = Date.now();
     const turn = (() => {
@@ -238,17 +215,6 @@ export class AcpAgent implements Agent {
         throw redactAcpErrorForThrow(error, this.target);
       }
     })();
-    const iterationStartUsed = this.lastReportedUsed;
-    let latestUsed = iterationStartUsed;
-    // Whether any usage_update status event has set `used` for this run.
-    // We track it on the agent (across iterations) because once an adapter
-    // has demonstrated it emits usage data, missing events later in the run
-    // shouldn't suddenly mark numbers as estimated. Within a single iteration
-    // the `iterationStartUsed > 0` check is enough; this flag covers
-    // iteration 1 specifically.
-    let usageUpdateReceived = iterationStartUsed > 0;
-    let toolCallCount = 0;
-    let agentOutputChars = 0;
     // Buffer for the in-flight assistant message. ACP adapters stream
     // `agent_message_chunk` notifications as many tiny `text_delta` events
     // (often a few characters each). We accumulate them and only surface the
@@ -268,28 +234,6 @@ export class AcpAgent implements Agent {
     let outputBuf = "";
     const logStream = logPath ? createWriteStream(logPath) : null;
 
-    const computeUsage = (): TokenUsage => {
-      const usedDelta = Math.max(0, latestUsed - iterationStartUsed);
-      // Prefer the adapter's reported context delta when available. Fall back
-      // to a prompt + tool-call heuristic for a proportional provisional
-      // estimate when adapters do not emit usage_update. Neither source is a
-      // complete input/output total, so tokensAvailable remains false below.
-      // Tool calls are the dominant input contributor because each result
-      // flows back to the model on the next round.
-      const fallbackInput =
-        promptTokenEstimate + toolCallCount * ESTIMATED_TOKENS_PER_TOOL_CALL;
-      const inputTokens = usedDelta > 0 ? usedDelta : fallbackInput;
-      const usage: TokenUsage = {
-        inputTokens,
-        outputTokens: estimateTokens(agentOutputChars),
-        cacheReadTokens: 0,
-        cacheCreationTokens: 0,
-        tokensAvailable: false,
-      };
-      if (!usageUpdateReceived) usage.estimated = true;
-      return usage;
-    };
-
     const flushPendingMessage = () => {
       if (pendingMessage.length > 0) {
         if (pendingStream === "output") {
@@ -302,10 +246,6 @@ export class AcpAgent implements Agent {
     };
 
     try {
-      // Emit a provisional estimate before the first ACP status event so
-      // adapter consumers receive an immediate usage update.
-      onUsage?.(computeUsage());
-
       try {
         for await (const event of turn.events) {
           logStream?.write(`${JSON.stringify(event)}\n`);
@@ -319,14 +259,9 @@ export class AcpAgent implements Agent {
             }
             pendingStream = stream;
             pendingMessage += text;
-            // Count both output and thought streams in the provisional output
-            // estimate because reasoning is generated text. outputBuf stays
-            // output-only because reasoning text would corrupt JSON parsing.
             if (stream === "output") {
               outputBuf += text;
             }
-            agentOutputChars += text.length;
-            onUsage?.(computeUsage());
             continue;
           }
 
@@ -337,14 +272,6 @@ export class AcpAgent implements Agent {
             // "tool call (completed)" are noisy and not useful in the TUI;
             // the user wants to see assistant prose, not mechanics.
             flushPendingMessage();
-            // Each tool call (not its many tool_call_update follow-ups) bumps
-            // the input-cost heuristic so the fallback estimate scales with
-            // actual work. Adapters tag the initial event "tool_call" and
-            // later updates "tool_call_update" - count only the former.
-            if (event.tag === "tool_call") {
-              toolCallCount += 1;
-              if (!usageUpdateReceived) onUsage?.(computeUsage());
-            }
             continue;
           }
 
@@ -353,12 +280,6 @@ export class AcpAgent implements Agent {
             // and fire frequently mid-stream. Don't surface their text via
             // onMessage - it would flicker over the actual assistant message
             // the user is reading.
-            if (typeof event.used === "number" && event.used !== latestUsed) {
-              latestUsed = event.used;
-              this.lastReportedUsed = latestUsed;
-              usageUpdateReceived = true;
-              onUsage?.(computeUsage());
-            }
             continue;
           }
         }
@@ -436,7 +357,16 @@ export class AcpAgent implements Agent {
       }
 
       const output = validateAgentOutput(parsed, this.schema);
-      return { output, usage: computeUsage() };
+      return {
+        output,
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: false,
+        },
+      };
     } finally {
       logStream?.end();
     }

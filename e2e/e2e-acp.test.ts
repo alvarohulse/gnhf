@@ -391,14 +391,10 @@ describe("gnhf acp e2e", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "marks tokens as estimated and scales input with tool-call count when no usage_update fires",
+    "keeps tokens unavailable when no usage_update fires",
     async () => {
-      // Regression: ACP adapters that never emit usage_update (Pi, some
-      // others) used to fall back to a prompt-length-only estimate that
-      // ignored tool-call payloads, so a run with hundreds of tool calls per
-      // iteration would still report ~700 input tokens/iteration. The fix:
-      // count distinct tool_call events as input cost, and flag the totals
-      // as estimated so the renderer can show "~". This test exercises both.
+      // Tool activity is observable, but ACP does not provide complete token
+      // receipts. Do not turn that activity into fabricated token totals.
       const cwd = createRepo();
       tempDirs.push(cwd);
       const logDir = mkdtempSync(join(tmpdir(), "gnhf-e2e-acp-logs-"));
@@ -412,9 +408,7 @@ describe("gnhf acp e2e", () => {
         }),
       );
 
-      // No usage_update flag -> no usage_update events emitted. 5 tool
-      // calls per iteration × 2 iterations = 10 distinct tool calls feeding
-      // the heuristic.
+      // No usage_update flag -> no authoritative usage events emitted.
       const result = await runCli(
         cwd,
         ["ship it", "--agent", "acp:mock-target", "--max-iterations", "2"],
@@ -439,10 +433,8 @@ describe("gnhf acp e2e", () => {
       );
       expect(iterationEnds).toHaveLength(2);
 
-      // Without usage_update events, ACP usage is heuristic and incomplete.
-      // Preserve that diagnostic while keeping aggregate totals unavailable.
       const lastEnd = iterationEnds[iterationEnds.length - 1]!;
-      expect(lastEnd.tokensEstimated).toBe(true);
+      expect(lastEnd.tokensEstimated).toBe(false);
       expect(lastEnd.totalInputTokens).toBeNull();
       expect(lastEnd.tokensAvailable).toBe(false);
     },
