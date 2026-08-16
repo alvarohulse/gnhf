@@ -147,6 +147,16 @@ function isSameUsage(a: TokenUsage, b: TokenUsage): boolean {
   );
 }
 
+function createUnavailableUsage(): TokenUsage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    tokensAvailable: false,
+  };
+}
+
 function messageKey(message: JsonRecord): string | null {
   const responseId = stringField(message, ["responseId", "id"]);
   if (responseId) return responseId;
@@ -275,13 +285,7 @@ export class PiAgent implements Agent {
       const streamTextByIndex = new Map<number, string>();
       const completeTextByIndex = new Map<number, string>();
       const usageByMessageKey = new Map<string, TokenUsage>();
-      let lastEmittedUsage: TokenUsage = {
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheReadTokens: 0,
-        cacheCreationTokens: 0,
-        tokensAvailable: false,
-      };
+      let lastEmittedUsage = createUnavailableUsage();
       let anonymousKeySeq = 0;
       let currentStreamingMessageKey: string | null = null;
 
@@ -307,24 +311,9 @@ export class PiAgent implements Agent {
           key = `assistant-anonymous-${anonymousKeySeq++}`;
         }
         if (streaming) currentStreamingMessageKey = key;
-        usageByMessageKey.set(
-          key,
-          usage ?? {
-            inputTokens: 0,
-            outputTokens: 0,
-            cacheReadTokens: 0,
-            cacheCreationTokens: 0,
-            tokensAvailable: false,
-          },
-        );
+        usageByMessageKey.set(key, usage ?? createUnavailableUsage());
 
-        const cumulative: TokenUsage = {
-          inputTokens: 0,
-          outputTokens: 0,
-          cacheReadTokens: 0,
-          cacheCreationTokens: 0,
-          tokensAvailable: false,
-        };
+        const cumulative = createUnavailableUsage();
         for (const entry of usageByMessageKey.values()) {
           cumulative.inputTokens += entry.inputTokens;
           cumulative.outputTokens += entry.outputTokens;
@@ -444,6 +433,7 @@ export class PiAgent implements Agent {
         if (event.type === "agent_end" && Array.isArray(event.messages)) {
           usageByMessageKey.clear();
           currentStreamingMessageKey = null;
+          lastEmittedUsage = createUnavailableUsage();
           for (const message of event.messages) {
             if (roleOf(message) === "assistant") {
               rememberAssistantMessage(message, false, true);
