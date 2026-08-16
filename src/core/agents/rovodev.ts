@@ -327,6 +327,7 @@ export class RovoDevAgent implements Agent {
         env: process.env,
       },
       this.shutdowns,
+      this.platform,
     ) as unknown as ChildProcessWithoutNullStreams;
 
     const server: RovoDevServer = {

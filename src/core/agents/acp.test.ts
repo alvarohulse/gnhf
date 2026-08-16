@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -45,6 +45,10 @@ const STUB_HANDLE: AcpRuntimeHandle = {
   backend: "acpx",
   runtimeSessionName: "stub",
 };
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 interface FakeTurn {
   events: AcpRuntimeEvent[];
@@ -254,6 +258,54 @@ describe("AcpAgent", () => {
 
     resolveResult({ status: "cancelled" });
     await expect(runPromise).rejects.toThrow("stream failed");
+  });
+
+  it("fails closed and closes the runtime when turn cancellation hangs", async () => {
+    vi.useFakeTimers();
+    const neverCancel = new Promise<void>(() => {});
+    const { runtime, calls } = createFakeRuntime([
+      {
+        events: [],
+        eventError: new Error("stream failed"),
+        result: { status: "cancelled" },
+        cancel: () => neverCancel,
+      },
+    ]);
+    const agent = makeAgent(runtime);
+    const runPromise = agent.run("p", "/w");
+    const rejection = expect(runPromise).rejects.toBeInstanceOf(
+      IncompleteAgentShutdownError,
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.cancelCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    await rejection;
+    expect(runtime.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed and closes the runtime when turn settlement hangs", async () => {
+    vi.useFakeTimers();
+    const neverSettles = new Promise<AcpRuntimeTurnResult>(() => {});
+    const { runtime } = createFakeRuntime([
+      {
+        events: [],
+        eventError: new Error("stream failed"),
+        result: neverSettles,
+      },
+    ]);
+    const agent = makeAgent(runtime);
+    const runPromise = agent.run("p", "/w");
+    const rejection = expect(runPromise).rejects.toBeInstanceOf(
+      IncompleteAgentShutdownError,
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    await rejection;
+    expect(runtime.close).toHaveBeenCalledTimes(1);
   });
 
   it("redacts raw command targets when ACP startup throws before streaming", async () => {
@@ -794,6 +846,30 @@ describe("AcpAgent", () => {
 
     expect(runtime.close).toHaveBeenCalledTimes(2);
     expect(calls.closeInputs).toHaveLength(1);
+  });
+
+  it("bounds hanging runtime cleanup and retains it for retry", async () => {
+    vi.useFakeTimers();
+    const { runtime } = createFakeRuntime([
+      {
+        events: [textDelta(JSON.stringify(VALID_OUTPUT))],
+        result: { status: "completed" },
+      },
+    ]);
+    runtime.close.mockImplementationOnce(() => new Promise<void>(() => {}));
+    const agent = makeAgent(runtime);
+    await agent.run("p", "/w");
+
+    const closePromise = agent.close();
+    const rejection = expect(closePromise).rejects.toBeInstanceOf(
+      IncompleteAgentShutdownError,
+    );
+    await vi.advanceTimersByTimeAsync(3_000);
+    await rejection;
+
+    runtime.close.mockResolvedValueOnce(undefined);
+    await agent.close();
+    expect(runtime.close).toHaveBeenCalledTimes(2);
   });
 
   it("close() is a no-op when no session was opened", async () => {

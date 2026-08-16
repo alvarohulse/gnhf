@@ -360,6 +360,7 @@ export class CursorAgent implements Agent {
           env: process.env,
         },
         this.shutdowns,
+        this.platform,
       );
       this.activeChild = child;
       child.on("close", () => {

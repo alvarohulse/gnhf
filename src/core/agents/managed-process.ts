@@ -25,10 +25,12 @@ interface ShutdownWindowsProcessTreeOptions {
 
 const SHUTDOWN_CONFIRMATION_GRACE_MS = 100;
 const activeShutdowns = new WeakMap<ChildProcess, Promise<void>>();
+const activeWindowsTreeShutdowns = new WeakMap<ChildProcess, Promise<void>>();
+const closedWindowsProcessTrees = new WeakSet<ChildProcess>();
 const closedOwnedProcessGroupLeaders = new WeakSet<ChildProcess>();
-const UNIX_PROCESS_GROUP_SUPERVISOR_SOURCE = String.raw`
+const PROCESS_TREE_SUPERVISOR_SOURCE = String.raw`
 const { spawn } = require("node:child_process");
-const [command, ...args] = process.argv.slice(1);
+const [shellFlag, command, ...args] = process.argv.slice(1);
 process.on("SIGTERM", () => {});
 process.on("disconnect", () => {
   try {
@@ -41,6 +43,7 @@ const keepAlive = setInterval(() => {}, 24 * 60 * 60 * 1000);
 const target = spawn(command, args, {
   cwd: process.cwd(),
   env: process.env,
+  shell: shellFlag === "1",
   stdio: "inherit",
 });
 target.once("error", (error) => {
@@ -93,8 +96,10 @@ export function spawnManagedChildProcess(
   args: readonly string[],
   options: SpawnOptions,
   shutdownTracker?: ChildProcessShutdownTracker,
+  platform: NodeJS.Platform = process.platform,
 ): ChildProcess {
-  if (options.detached !== true) {
+  const ownsProcessTree = options.detached === true || platform === "win32";
+  if (!ownsProcessTree) {
     return spawnProcess(command, args, options);
   }
 
@@ -103,10 +108,17 @@ export function spawnManagedChildProcess(
     : (options.stdio ?? "pipe");
   const supervisor = spawnProcess(
     process.execPath,
-    ["-e", UNIX_PROCESS_GROUP_SUPERVISOR_SOURCE, "--", command, ...args],
+    [
+      "-e",
+      PROCESS_TREE_SUPERVISOR_SOURCE,
+      "--",
+      options.shell === true ? "1" : "0",
+      command,
+      ...args,
+    ],
     {
       ...options,
-      detached: true,
+      shell: false,
       stdio: [input, "pipe", "pipe", "ipc"],
     },
   );
@@ -135,10 +147,12 @@ export function spawnManagedChildProcess(
 
   const startManagedShutdown = () => {
     const startShutdown = () =>
-      shutdownChildProcess(managed as unknown as ChildProcess, {
-        detached: true,
-        timeoutMs: 0,
-      });
+      platform === "win32"
+        ? shutdownWindowsProcessTree(managed as unknown as ChildProcess)
+        : shutdownChildProcess(managed as unknown as ChildProcess, {
+            detached: true,
+            timeoutMs: 0,
+          });
     return shutdownTracker?.start(startShutdown) ?? startShutdown();
   };
 
@@ -262,60 +276,91 @@ export function shutdownWindowsProcessTree(
   child: ChildProcess,
   options: ShutdownWindowsProcessTreeOptions = {},
 ): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) {
+  const activeShutdown = activeWindowsTreeShutdowns.get(child);
+  if (activeShutdown) {
+    return activeShutdown;
+  }
+  if (closedWindowsProcessTrees.has(child)) {
     return Promise.resolve();
+  }
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.reject(new IncompleteChildProcessShutdownError(child.pid));
   }
   if (child.pid === undefined) {
     return Promise.reject(new IncompleteChildProcessShutdownError(undefined));
   }
 
   const pid = child.pid;
-  return new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const timeout = setTimeout(() => {
-      settle(new IncompleteChildProcessShutdownError(pid));
-    }, options.timeoutMs ?? 3_000);
-    timeout.unref?.();
-
-    const handleClose = () => settle();
-    child.once("close", handleClose);
-
-    try {
-      const killTree =
-        options.killTree ??
-        ((processId: number) => {
-          execFileSync("taskkill", ["/T", "/F", "/PID", String(processId)], {
-            stdio: "ignore",
-          });
-        });
-      killTree(pid);
-    } catch {
-      if (child.exitCode !== null || child.signalCode !== null) {
-        settle();
-      } else {
+  let beginShutdown!: () => void;
+  const shutdown = new Promise<void>((resolve, reject) => {
+    beginShutdown = () => {
+      let rootClosed = false;
+      let treeTerminationConfirmed = false;
+      let settled = false;
+      const timeout = setTimeout(() => {
         settle(new IncompleteChildProcessShutdownError(pid));
-      }
-      return;
-    }
+      }, options.timeoutMs ?? 3_000);
+      timeout.unref?.();
 
-    if (child.exitCode !== null || child.signalCode !== null) {
-      settle();
-    }
+      const handleClose = () => {
+        rootClosed = true;
+        settleIfComplete();
+      };
+      child.once("close", handleClose);
 
-    function settle(error?: Error): void {
-      if (settled) {
+      try {
+        const killTree =
+          options.killTree ??
+          ((processId: number) => {
+            execFileSync("taskkill", ["/T", "/F", "/PID", String(processId)], {
+              stdio: "ignore",
+              timeout: options.timeoutMs ?? 3_000,
+            });
+          });
+        killTree(pid);
+        treeTerminationConfirmed = true;
+      } catch {
+        settle(new IncompleteChildProcessShutdownError(pid));
         return;
       }
-      settled = true;
-      clearTimeout(timeout);
-      child.off("close", handleClose);
-      if (error === undefined) {
-        resolve();
-      } else {
-        reject(error);
+
+      if (child.exitCode !== null || child.signalCode !== null) {
+        rootClosed = true;
       }
-    }
+      settleIfComplete();
+
+      function settleIfComplete(): void {
+        if (treeTerminationConfirmed && rootClosed) {
+          settle();
+        }
+      }
+
+      function settle(error?: Error): void {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        child.off("close", handleClose);
+        if (error === undefined) {
+          closedWindowsProcessTrees.add(child);
+          resolve();
+        } else {
+          reject(error);
+        }
+      }
+    };
   });
+  activeWindowsTreeShutdowns.set(child, shutdown);
+  beginShutdown();
+  void shutdown.then(clearActiveShutdown, clearActiveShutdown);
+  return shutdown;
+
+  function clearActiveShutdown(): void {
+    if (activeWindowsTreeShutdowns.get(child) === shutdown) {
+      activeWindowsTreeShutdowns.delete(child);
+    }
+  }
 }
 
 export function shutdownChildProcess(

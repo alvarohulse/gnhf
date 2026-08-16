@@ -6,6 +6,7 @@ import {
   createFileSessionStore,
   type AcpRuntimeHandle,
   type AcpRuntimeOptions,
+  type AcpRuntimeTurn,
   type AcpRuntimeTurnResult,
   type AcpxRuntime,
 } from "acpx/runtime";
@@ -30,6 +31,8 @@ type AcpxRuntimeLike = Pick<
   AcpxRuntime,
   "ensureSession" | "startTurn" | "close"
 >;
+
+const ACP_CLEANUP_TIMEOUT_MS = 3_000;
 
 export interface AcpAgentDeps {
   target: string;
@@ -59,6 +62,27 @@ function isAbortError(error: unknown): boolean {
 
 function createAbortError(): Error {
   return new Error("Agent was aborted");
+}
+
+async function waitForAcpCleanup<T>(
+  operation: PromiseLike<T>,
+  label: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      Promise.resolve(operation),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(`${label} did not settle within the cleanup grace`));
+        }, ACP_CLEANUP_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeout !== null) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 function redactRawAcpTargetInString(text: string, target: string): string {
@@ -286,12 +310,7 @@ export class AcpAgent implements Agent {
         }
         flushPendingMessage();
       } catch (error) {
-        await Promise.allSettled([
-          Promise.resolve().then(() =>
-            turn.cancel({ reason: "gnhf-stream-ended" }),
-          ),
-          turn.result,
-        ]);
+        await this.cleanupUnsettledTurn(turn);
         if (signal?.aborted || isAbortError(error)) {
           appendDebugLog("acp:turn:aborted", {
             target: redactAcpTargetForLogs(this.target),
@@ -309,7 +328,13 @@ export class AcpAgent implements Agent {
         throw redactAcpErrorForThrow(error, this.target);
       }
 
-      const result: AcpRuntimeTurnResult = await turn.result;
+      let result: AcpRuntimeTurnResult;
+      try {
+        result = await waitForAcpCleanup(turn.result, "ACP turn settlement");
+      } catch (error) {
+        await this.cleanupUnsettledTurn(turn, [error]);
+        throw error;
+      }
       appendDebugLog("acp:turn:result", {
         target: redactAcpTargetForLogs(this.target),
         requestId,
@@ -399,7 +424,10 @@ export class AcpAgent implements Agent {
     const runtime = this.runtime;
     const handle = this.handle;
     try {
-      await runtime.close({ handle, reason: "gnhf-shutdown" });
+      await waitForAcpCleanup(
+        runtime.close({ handle, reason: "gnhf-shutdown" }),
+        "ACP runtime close",
+      );
       this.runtime = null;
       this.handle = null;
       appendDebugLog("acp:close", {
@@ -414,6 +442,54 @@ export class AcpAgent implements Agent {
         "Could not prove ACP runtime cleanup completed",
         { cause: redactAcpErrorForThrow(error, this.target) },
       );
+    }
+  }
+
+  private async cleanupUnsettledTurn(
+    turn: AcpRuntimeTurn,
+    initialFailures: unknown[] = [],
+  ): Promise<void> {
+    const target = this.target;
+    const failures = initialFailures.map((error) =>
+      redactAcpErrorForThrow(error, target),
+    );
+
+    await captureCleanupFailure(
+      () => turn.cancel({ reason: "gnhf-stream-ended" }),
+      "ACP turn cancellation",
+    );
+    await captureCleanupFailure(() => turn.result, "ACP turn settlement");
+    try {
+      await this.close();
+    } catch (error) {
+      failures.push(redactAcpErrorForThrow(error, target));
+    }
+
+    if (failures.length === 0) {
+      return;
+    }
+
+    const error = new IncompleteAgentShutdownError(
+      "Could not prove ACP turn and runtime cleanup completed",
+      {
+        cause: new AggregateError(failures, "ACP cleanup operations failed"),
+      },
+    );
+    appendDebugLog("acp:turn:cleanup-error", {
+      target: redactAcpTargetForLogs(this.target),
+      error: serializeAcpErrorForLog(error, this.target),
+    });
+    throw error;
+
+    async function captureCleanupFailure(
+      operation: () => PromiseLike<unknown>,
+      label: string,
+    ): Promise<void> {
+      try {
+        await waitForAcpCleanup(Promise.resolve().then(operation), label);
+      } catch (error) {
+        failures.push(redactAcpErrorForThrow(error, target));
+      }
     }
   }
 
