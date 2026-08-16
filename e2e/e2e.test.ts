@@ -430,6 +430,8 @@ describe("gnhf e2e", () => {
           env: {
             ...createTestEnv(mockLogPath, tempDirs),
             GNHF_MOCK_CLAUDE_MODE: mode,
+            // Keep the mock's streams clean when Node warns about .cmd wrappers.
+            NODE_NO_WARNINGS: "1",
           },
         },
       );
@@ -437,43 +439,33 @@ describe("gnhf e2e", () => {
       expect(result.code).toBe(0);
 
       const debugLogPath = findRunLogPath(cwd);
-      const agentRunErrorEntry = readJsonLines(debugLogPath).find(
+      const debugEntries = readJsonLines(debugLogPath);
+      const agentRunErrorEntry = debugEntries.find(
         (entry) => entry.event === "agent:run:error",
       );
       expect(agentRunErrorEntry).toBeDefined();
       const agentError = agentRunErrorEntry?.error as
         | { message?: string; name?: string }
         | undefined;
-      if (process.platform === "win32") {
-        expect(agentError).toMatchObject({
-          message: expect.stringMatching(
-            /^Could not prove process cleanup completed for PID \d+$/,
-          ),
-          name: "IncompleteChildProcessShutdownError",
-        });
-      } else {
-        expect(agentError?.message).toBe(expected);
-      }
+      expect(agentError).toMatchObject({ message: expected, name: "Error" });
 
       if (process.platform === "win32") {
-        const recovery = JSON.parse(
-          readFileSync(
-            join(dirname(debugLogPath), "workspace-recovery.json"),
-            "utf-8",
-          ),
-        ) as unknown;
-        expect(recovery).toEqual({
-          kind: "interrupted",
-          detail: agentError?.message,
-        });
-      } else {
-        // The morning-after trace: notes.md is what the user actually reads.
-        const notes = readFileSync(
-          join(dirname(debugLogPath), "notes.md"),
-          "utf-8",
+        expect(debugEntries).toContainEqual(
+          expect.objectContaining({
+            event: "agent-process:cleanup-unverified",
+            trigger: "target-close",
+            mode: "best-effort",
+            descendantCleanup: "unverified",
+          }),
         );
-        expect(notes).toContain(`[ERROR] ${expected}`);
       }
+
+      // The morning-after trace: notes.md is what the user actually reads.
+      const notes = readFileSync(
+        join(dirname(debugLogPath), "notes.md"),
+        "utf-8",
+      );
+      expect(notes).toContain(`[ERROR] ${expected}`);
     },
     30_000,
   );
