@@ -15,7 +15,7 @@ A change that can lose user work in an edge case is a bug of the highest class a
 ## The user holds the leash
 
 An unattended loop earns trust through explicit limits, live control, and staying alive until morning.
-Iteration caps and natural-language stop conditions bound every run; token caps require complete provider-reported token totals, cost caps require concrete reported cost, and stop conditions survive resume.
+Iteration caps and natural-language stop conditions bound every run; token caps require complete provider-reported token totals, cost caps require final reported cost rather than estimates, and stop conditions survive resume.
 The first interrupt is graceful and lets the iteration finish; the second cancels it and waits for owned shutdown to settle.
 Steering a live run and reviewing a finished run's commits are user control, not scope creep.
 The run defends itself against whatever would end the night early: machine sleep, a closed terminal, transient agent failures.
