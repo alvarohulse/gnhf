@@ -468,14 +468,10 @@ export class CursorAgent implements Agent {
             closedAfterFinalCleanup = true;
             void shutdownRun().catch(rejectCleanupFailure);
           };
-          if (this.platform === "win32") {
-            cleanupFinalResult();
-          } else {
-            finalResultCleanupTimer = setTimeout(
-              cleanupFinalResult,
-              this.finalResultGraceMs,
-            );
-          }
+          finalResultCleanupTimer = setTimeout(
+            cleanupFinalResult,
+            this.finalResultGraceMs,
+          );
         }
       });
 
