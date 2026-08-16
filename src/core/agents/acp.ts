@@ -132,8 +132,8 @@ function redactAcpErrorForThrow(error: unknown, target: string): unknown {
 
 // Rough character-to-token heuristic. ACP's runtime only surfaces a cumulative
 // `used` context size via usage_update status events, and many adapters never
-// emit those. Estimating from text length gives the user a non-zero, vaguely
-// proportional number for both inputs and outputs regardless of adapter.
+// emit those. Estimating from text length preserves a proportional provisional
+// value for both inputs and outputs regardless of adapter.
 function estimateTokens(charCount: number): number {
   if (charCount <= 0) return 0;
   return Math.ceil(charCount / 4);
@@ -270,12 +270,12 @@ export class AcpAgent implements Agent {
 
     const computeUsage = (): TokenUsage => {
       const usedDelta = Math.max(0, latestUsed - iterationStartUsed);
-      // Prefer the adapter's reported context delta when available, since
-      // that is the authoritative number. Fall back to prompt + tool-call
-      // heuristic so the renderer is never stuck at near-zero for adapters
-      // that don't emit usage_update. Tool calls are the dominant input
-      // contributor in practice (each one feeds a result back to the model
-      // on the next round).
+      // Prefer the adapter's reported context delta when available. Fall back
+      // to a prompt + tool-call heuristic for a proportional provisional
+      // estimate when adapters do not emit usage_update. Neither source is a
+      // complete input/output total, so tokensAvailable remains false below.
+      // Tool calls are the dominant input contributor because each result
+      // flows back to the model on the next round.
       const fallbackInput =
         promptTokenEstimate + toolCallCount * ESTIMATED_TOKENS_PER_TOOL_CALL;
       const inputTokens = usedDelta > 0 ? usedDelta : fallbackInput;
@@ -302,8 +302,8 @@ export class AcpAgent implements Agent {
     };
 
     try {
-      // Surface an initial input-token estimate immediately so the renderer
-      // shows non-zero numbers as soon as the iteration starts.
+      // Emit a provisional estimate before the first ACP status event so
+      // adapter consumers receive an immediate usage update.
       onUsage?.(computeUsage());
 
       try {
@@ -319,12 +319,9 @@ export class AcpAgent implements Agent {
             }
             pendingStream = stream;
             pendingMessage += text;
-            // Count both output and thought streams toward output tokens -
-            // reasoning is real generated text that consumes tokens. Without
-            // this, agents that stream reasoning before answering (Gemini,
-            // GPT-5, etc.) leave the renderer at 0 output tokens for the
-            // entire thinking phase. outputBuf stays output-only because it
-            // is used for JSON parsing and reasoning text would corrupt it.
+            // Count both output and thought streams in the provisional output
+            // estimate because reasoning is generated text. outputBuf stays
+            // output-only because reasoning text would corrupt JSON parsing.
             if (stream === "output") {
               outputBuf += text;
             }

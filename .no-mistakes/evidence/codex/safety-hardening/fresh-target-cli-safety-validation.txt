@@ -1,0 +1,85 @@
+Target: 31832bc9cb6c7962a8396ea6b0907f7ed630fce7
+Built CLI: dist/cli.mjs
+Validation environment: local fixture repositories and local agent/inhibitor contract harnesses only; no install, deployment, or canary
+
+=== Linux inhibitor re-exec publishes atomic worktree identity ===
+Command: gnhf "live receipt check" --agent opencode --max-iterations 0 --prevent-sleep on --worktree --preserve-worktree
+Inhibitor invocation: systemd-inhibit --what=idle:sleep --mode=block --who=gnhf --why=Prevent sleep while gnhf is running .../dist/cli.mjs live receipt check --agent opencode --max-iterations 0 --prevent-sleep on --worktree --preserve-worktree
+Exit code: 0
+
+CLI permanent summary:
+  gnhf stopped
+  opencode ran for 0s before: max iterations reached (0)
+  iterations      0 total       0 good       0 failed
+  tokens          0 in          0 out
+  branch diff     0 commits     +0           -0
+  gnhf: worktree preserved at .../repo-gnhf-worktrees/live-receipt-check-258f20
+
+Published receipt:
+{"schemaVersion":1,"receiptId":"3afa3ce8-ec43-4853-8d88-9c8659d32066","runId":"live-receipt-check-258f20","state":"created","worktreePath":".../repo-gnhf-worktrees/live-receipt-check-258f20","baseCommit":"66c9b552415c3e3a0bf5d0688c4aa7d69fb87558"}
+Receipt mode: 600
+Original branch: main
+Preserved branch: gnhf/live-receipt-check-258f20
+Preserved status: clean
+Lifecycle receipts:
+{"event":"run:complete","status":"aborted","iterations":0,"totalInputTokens":0,"totalOutputTokens":0,"tokensAvailable":true,"reportedCostUsd":null,"commitCount":0,"worktreePath":".../repo-gnhf-worktrees/live-receipt-check-258f20"}
+{"event":"worktree:preserved","worktreePath":".../repo-gnhf-worktrees/live-receipt-check-258f20","reason":"requested"}
+
+=== Forced dirty shutdown preserves work and exact ownership ===
+Command: gnhf "slow cleanup dirty live evidence" --agent opencode --prevent-sleep off --worktree, then two SIGINT signals
+Environment: GNHF_SUPERVISED_PROCESS_GROUP=1
+Exit code: 130
+
+CLI permanent summary:
+  gnhf wrapped
+  opencode worked for 0s on gnhf/slow-cleanup-dirty-l-2c4d35
+  iterations      1 total       0 good       0 failed
+  tokens          unavailable
+  branch diff     0 commits     +0           -0
+  gnhf: worktree preserved at .../repo-gnhf-worktrees/slow-cleanup-dirty-l-2c4d35
+
+Published receipt:
+{"schemaVersion":1,"receiptId":"4aa8d095-87fe-443c-bb67-38944cdfee7e","runId":"slow-cleanup-dirty-l-2c4d35","state":"created","worktreePath":".../repo-gnhf-worktrees/slow-cleanup-dirty-l-2c4d35","baseCommit":"66c9b552415c3e3a0bf5d0688c4aa7d69fb87558"}
+Preserved Git status: M README.md
+Preserved marker: - mock change 1786864493030
+Managed opencode server alive after shutdown: false
+Unrelated sibling process alive after shutdown: true
+Lifecycle receipts:
+{"event":"signal:SIGINT"}
+{"event":"signal:SIGINT"}
+{"event":"run:complete","signal":"SIGINT","status":"stopped","iterations":1,"totalInputTokens":null,"totalOutputTokens":null,"tokensAvailable":false,"reportedCostUsd":null,"commitCount":0,"worktreePath":".../repo-gnhf-worktrees/slow-cleanup-dirty-l-2c4d35"}
+{"event":"worktree:preserved","worktreePath":".../repo-gnhf-worktrees/slow-cleanup-dirty-l-2c4d35","reason":"dirty"}
+
+=== Concrete reported cost enforces the cap and retains receipts ===
+Command: gnhf "live cost concrete" --agent cursor --current-branch --prevent-sleep off --max-reported-cost-usd 0.5 --max-iterations 2
+Exit code: 0
+
+CLI permanent summary:
+  gnhf stopped
+  cursor ran for 0s before: max reported cost reached ($1.25/$0.50)
+  iterations      1 total       0 good       0 failed
+  tokens          7 in          4 out
+  branch diff     0 commits     +0           -0
+Commit count: 1 (unchanged from fixture baseline)
+Working tree status: clean
+Usage receipts:
+{"event":"agent:run:end","iteration":1,"outcome":"aborted","success":null,"inputTokens":7,"outputTokens":4,"cacheReadTokens":2,"cacheCreationTokens":1,"reportedCostUsd":1.25,"reportedCostAvailable":true,"tokensAvailable":true,"estimated":false}
+{"event":"orchestrator:end","status":"aborted","iterations":1,"successCount":0,"failCount":0,"totalInputTokens":7,"totalOutputTokens":4,"tokensAvailable":true,"reportedCostUsd":1.25,"reportedCostAvailable":true,"commitCount":0}
+{"event":"run:complete","status":"aborted","iterations":1,"successCount":0,"failCount":0,"totalInputTokens":7,"totalOutputTokens":4,"tokensAvailable":true,"reportedCostUsd":1.25,"commitCount":0,"worktreePath":null}
+
+=== Missing reported cost is not inferred ===
+Command: gnhf "live cost missing" --agent cursor --current-branch --prevent-sleep off --max-reported-cost-usd 0 --max-iterations 1
+Exit code: 0
+
+CLI permanent summary:
+  gnhf stopped
+  cursor ran for 0s before: max iterations reached (1)
+  iterations      1 total       1 good       0 failed
+  tokens          7 in          4 out
+  branch diff     1 commit      +1           -0
+Commit count: 2 (one successful agent commit after fixture baseline)
+Working tree status: clean
+Usage receipts:
+{"event":"agent:run:end","iteration":1,"outcome":"completed","success":true,"inputTokens":7,"outputTokens":4,"cacheReadTokens":2,"cacheCreationTokens":1,"reportedCostUsd":null,"reportedCostAvailable":false,"tokensAvailable":true,"estimated":false}
+{"event":"orchestrator:end","status":"aborted","iterations":1,"successCount":1,"failCount":0,"totalInputTokens":7,"totalOutputTokens":4,"tokensAvailable":true,"reportedCostUsd":null,"reportedCostAvailable":false,"commitCount":1}
+{"event":"run:complete","status":"aborted","iterations":1,"successCount":1,"failCount":0,"totalInputTokens":7,"totalOutputTokens":4,"tokensAvailable":true,"reportedCostUsd":null,"commitCount":1,"worktreePath":null}

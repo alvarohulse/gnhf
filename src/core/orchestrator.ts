@@ -55,9 +55,8 @@ export interface OrchestratorState {
   totalOutputTokens: number;
   reportedCostUsd: number | null;
   tokensAvailable?: boolean;
-  // Sticky flag: true when at least one iteration's usage was reported as
-  // estimated (e.g. an ACP adapter that doesn't emit usage_update). Once set,
-  // it stays set for the rest of the run so totals are presented honestly.
+  // Sticky diagnostic flag: true when at least one iteration's usage was
+  // estimated (e.g. an ACP adapter that doesn't emit usage_update).
   tokensEstimated: boolean;
   commitCount: number;
   iterations: IterationRecord[];
