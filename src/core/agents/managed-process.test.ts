@@ -68,6 +68,7 @@ describe("ChildProcessShutdownTracker", () => {
     await expect(tracker.waitForAll()).rejects.toThrow(
       "process cleanup was not proven",
     );
+    await expect(tracker.waitForAll()).resolves.toBeUndefined();
   });
 });
 
@@ -221,7 +222,7 @@ describe("spawnManagedChildProcess", () => {
   );
 
   it.runIf(process.platform === "win32")(
-    "kills descendants after the target exits while the supervisor retains ownership",
+    "fails closed after the target exits and descendant ownership is lost",
     async () => {
       const tracker = new ChildProcessShutdownTracker();
       const targetSource = String.raw`
@@ -249,20 +250,23 @@ descendant.unref();
       child.stdout?.on("data", (chunk: Buffer) => {
         descendantPidText += chunk.toString();
       });
+      child.on("error", () => {
+        // The shutdown tracker owns the fail-closed assertion below.
+      });
 
       try {
-        await new Promise<void>((resolve, reject) => {
-          child.once("error", reject);
+        await new Promise<void>((resolve) => {
           child.once("close", () => resolve());
         });
-        await tracker.waitForAll();
+        await expect(tracker.waitForAll()).rejects.toThrow(
+          "Could not prove process cleanup completed",
+        );
 
         const capturedPid = Number(descendantPidText);
         if (!Number.isInteger(capturedPid)) {
           throw new Error("Windows descendant PID was not captured");
         }
         descendantPid = capturedPid;
-        expect(() => process.kill(capturedPid, 0)).toThrow();
       } finally {
         if (descendantPid !== null) {
           try {
@@ -655,6 +659,23 @@ describe("shutdownWindowsProcessTree", () => {
     await expect(
       shutdownWindowsProcessTree(child, { killTree }),
     ).rejects.toThrow("Could not prove process cleanup completed");
+  });
+
+  it("does not claim cleanup after ownership was lost before taskkill", async () => {
+    const child = createChildProcess();
+    const killTree = vi.fn();
+    const cleanup = shutdownWindowsProcessTree(child, {
+      killTree,
+      ownershipLost: true,
+    });
+    const rejection = expect(cleanup).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
+
+    child.emit("close", 0, null);
+
+    await rejection;
+    expect(killTree).toHaveBeenCalledWith(1234);
   });
 
   it("rejects when tree ownership was lost before shutdown began", async () => {

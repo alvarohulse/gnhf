@@ -385,7 +385,7 @@ export class RovoDevAgent implements Agent {
             .finalizeOwnedProcessGroup(server.child, server.detached, () =>
               this.shutdownServerProcess(server),
             )
-            .then(clearClosedServer, clearClosedServer);
+            .then(clearClosedServer, () => undefined);
         } else {
           this.server = null;
         }
@@ -868,17 +868,32 @@ export class RovoDevAgent implements Agent {
       pid: server.child.pid,
     });
 
-    this.closingPromise = this.shutdowns
-      .start(() => this.shutdownServerProcess(server))
+    const shutdown = this.shutdowns.start(() =>
+      this.shutdownServerProcess(server),
+    );
+    this.closingPromise = shutdown
+      .then(
+        () => {
+          if (this.server === server) {
+            this.server = null;
+          }
+          appendDebugLog("rovodev:shutdown:done", {
+            port: server.port,
+            elapsedMs: Date.now() - shutdownStartedAt,
+          });
+        },
+        (error) => {
+          this.shutdowns.acknowledgeFailure(error);
+          appendDebugLog("rovodev:shutdown:failed", {
+            port: server.port,
+            elapsedMs: Date.now() - shutdownStartedAt,
+            error: serializeError(error),
+          });
+          throw error;
+        },
+      )
       .finally(() => {
-        if (this.server === server) {
-          this.server = null;
-        }
         this.closingPromise = null;
-        appendDebugLog("rovodev:shutdown:done", {
-          port: server.port,
-          elapsedMs: Date.now() - shutdownStartedAt,
-        });
       });
 
     await this.closingPromise;

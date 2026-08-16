@@ -20,6 +20,7 @@ interface ShutdownChildProcessOptions {
 
 interface ShutdownWindowsProcessTreeOptions {
   killTree?: (pid: number) => void;
+  ownershipLost?: boolean;
   timeoutMs?: number;
 }
 
@@ -145,10 +146,12 @@ export function spawnManagedChildProcess(
   } | null = null;
   let settled = false;
 
-  const startManagedShutdown = () => {
+  const startManagedShutdown = (ownershipLost = false) => {
     const startShutdown = () =>
       platform === "win32"
-        ? shutdownWindowsProcessTree(managed as unknown as ChildProcess)
+        ? shutdownWindowsProcessTree(managed as unknown as ChildProcess, {
+            ownershipLost,
+          })
         : shutdownChildProcess(managed as unknown as ChildProcess, {
             detached: true,
             timeoutMs: 0,
@@ -173,7 +176,7 @@ export function spawnManagedChildProcess(
       return;
     }
     targetStatus = { code: message.code, signal: message.signal };
-    void startManagedShutdown().catch((error: unknown) => {
+    void startManagedShutdown(platform === "win32").catch((error: unknown) => {
       managed.emit(
         "error",
         error instanceof Error
@@ -223,7 +226,15 @@ export class ChildProcessShutdownTracker {
       await Promise.allSettled(this.pending);
     }
     if (this.failure !== null) {
-      throw this.failure;
+      const failure = this.failure;
+      this.failure = null;
+      throw failure;
+    }
+  }
+
+  acknowledgeFailure(error: unknown): void {
+    if (this.failure === error) {
+      this.failure = null;
     }
   }
 
@@ -331,7 +342,11 @@ export function shutdownWindowsProcessTree(
 
       function settleIfComplete(): void {
         if (treeTerminationConfirmed && rootClosed) {
-          settle();
+          settle(
+            options.ownershipLost
+              ? new IncompleteChildProcessShutdownError(pid)
+              : undefined,
+          );
         }
       }
 

@@ -669,7 +669,7 @@ export class OpenCodeAgent implements Agent {
             .finalizeOwnedProcessGroup(server.child, server.detached, () =>
               this.shutdownServerProcess(server),
             )
-            .then(clearClosedServer, clearClosedServer);
+            .then(clearClosedServer, () => undefined);
         } else {
           this.server = null;
         }
@@ -828,6 +828,7 @@ export class OpenCodeAgent implements Agent {
     let lastUsageSignature = "0:0:0:0:0:na:true";
     const structuredOutputByMessageId = new Map<string, AgentOutput>();
     const usageReceiptMessageIds = new Set<string>();
+    let lastStructuredOutputMessageId: string | null = null;
     let sawUnboundStructuredOutput = false;
     let streamErrorInfo: OpenCodeStreamErrorInfo | null = null;
 
@@ -1119,6 +1120,7 @@ export class OpenCodeAgent implements Agent {
               sawUnboundStructuredOutput = true;
             } else {
               structuredOutputByMessageId.set(info.id, info.structured);
+              lastStructuredOutputMessageId = info.id;
             }
           }
         }
@@ -1258,7 +1260,14 @@ export class OpenCodeAgent implements Agent {
       telemetry: buildTelemetry(),
     });
 
+    if (streamErrorInfo) {
+      messageAbortController.abort();
+    }
     const messageResult = await messageRequest;
+    if (streamErrorInfo) {
+      markUsageUnavailable();
+      throw new Error(buildProviderErrorMessage(streamErrorInfo));
+    }
     if (!messageResult.ok) {
       if (
         isAbortError(messageResult.error) ||
@@ -1283,16 +1292,11 @@ export class OpenCodeAgent implements Agent {
       }
     }
 
-    if (streamErrorInfo) {
-      markUsageUnavailable();
-      throw new Error(buildProviderErrorMessage(streamErrorInfo));
-    }
-
     const finalOutputText = toNonEmptyString(lastFinalAnswerText);
 
     if (
       finalOutputText === null &&
-      structuredOutputByMessageId.size === 0 &&
+      lastStructuredOutputMessageId === null &&
       !sawUnboundStructuredOutput
     ) {
       appendDebugLog("opencode:output:missing", {
@@ -1302,7 +1306,8 @@ export class OpenCodeAgent implements Agent {
       throw new Error("OpenCode produced no final answer");
     }
 
-    const terminalMessageId = lastFinalAnswerMessageId;
+    const terminalMessageId =
+      lastStructuredOutputMessageId ?? lastFinalAnswerMessageId;
     const structuredOutput =
       terminalMessageId === null
         ? undefined
@@ -1312,9 +1317,11 @@ export class OpenCodeAgent implements Agent {
       usageReceiptMessageIds.has(terminalMessageId);
     const structuredOutputMismatch =
       sawUnboundStructuredOutput ||
-      (structuredOutputByMessageId.size > 0 && structuredOutput === undefined);
+      (lastStructuredOutputMessageId !== null &&
+        structuredOutput === undefined) ||
+      (finalOutputText !== null &&
+        lastFinalAnswerMessageId !== terminalMessageId);
     if (
-      finalOutputText === null ||
       terminalMessageId === null ||
       !hasMatchingUsageReceipt ||
       structuredOutputMismatch
@@ -1345,6 +1352,13 @@ export class OpenCodeAgent implements Agent {
         usage,
         sawSessionIdle,
       };
+    }
+
+    if (finalOutputText === null) {
+      markUsageUnavailable();
+      throw new Error(
+        "OpenCode terminal output identity could not be verified",
+      );
     }
 
     try {
@@ -1434,17 +1448,32 @@ export class OpenCodeAgent implements Agent {
       pid: server.child.pid,
     });
 
-    this.closingPromise = this.shutdowns
-      .start(() => this.shutdownServerProcess(server))
+    const shutdown = this.shutdowns.start(() =>
+      this.shutdownServerProcess(server),
+    );
+    this.closingPromise = shutdown
+      .then(
+        () => {
+          if (this.server === server) {
+            this.server = null;
+          }
+          appendDebugLog("opencode:shutdown:done", {
+            port: server.port,
+            elapsedMs: Date.now() - shutdownStartedAt,
+          });
+        },
+        (error) => {
+          this.shutdowns.acknowledgeFailure(error);
+          appendDebugLog("opencode:shutdown:failed", {
+            port: server.port,
+            elapsedMs: Date.now() - shutdownStartedAt,
+            error: serializeError(error),
+          });
+          throw error;
+        },
+      )
       .finally(() => {
-        if (this.server === server) {
-          this.server = null;
-        }
         this.closingPromise = null;
-        appendDebugLog("opencode:shutdown:done", {
-          port: server.port,
-          elapsedMs: Date.now() - shutdownStartedAt,
-        });
       });
 
     await this.closingPromise;

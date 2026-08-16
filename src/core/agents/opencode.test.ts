@@ -744,6 +744,45 @@ describe("OpenCodeAgent", () => {
     expect(proc.kill).not.toHaveBeenCalled();
   });
 
+  it("retries Windows server cleanup after taskkill fails", async () => {
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 5678 });
+    mockSpawn.mockReturnValue(proc);
+    vi.mocked(execFileSync).mockImplementationOnce(() => {
+      throw new Error("access denied");
+    });
+    const windowsAgent = new OpenCodeAgent({
+      fetch: fetchMock as typeof fetch,
+      getPort,
+      platform: "win32",
+    });
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(
+        sseResponse(
+          finalAnswerEvents("done", { input: 1, output: 1, read: 0, write: 0 }),
+        ),
+      )
+      .mockResolvedValueOnce(promptAsyncResponse())
+      .mockResolvedValueOnce(jsonResponse(true));
+
+    await windowsAgent.run("test", "/repo");
+    await expect(windowsAgent.close()).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
+
+    const retry = windowsAgent.close();
+    proc.emit("close", 0, null);
+    await retry;
+
+    const taskkillCalls = vi
+      .mocked(execFileSync)
+      .mock.calls.filter(([command]) => command === "taskkill");
+    expect(taskkillCalls).toHaveLength(2);
+  });
+
   it("reuses the existing server process across runs in the same cwd", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
@@ -1226,6 +1265,28 @@ describe("OpenCodeAgent", () => {
     expect(result.output.summary).toBe("from-structured");
   });
 
+  it("accepts identified structured output without final-answer text", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(
+        sseResponse([
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-1","role":"assistant","structured":{"success":true,"summary":"structured-only","key_changes_made":[],"key_learnings":[]},"tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"session.idle","properties":{"sessionID":"session-123"}}}\n\n',
+        ]),
+      )
+      .mockResolvedValueOnce(promptAsyncResponse())
+      .mockResolvedValueOnce(jsonResponse(true));
+
+    await expect(agent.run("test", "/repo")).resolves.toMatchObject({
+      output: { summary: "structured-only" },
+      usage: { totalTokens: 2, tokensAvailable: true },
+    });
+  });
+
   it("rejects structured output whose assistant identity does not match the terminal marker", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
@@ -1323,6 +1384,30 @@ describe("OpenCodeAgent", () => {
     await expect(agent.run("test", "/repo")).rejects.toThrow(
       /OpenCode provider overloaded: Our servers are currently overloaded/,
     );
+  });
+
+  it("prioritizes a streamed provider error over a prompt request failure", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(
+        sseResponse(
+          'data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"provider failed"}}\n\n',
+        ),
+      )
+      .mockRejectedValueOnce(new Error("prompt request failed"))
+      .mockResolvedValueOnce(jsonResponse(true));
+
+    const error = await agent.run("test", "/repo").then(
+      () => null,
+      (cause: unknown) =>
+        cause instanceof Error ? cause : new Error(String(cause)),
+    );
+    expect(error?.message).toContain("OpenCode provider overloaded");
+    expect(error?.message).not.toContain("prompt request failed");
   });
 
   it("does not throw a JSON parse error when an overload event arrives mid-stream alongside reasoning text", async () => {

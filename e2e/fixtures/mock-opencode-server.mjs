@@ -121,6 +121,7 @@ function emitCompletedEvents(sessionId, summary) {
         sessionID: sessionId,
         part: {
           id: "part-final",
+          messageID: "msg-1",
           type: "text",
           text: JSON.stringify(output),
           metadata: { openai: { phase: "final_answer" } },
@@ -138,6 +139,25 @@ function emitCompletedEvents(sessionId, summary) {
           id: "finish-1",
           messageID: "msg-1",
           type: "step-finish",
+          tokens: {
+            input: 10,
+            output: 5,
+            cache: { read: 1, write: 0 },
+          },
+        },
+      },
+    },
+  });
+  broadcast({
+    directory: "/repo",
+    payload: {
+      type: "message.updated",
+      properties: {
+        sessionID: sessionId,
+        info: {
+          id: "msg-1",
+          role: "assistant",
+          structured: output,
           tokens: {
             input: 10,
             output: 5,
