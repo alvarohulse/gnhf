@@ -465,6 +465,9 @@ export function persistRunEvidence(runInfo: RunInfo, cwd: string): RunInfo {
   if (resolve(persistedRunDir) === resolve(runInfo.runDir)) {
     return runInfo;
   }
+  if (existsSync(persistedRunDir)) {
+    throw new Error(`Run evidence already exists: ${persistedRunDir}`);
+  }
 
   mkdirSync(dirname(persistedRunDir), { recursive: true, mode: 0o700 });
   const temporaryPath = join(
@@ -477,7 +480,6 @@ export function persistRunEvidence(runInfo: RunInfo, cwd: string): RunInfo {
       errorOnExist: true,
       force: false,
     });
-    rmSync(persistedRunDir, { recursive: true, force: true });
     renameSync(temporaryPath, persistedRunDir);
   } finally {
     rmSync(temporaryPath, { recursive: true, force: true });

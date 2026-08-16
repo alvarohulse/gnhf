@@ -3847,6 +3847,14 @@ describe("cli", () => {
     mkdirSync(join(suffixedWorktreePath, ".gnhf", "runs", suffixedRunId), {
       recursive: true,
     });
+    const setupFailurePath = join(
+      suffixedWorktreePath,
+      ".gnhf",
+      "setup-failures",
+      `${suffixedRunId}.json`,
+    );
+    mkdirSync(dirname(setupFailurePath), { recursive: true });
+    writeFileSync(setupFailurePath, '{"error":"metadata disk full"}\n');
 
     const createWorktree = vi.fn((_repo, path) => {
       if (path === join(worktreeRoot, runId)) {
@@ -3894,6 +3902,17 @@ describe("cli", () => {
       );
       expect(createWorktree).not.toHaveBeenCalled();
       expect(orchestratorCtor.mock.calls[0]?.[4]).toBe(suffixedWorktreePath);
+      const archivedSetupFailurePath = join(
+        suffixedWorktreePath,
+        ".gnhf",
+        "runs",
+        suffixedRunId,
+        "setup-failure.json",
+      );
+      expect(existsSync(setupFailurePath)).toBe(false);
+      expect(readFileSync(archivedSetupFailurePath, "utf-8")).toContain(
+        "metadata disk full",
+      );
       expect(persistRunEvidence).toHaveBeenCalledTimes(1);
       expect(removeWorktree).toHaveBeenCalledWith(
         expect.any(String),

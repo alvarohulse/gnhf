@@ -278,7 +278,7 @@ describe("ClaudeAgent", () => {
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
       "taskkill",
       ["/T", "/F", "/PID", "5678"],
-      { stdio: "ignore" },
+      { stdio: "ignore", timeout: 3_000 },
     );
     expect(proc.kill).not.toHaveBeenCalled();
   });
@@ -673,6 +673,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 200,
       cacheReadTokens: 50,
       cacheCreationTokens: 10,
+      totalTokens: 360,
       reportedCostUsd: 0.42,
       tokensAvailable: true,
     });
@@ -702,6 +703,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 100,
       cacheReadTokens: 20,
       cacheCreationTokens: 5,
+      totalTokens: 175,
       tokensAvailable: true,
     });
 
@@ -797,6 +799,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(2, {
@@ -804,6 +807,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(3, {
@@ -811,6 +815,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 11,
       cacheReadTokens: 30,
       cacheCreationTokens: 4,
+      totalTokens: 52,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(4, {
@@ -818,6 +823,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 20,
       cacheReadTokens: 30,
       cacheCreationTokens: 4,
+      totalTokens: 61,
       tokensAvailable: true,
     });
   });
@@ -890,6 +896,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(2, {
@@ -897,6 +904,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(3, {
@@ -904,6 +912,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 11,
       cacheReadTokens: 30,
       cacheCreationTokens: 4,
+      totalTokens: 52,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(4, {
@@ -911,6 +920,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 20,
       cacheReadTokens: 30,
       cacheCreationTokens: 4,
+      totalTokens: 61,
       tokensAvailable: true,
     });
   });
@@ -973,6 +983,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(2, {
@@ -980,6 +991,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 10,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 29,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(3, {
@@ -987,6 +999,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 10,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 29,
       tokensAvailable: true,
     });
   });
@@ -1059,6 +1072,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(2, {
@@ -1066,6 +1080,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(3, {
@@ -1073,6 +1088,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 24,
       cacheReadTokens: 30,
       cacheCreationTokens: 9,
+      totalTokens: 81,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(4, {
@@ -1080,6 +1096,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 24,
       cacheReadTokens: 30,
       cacheCreationTokens: 9,
+      totalTokens: 81,
       tokensAvailable: true,
     });
   });
@@ -1341,6 +1358,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 3,
       cacheReadTokens: 4,
       cacheCreationTokens: 2,
+      totalTokens: 19,
       reportedCostUsd: 0.42,
       tokensAvailable: true,
     });
@@ -1526,6 +1544,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 47,
       cacheReadTokens: 24,
       cacheCreationTokens: 6,
+      totalTokens: 90,
       tokensAvailable: true,
     });
   });
@@ -1612,6 +1631,7 @@ describe("ClaudeAgent", () => {
       outputTokens: 42,
       cacheReadTokens: 21,
       cacheCreationTokens: 5,
+      totalTokens: 79,
       tokensAvailable: true,
     });
   });

@@ -640,6 +640,41 @@ describe("resumeRun", () => {
 });
 
 describe("persistRunEvidence", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockExistsSync.mockReturnValue(false);
+  });
+
+  it("refuses to replace evidence from an existing run", () => {
+    const runDir = "/worktree/.gnhf/runs/run-abc";
+    const persistedRunDir = join("/repo", ".gnhf", "runs", "run-abc");
+    mockExistsSync.mockImplementation((path) => path === persistedRunDir);
+
+    expect(() =>
+      persistRunEvidence(
+        {
+          runId: "run-abc",
+          runDir,
+          promptPath: join(runDir, "prompt.md"),
+          notesPath: join(runDir, "notes.md"),
+          schemaPath: join(runDir, "output-schema.json"),
+          logPath: join(runDir, "gnhf.log"),
+          baseCommit: "abc123",
+          baseCommitPath: join(runDir, "base-commit"),
+          stopWhenPath: join(runDir, "stop-when"),
+          stopWhen: undefined,
+          commitMessagePath: join(runDir, "commit-message"),
+          commitMessage: undefined,
+          runtimeLimitsPath: join(runDir, "runtime-limits.json"),
+          runtimeLimits: {},
+        },
+        "/repo",
+      ),
+    ).toThrow(`Run evidence already exists: ${persistedRunDir}`);
+    expect(mockCpSync).not.toHaveBeenCalled();
+    expect(mockRmSync).not.toHaveBeenCalled();
+  });
+
   it("atomically copies worktree evidence into the originating checkout", () => {
     const runDir = "/worktree/.gnhf/runs/run-abc";
     const runInfo = {
@@ -670,7 +705,7 @@ describe("persistRunEvidence", () => {
     });
     expect(dirname(temporaryPath)).toBe(dirname(persistedRunDir));
     expect(basename(temporaryPath)).toMatch(/^\.run-abc\..+\.tmp$/);
-    expect(mockRmSync).toHaveBeenCalledWith(persistedRunDir, {
+    expect(mockRmSync).not.toHaveBeenCalledWith(persistedRunDir, {
       recursive: true,
       force: true,
     });

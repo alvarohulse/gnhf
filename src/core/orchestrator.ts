@@ -133,6 +133,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private totalTokens = 0;
   private tokensUnavailable = false;
   private reportedCostUnavailable = false;
+  private reportedCostLowerBoundUsd: number | null = null;
   private loopDone = false;
   private stoppedEventEmitted = false;
 
@@ -189,9 +190,11 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       this.state.totalInputTokens = usageState.totalInputTokens;
       this.state.totalOutputTokens = usageState.totalOutputTokens;
       this.totalTokens = usageState.totalTokens;
-      this.state.reportedCostUsd = usageGenerationComplete
-        ? usageState.reportedCostUsd
-        : null;
+      this.reportedCostLowerBoundUsd = usageState.reportedCostUsd;
+      this.state.reportedCostUsd =
+        usageGenerationComplete && !usageState.reportedCostUnavailable
+          ? usageState.reportedCostUsd
+          : null;
       this.tokensUnavailable =
         usageState.tokensUnavailable || !usageGenerationComplete;
       this.reportedCostUnavailable =
@@ -519,8 +522,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     const baseOutputTokens = this.state.totalOutputTokens;
     const baseTotalTokens = this.totalTokens;
     const baseReportedCostUsd = this.state.reportedCostUsd;
+    const baseReportedCostLowerBoundUsd = this.reportedCostLowerBoundUsd;
     let agentRunReceiptWritten = false;
     let pendingAbortUsage: TokenUsage | null = null;
+    let pendingAbortLimit: "tokens" | "reported-cost" | null = null;
 
     if (
       this.limits.preserveWorkspaceOnForceStop === true &&
@@ -550,23 +555,32 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         this.state.totalOutputTokens = baseOutputTokens;
         this.totalTokens = baseTotalTokens;
       }
-      if (
-        usage.reportedCostUsd !== undefined &&
-        !this.reportedCostUnavailable
-      ) {
-        this.state.reportedCostUsd =
-          (baseReportedCostUsd ?? 0) + usage.reportedCostUsd;
+      if (usage.reportedCostUsd !== undefined) {
+        this.reportedCostLowerBoundUsd =
+          (baseReportedCostLowerBoundUsd ?? 0) + usage.reportedCostUsd;
+        this.state.reportedCostUsd = !this.reportedCostUnavailable
+          ? (baseReportedCostUsd ?? 0) + usage.reportedCostUsd
+          : null;
       } else {
+        this.reportedCostLowerBoundUsd = baseReportedCostLowerBoundUsd;
         this.state.reportedCostUsd = baseReportedCostUsd;
       }
       this.activeIterationTokensEstimated = usage.estimated === true;
       this.emit("state", this.getState());
 
-      const reason =
-        (tokensAuthoritative ? this.getTokenAbortReason(true) : null) ??
-        this.getReportedCostAbortReason();
-      if (reason && this.pendingAbortReason === null) {
+      const tokenAbortReason = tokensAuthoritative
+        ? this.getTokenAbortReason(true)
+        : null;
+      const reportedCostAbortReason = this.getReportedCostAbortReason();
+      const reason = tokenAbortReason ?? reportedCostAbortReason;
+      if (this.pendingAbortReason !== null) {
+        if (isAuthoritativeAbortUsage(usage)) {
+          pendingAbortUsage = { ...usage };
+        }
+      } else if (reason !== null) {
         this.pendingAbortReason = reason;
+        pendingAbortLimit =
+          tokenAbortReason !== null ? "tokens" : "reported-cost";
         pendingAbortUsage = { ...usage };
         if (
           this.activeAbortController &&
@@ -604,7 +618,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       });
 
       if (this.pendingAbortReason !== null && pendingAbortUsage !== null) {
-        return await settleRuntimeLimitAbort(this, pendingAbortUsage);
+        const abortUsage = isAuthoritativeAbortUsage(result.usage)
+          ? result.usage
+          : pendingAbortUsage;
+        return await settleRuntimeLimitAbort(this, abortUsage);
       }
 
       if (this.stopRequested) {
@@ -728,6 +745,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       orchestrator.state.totalOutputTokens = baseOutputTokens;
       orchestrator.totalTokens = baseTotalTokens;
       orchestrator.state.reportedCostUsd = baseReportedCostUsd;
+      orchestrator.reportedCostLowerBoundUsd = baseReportedCostLowerBoundUsd;
       orchestrator.activeIterationTokensAvailable = false;
       orchestrator.activeIterationTokensEstimated = false;
     }
@@ -757,10 +775,29 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       if (usage.reportedCostUsd === undefined) {
         orchestrator.reportedCostUnavailable = true;
         orchestrator.state.reportedCostUsd = null;
-      } else if (!orchestrator.reportedCostUnavailable) {
+        orchestrator.reportedCostLowerBoundUsd = baseReportedCostLowerBoundUsd;
+      } else {
+        orchestrator.reportedCostLowerBoundUsd =
+          (baseReportedCostLowerBoundUsd ?? 0) + usage.reportedCostUsd;
         orchestrator.state.reportedCostUsd =
-          (baseReportedCostUsd ?? 0) + usage.reportedCostUsd;
+          !orchestrator.reportedCostUnavailable
+            ? (baseReportedCostUsd ?? 0) + usage.reportedCostUsd
+            : null;
       }
+    }
+
+    function isAuthoritativeAbortUsage(usage: TokenUsage): boolean {
+      if (pendingAbortLimit === "tokens") {
+        return hasCompleteTokenUsage(usage) && usage.estimated !== true;
+      }
+      if (pendingAbortLimit === "reported-cost") {
+        return (
+          usage.reportedCostUsd !== undefined &&
+          Number.isFinite(usage.reportedCostUsd) &&
+          usage.reportedCostUsd >= 0
+        );
+      }
+      return false;
     }
 
     async function settleRuntimeLimitAbort(
@@ -831,7 +868,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       totalInputTokens: this.state.totalInputTokens,
       totalOutputTokens: this.state.totalOutputTokens,
       totalTokens: this.totalTokens,
-      reportedCostUsd: this.state.reportedCostUsd,
+      reportedCostUsd: this.reportedCostLowerBoundUsd,
       tokensUnavailable: this.tokensUnavailable,
       reportedCostUnavailable: this.reportedCostUnavailable,
       tokensEstimated: this.state.tokensEstimated,
@@ -1034,7 +1071,6 @@ ${recovery.detail}
   ): string | null {
     if (
       this.limits.maxTokens === undefined ||
-      this.tokensUnavailable ||
       this.state.tokensEstimated ||
       !hasAuthoritativeReceipt
     ) {
@@ -1047,16 +1083,18 @@ ${recovery.detail}
   }
 
   private getReportedCostAbortReason(): string | null {
+    const reportedCostUsd = this.reportedCostUnavailable
+      ? this.reportedCostLowerBoundUsd
+      : this.state.reportedCostUsd;
     if (
       this.limits.maxReportedCostUsd === undefined ||
-      this.reportedCostUnavailable ||
-      this.state.reportedCostUsd === null ||
-      this.state.reportedCostUsd < this.limits.maxReportedCostUsd
+      reportedCostUsd === null ||
+      reportedCostUsd < this.limits.maxReportedCostUsd
     ) {
       return null;
     }
 
-    return `max reported cost reached ($${this.state.reportedCostUsd.toFixed(2)}/$${this.limits.maxReportedCostUsd.toFixed(2)})`;
+    return `max reported cost reached ($${reportedCostUsd.toFixed(2)}/$${this.limits.maxReportedCostUsd.toFixed(2)})`;
   }
 
   private finishGracefulStop(): void {

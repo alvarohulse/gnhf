@@ -155,13 +155,23 @@ function toTokenUsage(usage: {
 }): TokenUsage {
   const inputTokens = usage.input_tokens;
   const outputTokens = usage.output_tokens;
+  const cacheReadTokens = usage.cache_read_input_tokens ?? 0;
+  const cacheCreationTokens = usage.cache_creation_input_tokens ?? 0;
+  const tokensAvailable =
+    isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens);
+  const normalizedInputTokens = (inputTokens ?? 0) + cacheReadTokens;
   return {
-    inputTokens: (inputTokens ?? 0) + (usage.cache_read_input_tokens ?? 0),
+    inputTokens: normalizedInputTokens,
     outputTokens: outputTokens ?? 0,
-    cacheReadTokens: usage.cache_read_input_tokens ?? 0,
-    cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
-    tokensAvailable:
-      isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
+    cacheReadTokens,
+    cacheCreationTokens,
+    ...(tokensAvailable
+      ? {
+          totalTokens:
+            normalizedInputTokens + (outputTokens ?? 0) + cacheCreationTokens,
+        }
+      : {}),
+    tokensAvailable,
   };
 }
 
@@ -188,6 +198,15 @@ function toResultUsage(event: ClaudeResultEvent): TokenUsage | null {
     cacheCreationTokens: isValidTokenCount(cacheCreationTokens)
       ? cacheCreationTokens
       : 0,
+    ...(tokensAvailable
+      ? {
+          totalTokens:
+            inputTokens +
+            outputTokens +
+            (isValidTokenCount(cacheReadTokens) ? cacheReadTokens : 0) +
+            (isValidTokenCount(cacheCreationTokens) ? cacheCreationTokens : 0),
+        }
+      : {}),
     ...(reportedCostAvailable ? { reportedCostUsd } : {}),
     tokensAvailable,
   };
@@ -363,6 +382,7 @@ export class ClaudeAgent implements Agent {
           env: process.env,
         },
         this.shutdowns,
+        this.platform,
       );
       this.activeChild = child;
       child.on("close", () => {
@@ -523,6 +543,14 @@ export class ClaudeAgent implements Agent {
           cumulative.tokensAvailable = [...usageByMessageId.values()].every(
             (usage) => usage.tokensAvailable,
           );
+          if (cumulative.tokensAvailable) {
+            cumulative.totalTokens =
+              cumulative.inputTokens +
+              cumulative.outputTokens +
+              cumulative.cacheCreationTokens;
+          } else {
+            delete cumulative.totalTokens;
+          }
           onUsage?.({ ...cumulative });
 
           if (onMessage) {

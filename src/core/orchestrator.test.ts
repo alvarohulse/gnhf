@@ -428,11 +428,7 @@ describe("Orchestrator stop limits", () => {
         "ship it",
         "/repo",
         2,
-        {
-          maxIterations: 3,
-          maxTokens: 10,
-          maxReportedCostUsd: 0.3,
-        },
+        { maxIterations: 3 },
       );
 
       expect(orchestrator.getState()).toMatchObject({
@@ -445,6 +441,58 @@ describe("Orchestrator stop limits", () => {
       await orchestrator.start();
 
       expect(agent.run).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    {
+      limit: { maxTokens: 10 },
+      reason: "max tokens reached (12/10)",
+    },
+    {
+      limit: { maxReportedCostUsd: 0.3 },
+      reason: "max reported cost reached ($0.40/$0.30)",
+    },
+  ])(
+    "enforces a lowered cap against an incomplete persisted usage lower bound",
+    async ({ limit, reason }) => {
+      mockReadRunUsageState.mockReturnValueOnce({
+        generation: 2,
+        phase: "in-progress",
+        totalInputTokens: 4,
+        totalOutputTokens: 2,
+        totalTokens: 12,
+        reportedCostUsd: 0.4,
+        tokensUnavailable: false,
+        reportedCostUnavailable: false,
+        tokensEstimated: false,
+        hasAuthoritativeTokenReceipt: true,
+      });
+      const agent: Agent = {
+        name: "pi",
+        run: vi.fn(async () => createSuccessResult()),
+      };
+      const orchestrator = new Orchestrator(
+        config,
+        agent,
+        runInfo,
+        "ship it",
+        "/repo",
+        2,
+        { maxIterations: 3, ...limit },
+      );
+      const abort = vi.fn();
+      orchestrator.on("abort", abort);
+
+      expect(orchestrator.getState()).toMatchObject({
+        reportedCostUsd: null,
+        tokensAvailable: false,
+      });
+
+      await orchestrator.start();
+
+      expect(agent.run).not.toHaveBeenCalled();
+      expect(abort).toHaveBeenCalledWith(reason);
     },
   );
 
@@ -814,6 +862,64 @@ describe("Orchestrator stop limits", () => {
       tokensAvailable: true,
       lastMessage: "max tokens reached (10/10)",
     });
+  });
+
+  it("persists the terminal usage receipt after a live cap is crossed", async () => {
+    const agent: Agent = {
+      name: "claude",
+      close: vi.fn(async () => undefined),
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.({
+          inputTokens: 10,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: true,
+        });
+        options?.onUsage?.({
+          inputTokens: 12,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: true,
+        });
+        return {
+          ...createSuccessResult(),
+          usage: {
+            inputTokens: 14,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            tokensAvailable: true,
+          },
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxTokens: 10 },
+    );
+
+    await orchestrator.start();
+
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      totalInputTokens: 14,
+      tokensAvailable: true,
+    });
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(
+      runInfo,
+      expect.objectContaining({
+        phase: "terminal",
+        totalInputTokens: 14,
+        totalTokens: 14,
+      }),
+    );
   });
 
   it("uses provider-authoritative totals for live token caps", async () => {

@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
   rmdirSync,
   writeFileSync,
@@ -316,6 +317,29 @@ function setupFailureRecordPath(worktreePath: string, runId: string): string {
   return join(worktreePath, ".gnhf", "setup-failures", `${runId}.json`);
 }
 
+function archiveSetupFailureRecord(
+  worktreePath: string,
+  runInfo: RunInfo,
+): void {
+  const recordPath = setupFailureRecordPath(worktreePath, runInfo.runId);
+  if (!existsSync(recordPath)) {
+    return;
+  }
+
+  for (let suffix = 0; suffix < 100; suffix += 1) {
+    const filename =
+      suffix === 0 ? "setup-failure.json" : `setup-failure-${suffix}.json`;
+    const archivePath = join(runInfo.runDir, filename);
+    if (existsSync(archivePath)) {
+      continue;
+    }
+    renameSync(recordPath, archivePath);
+    return;
+  }
+
+  throw new Error(`Unable to archive setup failure for ${runInfo.runId}`);
+}
+
 function preserveWorktreeAfterSetupFailure(
   worktreePath: string,
   runId: string,
@@ -426,9 +450,7 @@ function initializeWorktreeRun(
         candidateWorktreePath,
         resumeSchemaOptions,
       );
-      rmSync(setupFailureRecordPath(candidateWorktreePath, candidateRunId), {
-        force: true,
-      });
+      archiveSetupFailureRecord(candidateWorktreePath, runInfo);
       return {
         runInfo,
         worktreePath: candidateWorktreePath,
