@@ -22,6 +22,7 @@ import {
   ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  shutdownWindowsProcessTree,
   spawnManagedChildProcess,
 } from "./managed-process.js";
 import { parseJSONLStream, setupAbortHandler } from "./stream-utils.js";
@@ -160,42 +161,13 @@ function shouldUseWindowsShell(
   }
 }
 
-function terminateCursorProcess(
-  child: ReturnType<typeof spawn>,
-  platform: NodeJS.Platform,
-  detached: boolean,
-): void {
-  if (platform === "win32" && child.pid) {
-    try {
-      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: the process may have already exited.
-    }
-    return;
-  }
-
-  if (detached && child.pid) {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-      return;
-    } catch {
-      // Fall back to the direct child if it was not started as a process group.
-    }
-  }
-
-  child.kill("SIGTERM");
-}
-
 async function shutdownCursorProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
   detached: boolean,
 ): Promise<void> {
   if (platform === "win32") {
-    terminateCursorProcess(child, platform, detached);
-    return;
+    return shutdownWindowsProcessTree(child);
   }
 
   await shutdownChildProcess(child, {
@@ -387,6 +359,7 @@ export class CursorAgent implements Agent {
           stdio: ["pipe", "pipe", "pipe"],
           env: process.env,
         },
+        this.shutdowns,
       );
       this.activeChild = child;
       child.on("close", () => {
@@ -402,10 +375,10 @@ export class CursorAgent implements Agent {
         this.shutdowns.start(() =>
           shutdownCursorProcess(child, this.platform, this.detached),
         );
-      const rejectAfterFinalize = (error: Error) => {
+      const rejectAfterShutdown = (error: Error) => {
         void (async () => {
           try {
-            await finalizeRun();
+            await shutdownRun();
             reject(error);
           } catch (cleanupError) {
             reject(
@@ -445,7 +418,7 @@ export class CursorAgent implements Agent {
       });
 
       child.on("error", (err) => {
-        rejectAfterFinalize(
+        rejectAfterShutdown(
           new Error(`Failed to spawn cursor: ${err.message}`),
         );
       });

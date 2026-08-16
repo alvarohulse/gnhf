@@ -17,6 +17,7 @@ import {
   ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  shutdownWindowsProcessTree,
   spawnManagedChildProcess,
 } from "./managed-process.js";
 
@@ -74,32 +75,13 @@ function shouldUseWindowsShell(
   }
 }
 
-function terminateCodexProcess(
-  child: ReturnType<typeof spawn>,
-  platform: NodeJS.Platform,
-): void {
-  if (platform === "win32" && child.pid) {
-    try {
-      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: the process may have already exited.
-    }
-    return;
-  }
-
-  child.kill("SIGTERM");
-}
-
 async function shutdownCodexProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
   detached: boolean,
 ): Promise<void> {
   if (platform === "win32") {
-    terminateCodexProcess(child, platform);
-    return;
+    return shutdownWindowsProcessTree(child);
   }
 
   await shutdownChildProcess(child, { detached });
@@ -182,6 +164,7 @@ export class CodexAgent implements Agent {
           stdio: ["ignore", "pipe", "pipe"],
           env: process.env,
         },
+        this.shutdowns,
       );
       this.activeChild = child;
       child.on("close", () => {
@@ -267,7 +250,7 @@ export class CodexAgent implements Agent {
             );
           }
         },
-        finalizeRun,
+        { finalize: finalizeRun, shutdown: shutdownRun },
       );
     });
   }

@@ -20,6 +20,7 @@ import {
   ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  shutdownWindowsProcessTree,
   spawnManagedChildProcess,
 } from "./managed-process.js";
 
@@ -64,42 +65,13 @@ function shouldUseWindowsShell(
   }
 }
 
-function terminatePiProcess(
-  child: ReturnType<typeof spawn>,
-  platform: NodeJS.Platform,
-  detached: boolean,
-): void {
-  if (platform === "win32" && child.pid) {
-    try {
-      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: the process may have already exited.
-    }
-    return;
-  }
-
-  if (detached && child.pid) {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-      return;
-    } catch {
-      // Fall back to the direct child if it was not started as a process group.
-    }
-  }
-
-  child.kill("SIGTERM");
-}
-
 async function shutdownPiProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
   detached: boolean,
 ): Promise<void> {
   if (platform === "win32") {
-    terminatePiProcess(child, platform, detached);
-    return;
+    return shutdownWindowsProcessTree(child);
   }
 
   await shutdownChildProcess(child, { detached });
@@ -274,6 +246,7 @@ export class PiAgent implements Agent {
           stdio: ["pipe", "pipe", "pipe"],
           env: process.env,
         },
+        this.shutdowns,
       );
       this.activeChild = child;
       child.on("close", () => {
@@ -524,7 +497,7 @@ export class PiAgent implements Agent {
 
           resolve({ output, usage: lastEmittedUsage });
         },
-        finalizeRun,
+        { finalize: finalizeRun, shutdown: shutdownRun },
       );
     });
   }

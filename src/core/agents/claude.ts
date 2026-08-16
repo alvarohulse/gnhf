@@ -15,6 +15,7 @@ import {
   ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  shutdownWindowsProcessTree,
   spawnManagedChildProcess,
 } from "./managed-process.js";
 import { parseJSONLStream, setupAbortHandler } from "./stream-utils.js";
@@ -98,42 +99,13 @@ function shouldUseWindowsShell(
   }
 }
 
-function terminateClaudeProcess(
-  child: ReturnType<typeof spawn>,
-  platform: NodeJS.Platform,
-  detached: boolean,
-): void {
-  if (platform === "win32" && child.pid) {
-    try {
-      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: the process may have already exited.
-    }
-    return;
-  }
-
-  if (detached && child.pid) {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-      return;
-    } catch {
-      // Fall back to the direct child if it was not started as a process group.
-    }
-  }
-
-  child.kill("SIGTERM");
-}
-
 async function shutdownClaudeProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
   detached: boolean,
 ): Promise<void> {
   if (platform === "win32") {
-    terminateClaudeProcess(child, platform, detached);
-    return;
+    return shutdownWindowsProcessTree(child);
   }
 
   await shutdownChildProcess(child, {
@@ -390,6 +362,7 @@ export class ClaudeAgent implements Agent {
           stdio: ["ignore", "pipe", "pipe"],
           env: process.env,
         },
+        this.shutdowns,
       );
       this.activeChild = child;
       child.on("close", () => {
@@ -405,10 +378,10 @@ export class ClaudeAgent implements Agent {
         this.shutdowns.start(() =>
           shutdownClaudeProcess(child, this.platform, this.detached),
         );
-      const rejectAfterFinalize = (error: Error) => {
+      const rejectAfterShutdown = (error: Error) => {
         void (async () => {
           try {
-            await finalizeRun();
+            await shutdownRun();
             reject(error);
           } catch (cleanupError) {
             reject(
@@ -470,7 +443,7 @@ export class ClaudeAgent implements Agent {
       });
 
       child.on("error", (err) => {
-        rejectAfterFinalize(
+        rejectAfterShutdown(
           new Error(`Failed to spawn claude: ${err.message}`),
         );
       });

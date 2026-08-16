@@ -21,6 +21,7 @@ import {
   IncompleteChildProcessShutdownError,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  shutdownWindowsProcessTree,
   spawnManagedChildProcess,
 } from "./managed-process.js";
 
@@ -107,24 +108,6 @@ function shouldUseWindowsShell(
   } catch {
     return false;
   }
-}
-
-function terminateRovoDevProcess(
-  child: ReturnType<typeof spawn>,
-  platform: NodeJS.Platform,
-): void {
-  if (platform === "win32" && child.pid) {
-    try {
-      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: the process may have already exited.
-    }
-    return;
-  }
-
-  child.kill("SIGTERM");
 }
 
 function getAvailablePort(): Promise<number> {
@@ -343,6 +326,7 @@ export class RovoDevAgent implements Agent {
         stdio: ["ignore", "pipe", "pipe"],
         env: process.env,
       },
+      this.shutdowns,
     ) as unknown as ChildProcessWithoutNullStreams;
 
     const server: RovoDevServer = {
@@ -900,34 +884,14 @@ export class RovoDevAgent implements Agent {
   }
 
   private shutdownServerProcess(server: RovoDevServer): Promise<void> {
-    if (this.platform !== "win32") {
-      return shutdownChildProcess(server.child, {
-        detached: server.detached,
-        killProcess: this.killProcessFn,
-        timeoutMs: 3_000,
-      });
+    if (this.platform === "win32") {
+      return shutdownWindowsProcessTree(server.child);
     }
 
-    return new Promise<void>((resolve) => {
-      const handleClose = () => {
-        server.child.off("close", handleClose);
-        resolve();
-      };
-
-      server.child.on("close", handleClose);
-
-      try {
-        terminateRovoDevProcess(server.child, this.platform);
-      } catch {
-        server.child.off("close", handleClose);
-        resolve();
-        return;
-      }
-
-      setTimeout(() => {
-        server.child.off("close", handleClose);
-        resolve();
-      }, 100).unref?.();
+    return shutdownChildProcess(server.child, {
+      detached: server.detached,
+      killProcess: this.killProcessFn,
+      timeoutMs: 3_000,
     });
   }
 
