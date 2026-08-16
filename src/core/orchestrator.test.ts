@@ -681,12 +681,16 @@ describe("Orchestrator stop limits", () => {
       "ship it",
       "/repo",
       0,
-      { maxIterations: 1 },
+      { maxIterations: 1, maxReportedCostUsd: 0.3 },
     );
 
     await orchestrator.start();
 
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
     expect(orchestrator.getState().reportedCostUsd).toBe(0.25);
+    expect(orchestrator.getState().lastMessage).toBe(
+      "max iterations reached (1)",
+    );
     expect(mockWriteRunUsageState).toHaveBeenLastCalledWith(
       runInfo,
       expect.objectContaining({

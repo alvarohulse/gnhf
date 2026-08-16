@@ -273,6 +273,22 @@ describe("git utilities", () => {
       expect(mockExecFileSync).toHaveBeenCalledTimes(3);
     });
 
+    it("throws CommitFailedError when staging fails so generated changes are preserved", () => {
+      mockExecFileSync.mockImplementation((_cmd, args) => {
+        const argv = args as string[];
+        if (argv[0] === "add") {
+          throw Object.assign(new Error("Command failed"), {
+            stderr: "unable to index file",
+          });
+        }
+        return "";
+      });
+
+      expect(() => commitAll("msg", "/repo")).toThrow(CommitFailedError);
+      expect(mockExecFileSync).toHaveBeenCalledTimes(1);
+      expect(argsOfCall(0)).toEqual(["add", "-A"]);
+    });
+
     it("does not retry with --no-verify when the first commit succeeds", () => {
       mockStagedChanges();
 

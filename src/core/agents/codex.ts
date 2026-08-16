@@ -223,6 +223,8 @@ export class CodexAgent implements Agent {
           cumulative.cacheReadTokens += isValidTokenCount(u.cached_input_tokens)
             ? u.cached_input_tokens
             : 0;
+          cumulative.totalTokens =
+            cumulative.inputTokens + cumulative.outputTokens;
           cumulative.tokensAvailable =
             usageEventCount > 0 && !incompleteUsageObserved;
           onUsage?.({ ...cumulative });

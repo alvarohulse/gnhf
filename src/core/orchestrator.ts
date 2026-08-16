@@ -639,10 +639,19 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       });
 
       if (this.pendingAbortReason !== null && pendingAbortUsage !== null) {
-        const abortUsage = isAuthoritativeAbortUsage(result.usage)
+        const terminalUsageCanCorrectAbort = isAuthoritativeAbortUsage(
+          result.usage,
+        );
+        const abortUsage = terminalUsageCanCorrectAbort
           ? result.usage
           : pendingAbortUsage;
-        return await settleRuntimeLimitAbort(this, abortUsage);
+        if (terminalUsageCanCorrectAbort) {
+          applyTerminalUsage(this, abortUsage);
+          this.pendingAbortReason = getPendingAbortReason(this);
+        }
+        if (this.pendingAbortReason !== null) {
+          return await settleRuntimeLimitAbort(this, abortUsage);
+        }
       }
 
       if (this.stopRequested) {
@@ -846,6 +855,18 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         );
       }
       return false;
+    }
+
+    function getPendingAbortReason(
+      orchestrator: Orchestrator,
+    ): string | null {
+      if (pendingAbortLimit === "tokens") {
+        return orchestrator.getTokenAbortReason(true);
+      }
+      if (pendingAbortLimit === "reported-cost") {
+        return orchestrator.getReportedCostAbortReason();
+      }
+      return null;
     }
 
     async function settleRuntimeLimitAbort(

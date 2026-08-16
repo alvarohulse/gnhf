@@ -208,6 +208,55 @@ describe("CodexAgent", () => {
     );
   });
 
+  it("uses the provider total without double counting cached input", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const onUsage = vi.fn();
+    const agent = new CodexAgent("/tmp/schema.json", {
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+    const promise = agent.run("test prompt", "/work/dir", { onUsage });
+
+    proc.stdout.emit(
+      "data",
+      Buffer.from(
+        `${JSON.stringify({
+          type: "turn.completed",
+          usage: {
+            input_tokens: 24_763,
+            cached_input_tokens: 24_448,
+            output_tokens: 122,
+          },
+        })}\n${JSON.stringify({
+          type: "item.completed",
+          item: {
+            type: "agent_message",
+            text: JSON.stringify({
+              success: true,
+              summary: "done",
+              key_changes_made: [],
+              key_learnings: [],
+            }),
+          },
+        })}\n`,
+      ),
+    );
+    proc.emit("close", 0);
+
+    const result = await promise;
+
+    expect(onUsage).toHaveBeenCalledWith({
+      inputTokens: 24_763,
+      outputTokens: 122,
+      cacheReadTokens: 24_448,
+      cacheCreationTokens: 0,
+      totalTokens: 24_885,
+      tokensAvailable: true,
+    });
+    expect(result.usage.totalTokens).toBe(24_885);
+  });
+
   it("surfaces ownership loss when the group leader closes during abort", async () => {
     vi.useFakeTimers();
     const proc = createMockProcess();

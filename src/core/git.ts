@@ -268,15 +268,15 @@ export function commitAll(message: string, cwd: string): void {
     message,
   ];
 
-  git(["add", "-A"], cwd);
   try {
-    git(["diff", "--cached", "--quiet"], cwd);
-    return;
-  } catch {
-    // Exit 1 means there are staged changes to commit.
-  }
+    git(["add", "-A"], cwd);
+    try {
+      git(["diff", "--cached", "--quiet"], cwd);
+      return;
+    } catch {
+      // Exit 1 means there are staged changes to commit.
+    }
 
-  try {
     git(commitArgs, cwd);
   } catch (error) {
     const commitError = new CommitFailedError(error);
