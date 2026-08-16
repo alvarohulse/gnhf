@@ -459,14 +459,14 @@ export class AcpAgent implements Agent {
       "ACP turn cancellation",
     );
     await captureCleanupFailure(() => turn.result, "ACP turn settlement");
+    if (failures.length === 0) {
+      return;
+    }
+
     try {
       await this.close();
     } catch (error) {
       failures.push(redactAcpErrorForThrow(error, target));
-    }
-
-    if (failures.length === 0) {
-      return;
     }
 
     const error = new IncompleteAgentShutdownError(

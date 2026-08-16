@@ -260,6 +260,28 @@ describe("AcpAgent", () => {
     await expect(runPromise).rejects.toThrow("stream failed");
   });
 
+  it("reuses the runtime after a retryable stream error settles cleanly", async () => {
+    const { runtime } = createFakeRuntime([
+      {
+        events: [],
+        eventError: new Error("stream failed"),
+        result: { status: "cancelled" },
+      },
+      {
+        events: [textDelta(JSON.stringify(VALID_OUTPUT))],
+        result: { status: "completed" },
+      },
+    ]);
+    const agent = makeAgent(runtime);
+
+    await expect(agent.run("first", "/w")).rejects.toThrow("stream failed");
+    await expect(agent.run("second", "/w")).resolves.toMatchObject({
+      output: VALID_OUTPUT,
+    });
+
+    expect(runtime.close).not.toHaveBeenCalled();
+  });
+
   it("fails closed and closes the runtime when turn cancellation hangs", async () => {
     vi.useFakeTimers();
     const neverCancel = new Promise<void>(() => {});
