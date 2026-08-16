@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.1.45](https://github.com/alvarohulse/gnhf/compare/gnhf-v0.1.44...gnhf-v0.1.45) (2026-08-16)
+
+
+### Features
+
+* **cli:** Add explicit worktree preservation ([061ff13](https://github.com/alvarohulse/gnhf/commit/061ff134c8093098c9ce350bef8e614597af3fdd))
+* **cli:** Harden unattended run preservation and limits ([d00683b](https://github.com/alvarohulse/gnhf/commit/d00683bdef48ebb8bd76bc228266bef3acb4c7f0))
+* **limits:** Stop on harness-reported cost ([c770004](https://github.com/alvarohulse/gnhf/commit/c77000471da88a446f2dadef169d8dee01537b96))
+
+
+### Bug Fixes
+
+* **acp:** Keep unavailable usage unestimated ([c17665f](https://github.com/alvarohulse/gnhf/commit/c17665fc0c43fe258282fa0f241729d2d2371fa1))
+* **acp:** Reuse settled runtime after stream errors ([8a1ff7f](https://github.com/alvarohulse/gnhf/commit/8a1ff7fddb43f70296948124090b3b12534af69e))
+* **agents:** Adopt tracked cross-platform shutdown ([693c17b](https://github.com/alvarohulse/gnhf/commit/693c17b699a5d1c5d08f5d53a3f944158754ce27))
+* **agents:** Restrict process cleanup ownership ([0bdee44](https://github.com/alvarohulse/gnhf/commit/0bdee44d0af25822422a2a36dd83a86b365a8c7f))
+* **agents:** Start Windows cleanup before final exit ([79ca74c](https://github.com/alvarohulse/gnhf/commit/79ca74c58ac276723f6b4c6154101e9259f3575c))
+* **agents:** Surface cleanup uncertainty and terminal costs ([c7c3498](https://github.com/alvarohulse/gnhf/commit/c7c3498d666e89ba437af0e5b4333336e0dba369))
+* **cli:** Limit worktree preservation to commit failures ([b73e745](https://github.com/alvarohulse/gnhf/commit/b73e7453f20ae38af192915875cf082cde281e28))
+* **cli:** Persist supervised worktree identity ([ef12d87](https://github.com/alvarohulse/gnhf/commit/ef12d87469c791983b339f239c99b321c48cb2c8))
+* **cli:** Persist worktree identity before run setup ([875ba95](https://github.com/alvarohulse/gnhf/commit/875ba95e0d71498e0b7f275b9ea396b95209cc63))
+* **cli:** Preserve unsafe worktrees on shutdown ([f577fe0](https://github.com/alvarohulse/gnhf/commit/f577fe0334d0b634e992460a6bbcbc8d04310beb))
+* **cli:** Preserve worktrees across forced shutdown ([3946ba9](https://github.com/alvarohulse/gnhf/commit/3946ba91e68cd832db2423ed2a6b060323eddcc1))
+* **cli:** Publish worktree receipts atomically ([066b63b](https://github.com/alvarohulse/gnhf/commit/066b63b027ff49af1e9cf114c474a5e20d901c71))
+* **cli:** Re-exec before worktree creation ([43a6d1d](https://github.com/alvarohulse/gnhf/commit/43a6d1d917d25e6d336bb24c3a4a06a680e680f2))
+* **core:** Preserve recovery work and terminal cost authority ([414f6ea](https://github.com/alvarohulse/gnhf/commit/414f6ea88c4a51d073a1bbb718453b26aa210a13))
+* **cursor:** Defer Windows cleanup through result grace ([a420d78](https://github.com/alvarohulse/gnhf/commit/a420d7849de3c866ca1c76a6dbf953949ae5f024))
+* **cursor:** Stay inside an external supervisor group ([2988df1](https://github.com/alvarohulse/gnhf/commit/2988df1d1eb5b5a4bd083532efd22782bdc83c68))
+* **limits:** Enforce cost caps from terminal receipts ([18a3a6e](https://github.com/alvarohulse/gnhf/commit/18a3a6e57d1a81411f51fa08eed272f3bcc844e5))
+* **limits:** Keep terminal cost authority separate ([c036292](https://github.com/alvarohulse/gnhf/commit/c036292c6e42455cdc325aa863d2a12b21c6051e))
+* **opencode:** Bind terminal output to usage receipts ([e6df6aa](https://github.com/alvarohulse/gnhf/commit/e6df6aa4f2723ccaa772cae252841922af118f29))
+* **opencode:** Serialize turn cleanup and receipt identity ([2da9130](https://github.com/alvarohulse/gnhf/commit/2da91306d7c16023a53f19e23c0baa2876ec2be8))
+* **orchestrator:** Persist unverified cleanup recovery ([d3615d7](https://github.com/alvarohulse/gnhf/commit/d3615d7a28677f8835f5dbb1ef516e12524557f2))
+* **pi:** Drop provisional usage without terminal messages ([f781b2b](https://github.com/alvarohulse/gnhf/commit/f781b2b668a06e1f310eb74cfe10f741b9ad5b19))
+* **pi:** Replace provisional usage with terminal receipts ([d471454](https://github.com/alvarohulse/gnhf/commit/d4714547ab376b8e541bd2b138015a73e8ee22b7))
+* **process:** Preserve supervisor-close uncertainty ([6ae2da6](https://github.com/alvarohulse/gnhf/commit/6ae2da6e24548602d8463a24f7d685fc72091944))
+* **process:** Propagate unverified cleanup state ([be3b080](https://github.com/alvarohulse/gnhf/commit/be3b080d8e903f9ed5d0fb8c4b6d4c38d4e1d47a))
+* **recovery:** Persist cleanup uncertainty across resume ([b3e76a0](https://github.com/alvarohulse/gnhf/commit/b3e76a0867e75f79850f3eb4bcc29de44055f6c3))
+* **recovery:** Preserve legacy commit-failure cleanup semantics ([1ea6b1d](https://github.com/alvarohulse/gnhf/commit/1ea6b1da882ab7711f30ccb382d1e630f377a81b))
+* **runtime:** Accept authoritative cost corrections ([9b20547](https://github.com/alvarohulse/gnhf/commit/9b20547786973a54338545816863737f7b869d7a))
+* **runtime:** Count persisted usage generations on resume ([f413bf1](https://github.com/alvarohulse/gnhf/commit/f413bf13765541a7645d2e8d6bfa0324993d415d))
+* **runtime:** Fail closed on ambiguous agent cleanup ([f8580c0](https://github.com/alvarohulse/gnhf/commit/f8580c0bc8dc6aff18028f98de8335f97027bc07))
+* **runtime:** Finalize managed agent shutdowns ([659a4cd](https://github.com/alvarohulse/gnhf/commit/659a4cd0d52b57b49c7edb915f519f88cdb19f39))
+* **runtime:** Finalize receipts and owned shutdowns ([989a5d5](https://github.com/alvarohulse/gnhf/commit/989a5d54ad315f0986a0f7405da2f153e7767ab2))
+* **runtime:** Harden process cleanup, receipts, and resumed limits ([d20165b](https://github.com/alvarohulse/gnhf/commit/d20165b743d5560508e48145911b083fc15abc8d))
+* **runtime:** Harden recovery and cumulative usage accounting ([b5dbfa4](https://github.com/alvarohulse/gnhf/commit/b5dbfa4e4d92b5d271392a4665f4d630390b5900))
+* **runtime:** Harden recovery, supervision, and usage receipts ([64f8193](https://github.com/alvarohulse/gnhf/commit/64f8193448363c10a328e1a7812b42c117a906cf))
+* **runtime:** Harden shutdown limits and worktree evidence ([0849f7a](https://github.com/alvarohulse/gnhf/commit/0849f7ad5af418441660ac1fa04702e2c27c3302))
+* **runtime:** Harden usage receipts and process shutdown ([d56b9b3](https://github.com/alvarohulse/gnhf/commit/d56b9b3bc29ec89969444ba8810077fbe2bd170a))
+* **runtime:** Harden worktree, supervision, resume, and usage safety ([89079ea](https://github.com/alvarohulse/gnhf/commit/89079ea73668a12382d0f97255d634d0842d61ca))
+* **runtime:** Persist usage bounds and retry managed cleanup ([224b829](https://github.com/alvarohulse/gnhf/commit/224b8298fdb8eb5f661eaf8db32e8515b6fd74fa))
+* **runtime:** Preserve commit recovery and usage accounting ([c076688](https://github.com/alvarohulse/gnhf/commit/c0766881d16c018f73796e66d5a8725495ef9a7e))
+* **runtime:** Preserve evidence and usage lower bounds ([3a7b2e0](https://github.com/alvarohulse/gnhf/commit/3a7b2e07b1e8b211eb7609daa6aa2ae54acd8493))
+* **runtime:** Prove managed process shutdown completion ([02bc331](https://github.com/alvarohulse/gnhf/commit/02bc331a24d40ce564826a1ef7b9aaee458f3891))
+* **runtime:** Retain process ownership through shutdown ([593d208](https://github.com/alvarohulse/gnhf/commit/593d20809f8e6b4a1c422883f8391e533e5f1753))
+* **usage:** Mark missing Cursor tokens unavailable ([738b9f5](https://github.com/alvarohulse/gnhf/commit/738b9f522388286ede8299edf2bede1bd1ac1385))
+* **usage:** Persist complete runtime receipts ([b81da9c](https://github.com/alvarohulse/gnhf/commit/b81da9ceba396efffb1b9f8150c9504ff6cc68a7))
+* **usage:** Preserve complete iteration receipts ([bbc1df0](https://github.com/alvarohulse/gnhf/commit/bbc1df042d569160524eb8ce3b3022b735e3c680))
+* **windows:** Preserve primary results after natural exit ([ec19ed7](https://github.com/alvarohulse/gnhf/commit/ec19ed72b57bfdcfcf73ec819662a4ee511ffa65))
+* **worktree:** Preserve forced and evidence-bearing runs ([8ac543a](https://github.com/alvarohulse/gnhf/commit/8ac543af8e516f8d3cf898326eaa1e416912e15d))
+
 ## [0.1.44](https://github.com/kunchenguid/gnhf/compare/gnhf-v0.1.43...gnhf-v0.1.44) (2026-08-13)
 
 
