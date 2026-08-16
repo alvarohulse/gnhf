@@ -52,6 +52,7 @@ import { appendDebugLog } from "./debug-log.js";
 import { Orchestrator } from "./orchestrator.js";
 import {
   PermanentAgentError,
+  UnverifiedAgentCleanupError,
   type Agent,
   type AgentResult,
   type TokenUsage,
@@ -2724,6 +2725,39 @@ describe("Orchestrator backoff behavior", () => {
       status: "aborted",
       hasPendingWorkspaceRecovery: true,
       lastAgentError: cleanupError.message,
+    });
+  });
+
+  it("keeps a completed result while preserving unverified cleanup", async () => {
+    const cleanupError = new UnverifiedAgentCleanupError(
+      "descendant cleanup was not verified",
+    );
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(async () => createSuccessResult()),
+      close: vi.fn(() => Promise.reject(cleanupError)),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      successCount: 1,
+      hasPendingWorkspaceRecovery: true,
+      lastAgentError: null,
     });
   });
 

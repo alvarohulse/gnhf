@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { initDebugLog, resetDebugLogForTests } from "../debug-log.js";
+import { UnverifiedAgentCleanupError } from "./types.js";
 import {
   ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
@@ -73,6 +74,17 @@ describe("ChildProcessShutdownTracker", () => {
       "process cleanup was not proven",
     );
     await expect(tracker.waitForAll()).resolves.toBeUndefined();
+  });
+
+  it("reports unverified cleanup only during finalization", async () => {
+    const tracker = new ChildProcessShutdownTracker();
+    const error = new UnverifiedAgentCleanupError(
+      "descendant cleanup was not verified",
+    );
+    tracker.recordUnverifiedCleanup(error);
+
+    await expect(tracker.waitForAll()).resolves.toBeUndefined();
+    await expect(tracker.finalize()).rejects.toBe(error);
   });
 });
 
@@ -240,6 +252,9 @@ describe("spawnManagedChildProcess", () => {
 
       await expect(closed).resolves.toEqual({ code: 0, signal: null });
       await expect(tracker.waitForAll()).resolves.toBeUndefined();
+      await expect(tracker.finalize()).rejects.toThrow(
+        "Could not verify descendant process cleanup for PID 1234 after target-close",
+      );
       expect(errors).toEqual([]);
 
       const events = readFileSync(logPath, "utf-8")
