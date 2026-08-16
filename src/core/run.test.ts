@@ -28,12 +28,14 @@ import {
   appendFileSync,
   existsSync,
   readFileSync,
+  readdirSync,
   renameSync,
 } from "node:fs";
 import { findLegacyRunBaseCommit, getHeadCommit } from "./git.js";
 import {
   setupRun,
   appendNotes,
+  getLastIterationNumber,
   resumeRun,
   peekRunMetadata,
   readRunUsageState,
@@ -49,6 +51,7 @@ const mockWriteFileSync = vi.mocked(writeFileSync);
 const mockAppendFileSync = vi.mocked(appendFileSync);
 const mockExistsSync = vi.mocked(existsSync);
 const mockReadFileSync = vi.mocked(readFileSync);
+const mockReaddirSync = vi.mocked(readdirSync);
 const mockRenameSync = vi.mocked(renameSync);
 const mockExecFileSync = vi.mocked(execFileSync);
 const mockFindLegacyRunBaseCommit = vi.mocked(findLegacyRunBaseCommit);
@@ -773,6 +776,36 @@ describe("run usage state", () => {
       temporaryPath,
       join("/run", "usage.json"),
     );
+  });
+});
+
+describe("getLastIterationNumber", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("counts a persisted usage generation created before its transcript", () => {
+    mockReaddirSync.mockReturnValue([
+      "iteration-1.jsonl",
+      "usage.json",
+    ] as unknown as ReturnType<typeof readdirSync>);
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({
+        generation: 2,
+        phase: "in-progress",
+        totalInputTokens: 4,
+        totalOutputTokens: 2,
+        totalTokens: 12,
+        reportedCostUsd: 0.4,
+        tokensUnavailable: false,
+        reportedCostUnavailable: false,
+        tokensEstimated: false,
+        hasAuthoritativeTokenReceipt: true,
+      }),
+    );
+
+    expect(getLastIterationNumber({ runDir: "/run" })).toBe(2);
   });
 });
 
