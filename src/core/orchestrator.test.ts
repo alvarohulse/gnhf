@@ -961,7 +961,7 @@ describe("Orchestrator stop limits", () => {
     expect(orchestrator.getState().status).toBe("aborted");
   });
 
-  it("persists live token usage after a cap abort and enforces it on resume", async () => {
+  it("persists live token usage without certifying streamed cost after a cap abort", async () => {
     let resolveClose!: () => void;
     const closePromise = new Promise<void>((resolve) => {
       resolveClose = resolve;
@@ -981,6 +981,7 @@ describe("Orchestrator stop limits", () => {
               outputTokens: 2,
               cacheReadTokens: 0,
               cacheCreationTokens: 2,
+              reportedCostUsd: 0.4,
               tokensAvailable: true,
             });
           }),
@@ -1024,7 +1025,7 @@ describe("Orchestrator stop limits", () => {
       totalInputTokens: 7,
       totalOutputTokens: 2,
       totalTokens: 11,
-      reportedCostUsd: null,
+      reportedCostUsd: 0.4,
       reportedCostLowerBoundUsd: null,
       tokensUnavailable: false,
       reportedCostUnavailable: true,
@@ -1038,7 +1039,7 @@ describe("Orchestrator stop limits", () => {
       totalInputTokens: 7,
       totalOutputTokens: 2,
       totalTokens: 11,
-      reportedCostUsd: null,
+      reportedCostUsd: 0.4,
       reportedCostLowerBoundUsd: null,
       tokensUnavailable: false,
       reportedCostUnavailable: true,
@@ -1060,6 +1061,37 @@ describe("Orchestrator stop limits", () => {
 
     expect(resumedAgent.run).not.toHaveBeenCalled();
     expect(resumed.getState().lastMessage).toBe("max tokens reached (11/10)");
+
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 1,
+      phase: "terminal",
+      totalInputTokens: 7,
+      totalOutputTokens: 2,
+      totalTokens: 11,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: null,
+      tokensUnavailable: false,
+      reportedCostUnavailable: true,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const costOnlyResumeAgent: Agent = {
+      name: "claude",
+      run: vi.fn(async () => createSuccessResult()),
+    };
+    const costOnlyResume = new Orchestrator(
+      config,
+      costOnlyResumeAgent,
+      runInfo,
+      "ship it",
+      "/repo",
+      1,
+      { maxIterations: 2, maxReportedCostUsd: 0.3 },
+    );
+
+    await costOnlyResume.start();
+
+    expect(costOnlyResumeAgent.run).toHaveBeenCalledTimes(1);
   });
 
   it("treats a live cap as authoritative when the agent resolves", async () => {
@@ -1154,6 +1186,63 @@ describe("Orchestrator stop limits", () => {
         phase: "terminal",
         totalInputTokens: 14,
         totalTokens: 14,
+      }),
+    );
+  });
+
+  it("keeps terminal cost authority when terminal token usage is incomplete", async () => {
+    const agent: Agent = {
+      name: "claude",
+      close: vi.fn(async () => undefined),
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.({
+          inputTokens: 10,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          reportedCostUsd: 0.4,
+          tokensAvailable: true,
+        });
+        return {
+          ...createSuccessResult(),
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            reportedCostUsd: 0.25,
+            tokensAvailable: false,
+          },
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxTokens: 10, maxReportedCostUsd: 0.3 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockCommitAll).not.toHaveBeenCalled();
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      totalInputTokens: 10,
+      reportedCostUsd: 0.25,
+      lastMessage: "max tokens reached (10/10)",
+    });
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(
+      runInfo,
+      expect.objectContaining({
+        phase: "terminal",
+        totalInputTokens: 10,
+        reportedCostUsd: 0.25,
+        reportedCostLowerBoundUsd: 0.25,
+        reportedCostUnavailable: false,
       }),
     );
   });

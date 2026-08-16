@@ -645,13 +645,14 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       });
 
       if (this.pendingAbortReason !== null && pendingAbortUsage !== null) {
-        const terminalUsageCanCorrectAbort = isAuthoritativeTokenUsage(
+        const terminalTokensCanCorrectAbort = isAuthoritativeTokenUsage(
           result.usage,
         );
-        const abortUsage = terminalUsageCanCorrectAbort
-          ? result.usage
-          : pendingAbortUsage;
-        if (terminalUsageCanCorrectAbort) {
+        const abortUsage = combineTokenUsageWithTerminalCost(
+          terminalTokensCanCorrectAbort ? result.usage : pendingAbortUsage,
+          result.usage,
+        );
+        if (terminalTokensCanCorrectAbort) {
           applyTerminalUsage(this, abortUsage);
           this.pendingAbortReason = this.getTokenAbortReason(true);
         }
@@ -737,7 +738,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         return { type: "aborted", reason: err.message };
       }
       if (this.pendingAbortReason !== null && pendingAbortUsage !== null) {
-        return await settleRuntimeLimitAbort(this, pendingAbortUsage);
+        return await settleRuntimeLimitAbort(
+          this,
+          combineTokenUsageWithTerminalCost(pendingAbortUsage),
+        );
       }
       if (!agentRunReceiptWritten) {
         restoreLiveUsage(this);
@@ -861,6 +865,18 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
     function isAuthoritativeTokenUsage(usage: TokenUsage): boolean {
       return hasCompleteTokenUsage(usage) && usage.estimated !== true;
+    }
+
+    function combineTokenUsageWithTerminalCost(
+      tokenUsage: TokenUsage,
+      terminalUsage?: TokenUsage,
+    ): TokenUsage {
+      const usage: TokenUsage = { ...tokenUsage };
+      delete usage.reportedCostUsd;
+      if (terminalUsage?.reportedCostUsd !== undefined) {
+        usage.reportedCostUsd = terminalUsage.reportedCostUsd;
+      }
+      return usage;
     }
 
     async function settleRuntimeLimitAbort(
