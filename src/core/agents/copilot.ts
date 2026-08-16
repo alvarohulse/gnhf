@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import {
   buildAgentOutputSchema,
+  isValidTokenCount,
   parseAgentOutput,
   type Agent,
   type AgentOutputSchema,
@@ -187,6 +188,8 @@ function usageFromRecord(usage: Record<string, unknown>): TokenUsage | null {
     outputTokens: outputTokens ?? 0,
     cacheReadTokens: cacheReadTokens ?? 0,
     cacheCreationTokens: cacheCreationTokens ?? 0,
+    tokensAvailable:
+      isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
   };
 }
 
@@ -242,6 +245,7 @@ export class CopilotAgent implements Agent {
         outputTokens: 0,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       };
 
       parseJSONLStream<CopilotEvent>(child.stdout!, logStream, (event) => {
@@ -267,6 +271,7 @@ export class CopilotAgent implements Agent {
             );
             cumulative.cacheReadTokens = usage.cacheReadTokens;
             cumulative.cacheCreationTokens = usage.cacheCreationTokens;
+            cumulative.tokensAvailable = usage.tokensAvailable;
             onUsage?.({ ...cumulative });
           }
         }

@@ -5,12 +5,13 @@ import {
 } from "node:child_process";
 import { createWriteStream, readFileSync, type WriteStream } from "node:fs";
 import { createServer } from "node:net";
-import type {
-  Agent,
-  AgentOutputSchema,
-  AgentResult,
-  AgentRunOptions,
-  TokenUsage,
+import {
+  isValidTokenCount,
+  type Agent,
+  type AgentOutputSchema,
+  type AgentResult,
+  type AgentRunOptions,
+  type TokenUsage,
 } from "./types.js";
 import { validateAgentOutput } from "./types.js";
 import { appendDebugLog, serializeError } from "../debug-log.js";
@@ -562,7 +563,10 @@ export class RovoDevAgent implements Agent {
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      tokensAvailable: false,
     };
+    let incompleteUsageObserved = false;
+    let usageEventCount = 0;
     let latestTextSegment = "";
     let currentTextParts: string[] = [];
     let currentTextIndexes = new Map<number, number>();
@@ -584,10 +588,24 @@ export class RovoDevAgent implements Agent {
     };
 
     const handleUsage = (event: RovoDevRequestUsageEvent) => {
-      usage.inputTokens += event.input_tokens ?? 0;
-      usage.outputTokens += event.output_tokens ?? 0;
-      usage.cacheReadTokens += event.cache_read_tokens ?? 0;
-      usage.cacheCreationTokens += event.cache_write_tokens ?? 0;
+      usageEventCount += 1;
+      const eventTokensAvailable =
+        isValidTokenCount(event.input_tokens) &&
+        isValidTokenCount(event.output_tokens);
+      incompleteUsageObserved ||= !eventTokensAvailable;
+      usage.inputTokens += isValidTokenCount(event.input_tokens)
+        ? event.input_tokens
+        : 0;
+      usage.outputTokens += isValidTokenCount(event.output_tokens)
+        ? event.output_tokens
+        : 0;
+      usage.cacheReadTokens += isValidTokenCount(event.cache_read_tokens)
+        ? event.cache_read_tokens
+        : 0;
+      usage.cacheCreationTokens += isValidTokenCount(event.cache_write_tokens)
+        ? event.cache_write_tokens
+        : 0;
+      usage.tokensAvailable = usageEventCount > 0 && !incompleteUsageObserved;
       onUsage?.({ ...usage });
     };
 

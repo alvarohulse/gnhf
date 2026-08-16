@@ -117,7 +117,9 @@ export function ensureCleanWorkingTree(cwd: string): void {
 }
 
 export function hasWorkingTreeChanges(cwd: string): boolean {
-  return git(["status", "--porcelain"], cwd).length > 0;
+  return (
+    git(["status", "--porcelain", "--untracked-files=all"], cwd).length > 0
+  );
 }
 
 export function createBranch(branchName: string, cwd: string): void {
@@ -312,7 +314,10 @@ export function createWorktree(
 }
 
 export function removeWorktree(baseCwd: string, worktreePath: string): void {
-  git(["worktree", "remove", worktreePath], baseCwd);
+  git(
+    ["-c", "status.showUntrackedFiles=all", "worktree", "remove", worktreePath],
+    baseCwd,
+  );
 }
 
 export function listWorktreePaths(baseCwd: string): Set<string> {

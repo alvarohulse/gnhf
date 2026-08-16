@@ -14,6 +14,7 @@ import {
   getBranchCommitCount,
   getBranchDiffStats,
   getCurrentBranch,
+  hasWorkingTreeChanges,
   pushCurrentBranch,
   resetHard,
   getRepoRootDir,
@@ -98,6 +99,18 @@ describe("git utilities", () => {
           stdio: "pipe",
         }),
       );
+    });
+  });
+
+  describe("hasWorkingTreeChanges", () => {
+    it("forces untracked files to be included", () => {
+      hasWorkingTreeChanges("/repo");
+
+      expect(argsOfCall(0)).toEqual([
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+      ]);
     });
   });
 
@@ -453,9 +466,15 @@ describe("git utilities", () => {
   });
 
   describe("removeWorktree", () => {
-    it("passes the worktree path as its own argv entry", () => {
+    it("forces Git to check untracked files before removal", () => {
       removeWorktree("/repo", "/tmp/wt");
-      expect(argsOfCall(0)).toEqual(["worktree", "remove", "/tmp/wt"]);
+      expect(argsOfCall(0)).toEqual([
+        "-c",
+        "status.showUntrackedFiles=all",
+        "worktree",
+        "remove",
+        "/tmp/wt",
+      ]);
     });
   });
 

@@ -317,6 +317,7 @@ describe("OpenCodeAgent", () => {
       outputTokens: 4,
       cacheReadTokens: 3,
       cacheCreationTokens: 2,
+      tokensAvailable: true,
     });
     await vi.waitFor(() => {
       expect(readFileSync(logPath, "utf-8")).toContain("message.part.delta");
@@ -372,6 +373,7 @@ describe("OpenCodeAgent", () => {
         outputTokens: 4,
         cacheReadTokens: 3,
         cacheCreationTokens: 2,
+        tokensAvailable: true,
       },
     });
   });
@@ -482,6 +484,7 @@ describe("OpenCodeAgent", () => {
         outputTokens: 20,
         cacheReadTokens: 7,
         cacheCreationTokens: 3,
+        tokensAvailable: true,
       },
     });
     expect(onUsage).toHaveBeenCalledWith({
@@ -489,6 +492,7 @@ describe("OpenCodeAgent", () => {
       outputTokens: 20,
       cacheReadTokens: 7,
       cacheCreationTokens: 3,
+      tokensAvailable: true,
     });
     expect(onMessage).toHaveBeenNthCalledWith(
       1,
@@ -813,18 +817,21 @@ describe("OpenCodeAgent", () => {
       outputTokens: 4,
       cacheReadTokens: 3,
       cacheCreationTokens: 2,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(2, {
       inputTokens: 30,
       outputTokens: 10,
       cacheReadTokens: 8,
       cacheCreationTokens: 3,
+      tokensAvailable: true,
     });
     expect(result.usage).toEqual({
       inputTokens: 30,
       outputTokens: 10,
       cacheReadTokens: 8,
       cacheCreationTokens: 3,
+      tokensAvailable: true,
     });
   });
 

@@ -427,6 +427,7 @@ describe("AcpAgent", () => {
     const result = await agent.run("p", "/w", { onUsage });
 
     expect(result.usage.inputTokens).toBe(120);
+    expect(result.usage.tokensAvailable).toBe(false);
     const reported = onUsage.mock.calls.map(
       (args) => (args[0] as { inputTokens: number }).inputTokens,
     );

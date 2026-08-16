@@ -1,11 +1,12 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import type {
-  Agent,
-  AgentResult,
-  AgentOutput,
-  TokenUsage,
-  AgentRunOptions,
+import {
+  isValidTokenCount,
+  type Agent,
+  type AgentResult,
+  type AgentOutput,
+  type TokenUsage,
+  type AgentRunOptions,
 } from "./types.js";
 import {
   parseJSONLStream,
@@ -168,7 +169,10 @@ export class CodexAgent implements Agent {
         outputTokens: 0,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       };
+      let incompleteUsageObserved = false;
+      let usageEventCount = 0;
 
       parseJSONLStream<CodexEvent>(child.stdout!, logStream, (event) => {
         if (
@@ -182,9 +186,22 @@ export class CodexAgent implements Agent {
 
         if (event.type === "turn.completed" && "usage" in event) {
           const u = (event as CodexTurnCompleted).usage;
-          cumulative.inputTokens += u.input_tokens ?? 0;
-          cumulative.outputTokens += u.output_tokens ?? 0;
-          cumulative.cacheReadTokens += u.cached_input_tokens ?? 0;
+          usageEventCount += 1;
+          const eventTokensAvailable =
+            isValidTokenCount(u.input_tokens) &&
+            isValidTokenCount(u.output_tokens);
+          incompleteUsageObserved ||= !eventTokensAvailable;
+          cumulative.inputTokens += isValidTokenCount(u.input_tokens)
+            ? u.input_tokens
+            : 0;
+          cumulative.outputTokens += isValidTokenCount(u.output_tokens)
+            ? u.output_tokens
+            : 0;
+          cumulative.cacheReadTokens += isValidTokenCount(u.cached_input_tokens)
+            ? u.cached_input_tokens
+            : 0;
+          cumulative.tokensAvailable =
+            usageEventCount > 0 && !incompleteUsageObserved;
           onUsage?.({ ...cumulative });
         }
       });

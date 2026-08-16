@@ -284,6 +284,7 @@ export class AcpAgent implements Agent {
         outputTokens: estimateTokens(agentOutputChars),
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       };
       if (!usageUpdateReceived) usage.estimated = true;
       return usage;

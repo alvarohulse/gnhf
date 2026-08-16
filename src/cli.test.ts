@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -536,12 +537,15 @@ async function runCliResumeWithActualRun(
   const tempDir = mkdtempSync(join(tmpdir(), "gnhf-cli-resume-test-"));
   const runDir = join(tempDir, ".gnhf", "runs", "existing-run");
   const promptPath = join(runDir, "prompt.md");
+  const notesPath = join(runDir, "notes.md");
   const baseCommitPath = join(runDir, "base-commit");
   const stopWhenPath = join(runDir, "stop-when");
   const commitMessagePath = join(runDir, "commit-message");
   const schemaPath = join(runDir, "output-schema.json");
   mkdirSync(runDir, { recursive: true });
+  execFileSync("git", ["init", "--quiet"], { cwd: tempDir });
   writeFileSync(promptPath, "existing prompt", "utf-8");
+  writeFileSync(notesPath, "# existing run\n", "utf-8");
   writeFileSync(baseCommitPath, "abc123\n", "utf-8");
   if (storedStopWhen !== undefined) {
     writeFileSync(stopWhenPath, `${storedStopWhen}\n`, "utf-8");
@@ -3416,15 +3420,24 @@ describe("cli", () => {
       const recordPath = join(
         createdWorktreePath!,
         ".gnhf",
-        "runs",
-        basename(createdWorktreePath!),
-        "preserved-worktree.json",
+        "setup-failures",
+        `${basename(createdWorktreePath!)}.json`,
       );
       expect(JSON.parse(readFileSync(recordPath, "utf-8"))).toMatchObject({
         worktreePath: createdWorktreePath,
         reason: "setup-failed",
         error: "metadata disk full",
       });
+      expect(
+        existsSync(
+          join(
+            createdWorktreePath!,
+            ".gnhf",
+            "runs",
+            basename(createdWorktreePath!),
+          ),
+        ),
+      ).toBe(false);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

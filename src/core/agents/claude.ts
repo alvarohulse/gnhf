@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import {
   buildAgentOutputSchema,
+  isValidTokenCount,
   type Agent,
   type AgentOutput,
   type AgentOutputSchema,
@@ -178,12 +179,15 @@ function toTokenUsage(usage: {
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
 }): TokenUsage {
+  const inputTokens = usage.input_tokens;
+  const outputTokens = usage.output_tokens;
   return {
-    inputTokens:
-      (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0),
-    outputTokens: usage.output_tokens ?? 0,
+    inputTokens: (inputTokens ?? 0) + (usage.cache_read_input_tokens ?? 0),
+    outputTokens: outputTokens ?? 0,
     cacheReadTokens: usage.cache_read_input_tokens ?? 0,
     cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
+    tokensAvailable:
+      isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
   };
 }
 
@@ -194,9 +198,8 @@ function toResultUsage(event: ClaudeResultEvent): TokenUsage | null {
   const cacheCreationTokens = event.usage?.cache_creation_input_tokens;
   const reportedCostUsd = event.total_cost_usd;
   const tokensAvailable =
-    isNonNegativeFiniteNumber(inputTokens) &&
-    isNonNegativeFiniteNumber(outputTokens);
-  const reportedCostAvailable = isNonNegativeFiniteNumber(reportedCostUsd);
+    isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens);
+  const reportedCostAvailable = isValidTokenCount(reportedCostUsd);
 
   if (!tokensAvailable && !reportedCostAvailable) {
     return null;
@@ -204,23 +207,16 @@ function toResultUsage(event: ClaudeResultEvent): TokenUsage | null {
 
   return {
     inputTokens: tokensAvailable
-      ? inputTokens +
-        (isNonNegativeFiniteNumber(cacheReadTokens) ? cacheReadTokens : 0)
+      ? inputTokens + (isValidTokenCount(cacheReadTokens) ? cacheReadTokens : 0)
       : 0,
     outputTokens: tokensAvailable ? outputTokens : 0,
-    cacheReadTokens: isNonNegativeFiniteNumber(cacheReadTokens)
-      ? cacheReadTokens
-      : 0,
-    cacheCreationTokens: isNonNegativeFiniteNumber(cacheCreationTokens)
+    cacheReadTokens: isValidTokenCount(cacheReadTokens) ? cacheReadTokens : 0,
+    cacheCreationTokens: isValidTokenCount(cacheCreationTokens)
       ? cacheCreationTokens
       : 0,
     ...(reportedCostAvailable ? { reportedCostUsd } : {}),
-    ...(tokensAvailable ? {} : { tokensAvailable: false }),
+    tokensAvailable,
   };
-}
-
-function isNonNegativeFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 function isSameUsage(a: TokenUsage, b: TokenUsage): boolean {
@@ -228,7 +224,8 @@ function isSameUsage(a: TokenUsage, b: TokenUsage): boolean {
     a.inputTokens === b.inputTokens &&
     a.outputTokens === b.outputTokens &&
     a.cacheReadTokens === b.cacheReadTokens &&
-    a.cacheCreationTokens === b.cacheCreationTokens
+    a.cacheCreationTokens === b.cacheCreationTokens &&
+    a.tokensAvailable === b.tokensAvailable
   );
 }
 
@@ -410,6 +407,7 @@ export class ClaudeAgent implements Agent {
         outputTokens: 0,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       };
       const usageByMessageId = new Map<string, TokenUsage>();
       let anonymousAssistantCount = 0;
@@ -515,6 +513,9 @@ export class ClaudeAgent implements Agent {
           }
 
           usageByMessageId.set(messageId, nextUsage);
+          cumulative.tokensAvailable = [...usageByMessageId.values()].every(
+            (usage) => usage.tokensAvailable,
+          );
           onUsage?.({ ...cumulative });
 
           if (onMessage) {

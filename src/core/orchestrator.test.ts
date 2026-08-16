@@ -107,6 +107,7 @@ function createSuccessResult(summary = "done"): AgentResult {
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      tokensAvailable: true,
     },
   };
 }
@@ -513,6 +514,7 @@ describe("Orchestrator stop limits", () => {
               outputTokens: 4,
               cacheReadTokens: 0,
               cacheCreationTokens: 0,
+              tokensAvailable: true,
             });
           }),
       ),
@@ -543,13 +545,12 @@ describe("Orchestrator stop limits", () => {
     });
   });
 
-  it("does not enforce token caps from an incomplete usage receipt", async () => {
+  it("does not enforce token caps without explicit usage availability", async () => {
     const incompleteUsage = {
       inputTokens: 7,
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
-      tokensAvailable: false,
     };
     const agent: Agent = {
       name: "cursor",
@@ -601,6 +602,7 @@ describe("Orchestrator stop limits", () => {
               cacheReadTokens: 0,
               cacheCreationTokens: 0,
               reportedCostUsd: 1.25,
+              tokensAvailable: true,
             });
           }),
       ),
@@ -801,6 +803,7 @@ describe("Orchestrator stop limits", () => {
           outputTokens: 2,
           cacheReadTokens: 0,
           cacheCreationTokens: 0,
+          tokensAvailable: true,
           estimated: true,
         });
         options?.onUsage?.({
@@ -808,8 +811,18 @@ describe("Orchestrator stop limits", () => {
           outputTokens: 3,
           cacheReadTokens: 0,
           cacheCreationTokens: 0,
+          tokensAvailable: true,
         });
-        return createSuccessResult();
+        return {
+          ...createSuccessResult(),
+          usage: {
+            inputTokens: 5,
+            outputTokens: 3,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            tokensAvailable: true,
+          },
+        };
       }),
     };
     const orchestrator = new Orchestrator(
@@ -848,6 +861,7 @@ describe("Orchestrator stop limits", () => {
             outputTokens: 2,
             cacheReadTokens: 0,
             cacheCreationTokens: 0,
+            tokensAvailable: true,
             estimated: true,
           });
           throw new Error("transient error");
@@ -857,8 +871,18 @@ describe("Orchestrator stop limits", () => {
           outputTokens: 3,
           cacheReadTokens: 0,
           cacheCreationTokens: 0,
+          tokensAvailable: true,
         });
-        return createSuccessResult();
+        return {
+          ...createSuccessResult(),
+          usage: {
+            inputTokens: 5,
+            outputTokens: 3,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            tokensAvailable: true,
+          },
+        };
       }),
     };
     const orchestrator = new Orchestrator(
@@ -1444,6 +1468,7 @@ describe("Orchestrator stop limits", () => {
                 outputTokens: 0,
                 cacheReadTokens: 0,
                 cacheCreationTokens: 0,
+                tokensAvailable: true,
               });
             }),
         ),

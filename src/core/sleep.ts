@@ -272,6 +272,7 @@ export async function startSleepPrevention(
       return { type: "skipped", reason: "already-inhibited" };
     }
 
+    const detached = env.GNHF_SUPERVISED_PROCESS_GROUP !== "1";
     const readyDir = mkdtempSync(
       join(tmpdir(), GNHF_SLEEP_REEXEC_READY_DIR_PREFIX),
     );
@@ -289,7 +290,7 @@ export async function startSleepPrevention(
         ...argv,
       ],
       {
-        detached: true,
+        detached,
         env: {
           ...env,
           ...reexecEnv,
@@ -315,7 +316,7 @@ export async function startSleepPrevention(
     // between spawn and the readiness check are forwarded to the child.
     const stopForwardingSignals = forwardTerminationSignalsToChild(
       child,
-      true,
+      detached,
       killProcess,
       processOn,
       processOff,
@@ -387,7 +388,7 @@ export async function startSleepPrevention(
           timeoutMs: SYSTEMD_INHIBIT_READY_TIMEOUT_MS,
         });
         await shutdownChildProcess(child, {
-          detached: true,
+          detached,
           killProcess,
           timeoutMs: 1_000,
         });

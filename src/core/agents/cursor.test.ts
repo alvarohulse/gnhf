@@ -350,6 +350,7 @@ describe("CursorAgent", () => {
         cacheReadTokens: 80,
         cacheCreationTokens: 5,
         reportedCostUsd: 0.25,
+        tokensAvailable: true,
       },
     });
     expect(onMessage).toHaveBeenCalledWith("working...");
@@ -361,6 +362,7 @@ describe("CursorAgent", () => {
       cacheReadTokens: 80,
       cacheCreationTokens: 5,
       reportedCostUsd: 0.25,
+      tokensAvailable: true,
     });
   });
 

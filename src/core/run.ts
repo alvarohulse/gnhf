@@ -254,6 +254,8 @@ export function resumeRun(
   cwd: string,
   schemaOptions: RunSchemaOptions,
 ): RunInfo {
+  ensureRunMetadataIgnored(cwd);
+
   const runDir = join(cwd, ".gnhf", "runs", runId);
   if (!existsSync(runDir)) {
     throw new Error(`Run directory not found: ${runDir}`);
@@ -261,6 +263,11 @@ export function resumeRun(
 
   const promptPath = join(runDir, "prompt.md");
   const notesPath = join(runDir, "notes.md");
+  for (const requiredPath of [promptPath, notesPath]) {
+    if (!existsSync(requiredPath)) {
+      throw new Error(`Incomplete run metadata: missing ${requiredPath}`);
+    }
+  }
   const schemaPath = join(runDir, "output-schema.json");
   const logPath = join(runDir, LOG_FILENAME);
   const baseCommitPath = join(runDir, "base-commit");

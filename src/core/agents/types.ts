@@ -158,6 +158,16 @@ export interface TokenUsage {
   estimated?: boolean;
 }
 
+export function isValidTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+export function hasCompleteTokenUsage(
+  usage: TokenUsage,
+): usage is TokenUsage & { tokensAvailable: true } {
+  return usage.tokensAvailable === true;
+}
+
 export interface AgentResult {
   output: AgentOutput;
   usage: TokenUsage;

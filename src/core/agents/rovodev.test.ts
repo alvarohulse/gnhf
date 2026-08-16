@@ -200,6 +200,7 @@ describe("RovoDevAgent", () => {
         outputTokens: 4,
         cacheReadTokens: 3,
         cacheCreationTokens: 2,
+        tokensAvailable: true,
       },
     });
     expect(onUsage).toHaveBeenCalledWith({
@@ -207,6 +208,7 @@ describe("RovoDevAgent", () => {
       outputTokens: 4,
       cacheReadTokens: 3,
       cacheCreationTokens: 2,
+      tokensAvailable: true,
     });
     expect(onMessage).toHaveBeenCalledWith(
       '{"success":true,"summary":"done","key_changes_made":["a"],"key_learnings":["b"]}',

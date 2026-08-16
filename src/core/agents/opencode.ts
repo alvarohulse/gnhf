@@ -7,6 +7,7 @@ import { createWriteStream, type WriteStream } from "node:fs";
 import { createServer } from "node:net";
 import {
   buildAgentOutputSchema,
+  isValidTokenCount,
   parseAgentOutput,
   type Agent,
   type AgentOutput,
@@ -299,11 +300,15 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 function toUsage(tokens?: OpenCodeTokens): TokenUsage {
+  const inputTokens = tokens?.input;
+  const outputTokens = tokens?.output;
   return {
-    inputTokens: tokens?.input ?? 0,
-    outputTokens: tokens?.output ?? 0,
+    inputTokens: inputTokens ?? 0,
+    outputTokens: outputTokens ?? 0,
     cacheReadTokens: tokens?.cache?.read ?? 0,
     cacheCreationTokens: tokens?.cache?.write ?? 0,
+    tokensAvailable:
+      isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
   };
 }
 
@@ -691,11 +696,12 @@ export class OpenCodeAgent implements Agent {
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      tokensAvailable: false,
     };
     const usageByMessageId = new Map<string, TokenUsage>();
     const textParts = new Map<string, OpenCodeTextPartState>();
     let lastFinalAnswerText: string | null = null;
-    let lastUsageSignature = "0:0:0:0";
+    let lastUsageSignature = "0:0:0:0:true";
     let structuredOutputFromSSE: AgentOutput | null = null;
     let streamErrorInfo: OpenCodeStreamErrorInfo | null = null;
 
@@ -825,16 +831,20 @@ export class OpenCodeAgent implements Agent {
         nextCacheCreationTokens += messageUsage.cacheCreationTokens;
       }
 
+      usage.inputTokens = nextInputTokens;
+      usage.outputTokens = nextOutputTokens;
+      usage.cacheReadTokens = nextCacheReadTokens;
+      usage.cacheCreationTokens = nextCacheCreationTokens;
+      usage.tokensAvailable = [...usageByMessageId.values()].every(
+        (messageUsage) => messageUsage.tokensAvailable,
+      );
       const signature = [
         nextInputTokens,
         nextOutputTokens,
         nextCacheReadTokens,
         nextCacheCreationTokens,
+        usage.tokensAvailable,
       ].join(":");
-      usage.inputTokens = nextInputTokens;
-      usage.outputTokens = nextOutputTokens;
-      usage.cacheReadTokens = nextCacheReadTokens;
-      usage.cacheCreationTokens = nextCacheCreationTokens;
       if (signature !== lastUsageSignature) {
         lastUsageSignature = signature;
         onUsage?.({ ...usage });

@@ -171,6 +171,7 @@ describe("CopilotAgent", () => {
         outputTokens: 7,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       },
     });
     expect(onMessage).toHaveBeenCalledWith(content);
@@ -179,6 +180,38 @@ describe("CopilotAgent", () => {
       outputTokens: 7,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      tokensAvailable: false,
+    });
+  });
+
+  it("marks complete input and output totals available", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CopilotAgent();
+    const content = JSON.stringify({
+      success: true,
+      summary: "ok",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "assistant.message",
+      data: { content },
+    });
+    emitJson(proc, {
+      type: "result",
+      usage: { inputTokens: 5, outputTokens: 7 },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 5,
+        outputTokens: 7,
+        tokensAvailable: true,
+      },
     });
   });
 

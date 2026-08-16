@@ -9,6 +9,7 @@ import {
 import { posix, win32 } from "node:path";
 import {
   buildAgentOutputSchema,
+  isValidTokenCount,
   parseAgentOutput,
   PermanentAgentError,
   type Agent,
@@ -302,9 +303,8 @@ function usageFromRecord(usage: JsonRecord): TokenUsage | null {
     cacheReadTokens: cacheReadTokens ?? 0,
     cacheCreationTokens: cacheCreationTokens ?? 0,
     ...(hasValidReportedCost ? { reportedCostUsd } : {}),
-    ...(inputTokens === undefined || outputTokens === undefined
-      ? { tokensAvailable: false }
-      : {}),
+    tokensAvailable:
+      isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
   };
 }
 

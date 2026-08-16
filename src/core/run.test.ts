@@ -49,6 +49,10 @@ const mockExecFileSync = vi.mocked(execFileSync);
 const mockFindLegacyRunBaseCommit = vi.mocked(findLegacyRunBaseCommit);
 const mockGetHeadCommit = vi.mocked(getHeadCommit);
 
+function requiredRunPaths(runDir: string): string[] {
+  return [runDir, join(runDir, "prompt.md"), join(runDir, "notes.md")];
+}
+
 describe("setupRun", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -294,7 +298,12 @@ describe("resumeRun", () => {
 
   it("refreshes output-schema.json to the current JSON schema", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
-    mockExistsSync.mockImplementation((path) => path === runDir);
+    mockExistsSync.mockImplementation(
+      (path) =>
+        path === runDir ||
+        path === join(runDir, "prompt.md") ||
+        path === join(runDir, "notes.md"),
+    );
 
     resumeRun("run-abc", P, { includeStopField: false });
 
@@ -313,9 +322,38 @@ describe("resumeRun", () => {
     expect(schema.required).not.toContain("should_fully_stop");
   });
 
-  it("rewrites output-schema.json with should_fully_stop when includeStopField is true", () => {
+  it("re-establishes the local ignore rule before resuming", () => {
+    const runDir = join(P, ".gnhf", "runs", "run-abc");
+    mockExistsSync.mockImplementation(
+      (path) =>
+        path === runDir ||
+        path === join(runDir, "prompt.md") ||
+        path === join(runDir, "notes.md"),
+    );
+
+    resumeRun("run-abc", P, { includeStopField: false });
+
+    expect(mockExecFileSync).toHaveBeenCalledWith(
+      "git",
+      ["rev-parse", "--git-path", "info/exclude"],
+      { cwd: P, encoding: "utf-8" },
+    );
+  });
+
+  it("rejects incomplete run metadata", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
     mockExistsSync.mockImplementation((path) => path === runDir);
+
+    expect(() => resumeRun("run-abc", P, { includeStopField: false })).toThrow(
+      "Incomplete run metadata",
+    );
+  });
+
+  it("rewrites output-schema.json with should_fully_stop when includeStopField is true", () => {
+    const runDir = join(P, ".gnhf", "runs", "run-abc");
+    mockExistsSync.mockImplementation((path) =>
+      requiredRunPaths(runDir).includes(String(path)),
+    );
 
     resumeRun("run-abc", P, { includeStopField: true });
 
@@ -332,7 +370,9 @@ describe("resumeRun", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
     const baseCommitPath = join(runDir, "base-commit");
     mockExistsSync.mockImplementation(
-      (path) => path === runDir || path === baseCommitPath,
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) ||
+        path === baseCommitPath,
     );
     mockReadFileSync.mockImplementation((path) =>
       path === baseCommitPath ? "abc123\n" : "",
@@ -348,7 +388,9 @@ describe("resumeRun", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
     const stopWhenPath = join(runDir, "stop-when");
     mockExistsSync.mockImplementation(
-      (path) => path === runDir || path === stopWhenPath,
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) ||
+        path === stopWhenPath,
     );
     mockReadFileSync.mockImplementation((path) =>
       path === stopWhenPath ? "all tests pass\n" : "",
@@ -362,7 +404,9 @@ describe("resumeRun", () => {
 
   it("returns undefined for stop-when when the file is missing", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
-    mockExistsSync.mockImplementation((path) => path === runDir);
+    mockExistsSync.mockImplementation((path) =>
+      requiredRunPaths(runDir).includes(String(path)),
+    );
 
     const info = resumeRun("run-abc", P, { includeStopField: false });
 
@@ -373,7 +417,9 @@ describe("resumeRun", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
     const commitMessagePath = join(runDir, "commit-message");
     mockExistsSync.mockImplementation(
-      (path) => path === runDir || path === commitMessagePath,
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) ||
+        path === commitMessagePath,
     );
     mockReadFileSync.mockImplementation((path) =>
       path === commitMessagePath ? "default\n" : "",
@@ -403,7 +449,9 @@ describe("resumeRun", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
     const commitMessagePath = join(runDir, "commit-message");
     mockExistsSync.mockImplementation(
-      (path) => path === runDir || path === commitMessagePath,
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) ||
+        path === commitMessagePath,
     );
     mockReadFileSync.mockImplementation((path) =>
       path === commitMessagePath ? "conventional\n" : "",
@@ -426,7 +474,8 @@ describe("resumeRun", () => {
     const schemaPath = join(runDir, "output-schema.json");
     const commitMessagePath = join(runDir, "commit-message");
     mockExistsSync.mockImplementation(
-      (path) => path === runDir || path === schemaPath,
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) || path === schemaPath,
     );
     mockReadFileSync.mockImplementation((path) =>
       path === schemaPath
@@ -451,7 +500,9 @@ describe("resumeRun", () => {
 
   it("backfills missing base-commit for legacy runs", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
-    mockExistsSync.mockImplementation((path) => path === runDir);
+    mockExistsSync.mockImplementation((path) =>
+      requiredRunPaths(runDir).includes(String(path)),
+    );
     mockFindLegacyRunBaseCommit.mockReturnValue("legacy123");
 
     const info = resumeRun("run-abc", P, { includeStopField: false });
@@ -467,7 +518,9 @@ describe("resumeRun", () => {
 
   it("falls back to HEAD when a legacy run has no recoverable base commit", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
-    mockExistsSync.mockImplementation((path) => path === runDir);
+    mockExistsSync.mockImplementation((path) =>
+      requiredRunPaths(runDir).includes(String(path)),
+    );
     mockFindLegacyRunBaseCommit.mockReturnValue(null);
     mockGetHeadCommit.mockReturnValue("head456");
 

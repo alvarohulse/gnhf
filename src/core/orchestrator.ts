@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import {
+  hasCompleteTokenUsage,
   PermanentAgentError,
   type Agent,
   type AgentOutput,
@@ -507,12 +508,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
     const onUsage = (usage: TokenUsage) => {
       latestUsage = { ...usage };
-      const tokensAvailable = usage.tokensAvailable !== false;
+      const tokensAvailable = hasCompleteTokenUsage(usage);
       if (tokensAvailable) {
         this.state.totalInputTokens = baseInputTokens + usage.inputTokens;
         this.state.totalOutputTokens = baseOutputTokens + usage.outputTokens;
-      } else {
-        this.tokensUnavailable = true;
       }
       if (
         usage.reportedCostUsd !== undefined &&
@@ -565,6 +564,12 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
       latestUsage = result.usage;
       this.activeIterationTokensEstimated = false;
+      if (hasCompleteTokenUsage(result.usage)) {
+        this.state.totalInputTokens =
+          baseInputTokens + result.usage.inputTokens;
+        this.state.totalOutputTokens =
+          baseOutputTokens + result.usage.outputTokens;
+      }
       if (result.usage.estimated) this.state.tokensEstimated = true;
       if (result.usage.reportedCostUsd === undefined) {
         this.reportedCostUnavailable = true;
@@ -701,7 +706,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     success,
     usage,
   }: AppendAgentRunReceiptParams): void {
-    const tokensAvailable = usage !== null && usage.tokensAvailable !== false;
+    const tokensAvailable = usage !== null && hasCompleteTokenUsage(usage);
     if (!tokensAvailable) {
       this.tokensUnavailable = true;
     }

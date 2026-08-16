@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import {
   buildAgentOutputSchema,
+  isValidTokenCount,
   parseAgentOutput,
   type Agent,
   type AgentOutput,
@@ -127,11 +128,15 @@ function numberField(record: JsonRecord, names: string[]): number | undefined {
 function toTokenUsage(usage: JsonRecord | undefined): TokenUsage | null {
   if (!usage) return null;
 
+  const inputTokens = numberField(usage, ["input"]);
+  const outputTokens = numberField(usage, ["output"]);
   return {
-    inputTokens: numberField(usage, ["input"]) ?? 0,
-    outputTokens: numberField(usage, ["output"]) ?? 0,
+    inputTokens: inputTokens ?? 0,
+    outputTokens: outputTokens ?? 0,
     cacheReadTokens: numberField(usage, ["cacheRead"]) ?? 0,
     cacheCreationTokens: numberField(usage, ["cacheWrite"]) ?? 0,
+    tokensAvailable:
+      isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
   };
 }
 
@@ -140,7 +145,8 @@ function isSameUsage(a: TokenUsage, b: TokenUsage): boolean {
     a.inputTokens === b.inputTokens &&
     a.outputTokens === b.outputTokens &&
     a.cacheReadTokens === b.cacheReadTokens &&
-    a.cacheCreationTokens === b.cacheCreationTokens
+    a.cacheCreationTokens === b.cacheCreationTokens &&
+    a.tokensAvailable === b.tokensAvailable
   );
 }
 
@@ -258,6 +264,7 @@ export class PiAgent implements Agent {
         outputTokens: 0,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       };
       let anonymousKeySeq = 0;
       let currentStreamingMessageKey: string | null = null;
@@ -284,6 +291,7 @@ export class PiAgent implements Agent {
           outputTokens: 0,
           cacheReadTokens: 0,
           cacheCreationTokens: 0,
+          tokensAvailable: false,
         };
         for (const entry of usageByMessageKey.values()) {
           cumulative.inputTokens += entry.inputTokens;
@@ -291,6 +299,9 @@ export class PiAgent implements Agent {
           cumulative.cacheReadTokens += entry.cacheReadTokens;
           cumulative.cacheCreationTokens += entry.cacheCreationTokens;
         }
+        cumulative.tokensAvailable = [...usageByMessageKey.values()].every(
+          (entry) => entry.tokensAvailable,
+        );
 
         if (!isSameUsage(cumulative, lastEmittedUsage)) {
           lastEmittedUsage = cumulative;

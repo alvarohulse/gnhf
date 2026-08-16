@@ -264,6 +264,7 @@ describe("PiAgent", () => {
         outputTokens: 7,
         cacheReadTokens: 3,
         cacheCreationTokens: 0,
+        tokensAvailable: true,
       },
     });
     expect(onUsage).toHaveBeenCalledWith({
@@ -271,6 +272,7 @@ describe("PiAgent", () => {
       outputTokens: 7,
       cacheReadTokens: 3,
       cacheCreationTokens: 0,
+      tokensAvailable: true,
     });
   });
 
@@ -291,6 +293,7 @@ describe("PiAgent", () => {
 
     await expect(promise).resolves.toMatchObject({
       output: { success: true, summary: "ok" },
+      usage: { tokensAvailable: false },
     });
   });
 
