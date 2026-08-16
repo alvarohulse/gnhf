@@ -857,9 +857,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       return false;
     }
 
-    function getPendingAbortReason(
-      orchestrator: Orchestrator,
-    ): string | null {
+    function getPendingAbortReason(orchestrator: Orchestrator): string | null {
       if (pendingAbortLimit === "tokens") {
         return orchestrator.getTokenAbortReason(true);
       }
