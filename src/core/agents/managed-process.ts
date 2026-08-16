@@ -1,4 +1,5 @@
-import type { ChildProcess } from "node:child_process";
+import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { EventEmitter } from "node:events";
 
 interface SignalChildProcessOptions {
   detached: boolean;
@@ -12,25 +13,178 @@ interface ShutdownChildProcessOptions {
   timeoutMs?: number;
 }
 
-const POST_SIGKILL_GRACE_MS = 100;
+const SHUTDOWN_CONFIRMATION_GRACE_MS = 100;
 const activeShutdowns = new WeakMap<ChildProcess, Promise<void>>();
+const closedOwnedProcessGroupLeaders = new WeakSet<ChildProcess>();
+const UNIX_PROCESS_GROUP_SUPERVISOR_SOURCE = String.raw`
+const { spawn } = require("node:child_process");
+const [command, ...args] = process.argv.slice(1);
+process.on("SIGTERM", () => {});
+process.on("disconnect", () => {
+  try {
+    process.kill(-process.pid, "SIGKILL");
+  } catch {
+    process.exit(1);
+  }
+});
+const keepAlive = setInterval(() => {}, 24 * 60 * 60 * 1000);
+const target = spawn(command, args, {
+  cwd: process.cwd(),
+  env: process.env,
+  stdio: "inherit",
+});
+target.once("error", (error) => {
+  process.send?.({ type: "target-error", message: error.message });
+});
+target.once("close", (code, signal) => {
+  process.send?.({ type: "target-close", code, signal });
+});
+process.once("exit", () => clearInterval(keepAlive));
+`;
+
+type SpawnProcess = (
+  command: string,
+  args: readonly string[],
+  options: SpawnOptions,
+) => ChildProcess;
+
+type SupervisorMessage =
+  | { type: "target-close"; code: number | null; signal: NodeJS.Signals | null }
+  | { type: "target-error"; message: string };
+
+function isSupervisorMessage(value: unknown): value is SupervisorMessage {
+  if (typeof value !== "object" || value === null || !("type" in value)) {
+    return false;
+  }
+  if (value.type === "target-error") {
+    return "message" in value && typeof value.message === "string";
+  }
+  return (
+    value.type === "target-close" &&
+    "code" in value &&
+    (value.code === null || typeof value.code === "number") &&
+    "signal" in value &&
+    (value.signal === null || typeof value.signal === "string")
+  );
+}
+
+export class IncompleteChildProcessShutdownError extends Error {
+  constructor(pid: number | undefined) {
+    super(
+      `Could not prove process cleanup completed${pid === undefined ? "" : ` for PID ${pid}`}`,
+    );
+    this.name = "IncompleteChildProcessShutdownError";
+  }
+}
+
+export function spawnManagedChildProcess(
+  spawnProcess: SpawnProcess,
+  command: string,
+  args: readonly string[],
+  options: SpawnOptions,
+): ChildProcess {
+  if (options.detached !== true) {
+    return spawnProcess(command, args, options);
+  }
+
+  const input = Array.isArray(options.stdio)
+    ? options.stdio[0]
+    : (options.stdio ?? "pipe");
+  const supervisor = spawnProcess(
+    process.execPath,
+    ["-e", UNIX_PROCESS_GROUP_SUPERVISOR_SOURCE, "--", command, ...args],
+    {
+      ...options,
+      detached: true,
+      stdio: [input, "pipe", "pipe", "ipc"],
+    },
+  );
+  if (typeof supervisor.send !== "function") {
+    return supervisor;
+  }
+
+  const managed = Object.assign(new EventEmitter(), {
+    stdin: supervisor.stdin,
+    stdout: supervisor.stdout,
+    stderr: supervisor.stderr,
+    pid: supervisor.pid,
+    exitCode: null as number | null,
+    signalCode: null as NodeJS.Signals | null,
+    killed: false,
+    kill(signal?: number | NodeJS.Signals): boolean {
+      managed.killed = true;
+      return supervisor.kill(signal);
+    },
+  });
+  let targetStatus: {
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  } | null = null;
+  let settled = false;
+
+  supervisor.on("message", (message: unknown) => {
+    if (!isSupervisorMessage(message)) {
+      return;
+    }
+    if (message.type === "target-error") {
+      managed.emit("error", new Error(message.message));
+      return;
+    }
+    targetStatus = { code: message.code, signal: message.signal };
+    void shutdownChildProcess(managed as unknown as ChildProcess, {
+      detached: true,
+      timeoutMs: 0,
+    }).catch((error: unknown) => {
+      managed.emit(
+        "error",
+        error instanceof Error
+          ? error
+          : new IncompleteChildProcessShutdownError(managed.pid),
+      );
+    });
+  });
+  supervisor.on("error", (error) => managed.emit("error", error));
+  supervisor.on("close", (code, signal) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    managed.exitCode = targetStatus !== null ? targetStatus.code : code;
+    managed.signalCode = targetStatus !== null ? targetStatus.signal : signal;
+    managed.emit("close", managed.exitCode, managed.signalCode);
+  });
+
+  return managed as unknown as ChildProcess;
+}
 
 export class ChildProcessShutdownTracker {
   private pending = new Set<Promise<void>>();
+  private failure: unknown = null;
 
   start(startShutdown: () => Promise<void>): Promise<void> {
-    const shutdown = startShutdown();
+    let shutdown: Promise<void>;
+    try {
+      shutdown = startShutdown();
+    } catch (error) {
+      shutdown = Promise.reject(error);
+    }
     this.pending.add(shutdown);
     void shutdown.then(
       () => this.pending.delete(shutdown),
-      () => this.pending.delete(shutdown),
+      (error) => {
+        this.pending.delete(shutdown);
+        this.failure ??= error;
+      },
     );
     return shutdown;
   }
 
   async waitForAll(): Promise<void> {
     while (this.pending.size > 0) {
-      await Promise.all(this.pending);
+      await Promise.allSettled(this.pending);
+    }
+    if (this.failure !== null) {
+      throw this.failure;
     }
   }
 
@@ -42,6 +196,7 @@ export class ChildProcessShutdownTracker {
     if (!detached || child.pid === undefined) {
       return;
     }
+    closedOwnedProcessGroupLeaders.add(child);
     await this.start(startShutdown);
   }
 }
@@ -59,7 +214,13 @@ export function signalChildProcess(
 ): void {
   const killProcess = options.killProcess ?? process.kill.bind(process);
 
-  if (options.detached && child.pid) {
+  if (
+    options.detached &&
+    child.pid &&
+    child.exitCode === null &&
+    child.signalCode === null &&
+    !closedOwnedProcessGroupLeaders.has(child)
+  ) {
     try {
       killProcess(-child.pid, options.signal);
       return;
@@ -81,7 +242,11 @@ export function shutdownChildProcess(
   }
 
   const ownedProcessGroupId = options.detached && child.pid ? -child.pid : null;
-  let ownsProcessGroup = ownedProcessGroupId !== null;
+  let ownsProcessGroup =
+    ownedProcessGroupId !== null &&
+    child.exitCode === null &&
+    child.signalCode === null &&
+    !closedOwnedProcessGroupLeaders.has(child);
   if (
     ownedProcessGroupId === null &&
     (child.exitCode != null || child.signalCode != null)
@@ -91,21 +256,24 @@ export function shutdownChildProcess(
 
   const shutdown = performShutdown();
   activeShutdowns.set(child, shutdown);
-  void shutdown.finally(() => {
+  void shutdown.then(clearActiveShutdown, clearActiveShutdown);
+  return shutdown;
+
+  function clearActiveShutdown(): void {
     if (activeShutdowns.get(child) === shutdown) {
       activeShutdowns.delete(child);
     }
-  });
-  return shutdown;
+  }
 
   function performShutdown(): Promise<void> {
     const timeoutMs = options.timeoutMs ?? 3_000;
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
       let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
       let hardDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+      let terminalGroupSignalDelivered = false;
       let settled = false;
 
-      const settle = () => {
+      const settle = (error?: Error) => {
         if (settled) {
           return;
         }
@@ -119,16 +287,53 @@ export function shutdownChildProcess(
           hardDeadlineTimer = null;
         }
         child.off("close", handleClose);
-        resolve();
-      };
-
-      const handleClose = () => {
-        if (ownedProcessGroupId === null) {
-          settle();
+        if (error === undefined) {
+          resolve();
+        } else {
+          reject(error);
         }
       };
 
+      const handleClose = () => {
+        ownsProcessGroup = false;
+        if (ownedProcessGroupId === null) {
+          settle();
+          return;
+        }
+        if (terminalGroupSignalDelivered || !isProcessGroupPresent()) {
+          settle();
+          return;
+        }
+        waitForPassiveGroupExit();
+      };
+
+      const waitForPassiveGroupExit = () => {
+        if (forceKillTimer !== null) {
+          clearTimeout(forceKillTimer);
+          forceKillTimer = null;
+        }
+        if (hardDeadlineTimer !== null) {
+          return;
+        }
+        hardDeadlineTimer = setTimeout(() => {
+          if (!isProcessGroupPresent()) {
+            settle();
+            return;
+          }
+          settle(new IncompleteChildProcessShutdownError(child.pid));
+        }, SHUTDOWN_CONFIRMATION_GRACE_MS);
+      };
+
       child.on("close", handleClose);
+
+      if (ownedProcessGroupId !== null && !ownsProcessGroup) {
+        if (!isProcessGroupPresent()) {
+          settle();
+        } else {
+          waitForPassiveGroupExit();
+        }
+        return;
+      }
 
       try {
         signalShutdownTarget("SIGTERM");
@@ -137,23 +342,27 @@ export function shutdownChildProcess(
       }
 
       forceKillTimer = setTimeout(() => {
-        if (
-          ownedProcessGroupId !== null &&
-          (!ownsProcessGroup || !isOwnedProcessGroupAlive())
-        ) {
-          settle();
+        if (ownedProcessGroupId !== null && !ownsProcessGroup) {
+          if (!isProcessGroupPresent()) {
+            settle();
+          } else {
+            settle(new IncompleteChildProcessShutdownError(child.pid));
+          }
           return;
         }
 
         try {
-          signalShutdownTarget("SIGKILL", ownedProcessGroupId === null);
+          terminalGroupSignalDelivered = signalShutdownTarget(
+            "SIGKILL",
+            ownedProcessGroupId === null,
+          );
         } catch {
           // Best-effort cleanup only.
         }
 
         hardDeadlineTimer = setTimeout(() => {
-          settle();
-        }, POST_SIGKILL_GRACE_MS);
+          settle(new IncompleteChildProcessShutdownError(child.pid));
+        }, SHUTDOWN_CONFIRMATION_GRACE_MS);
         if (ownedProcessGroupId === null) {
           hardDeadlineTimer.unref?.();
         }
@@ -164,7 +373,7 @@ export function shutdownChildProcess(
     });
   }
 
-  function isOwnedProcessGroupAlive(): boolean {
+  function isProcessGroupPresent(): boolean {
     if (ownedProcessGroupId === null) {
       return false;
     }
@@ -173,29 +382,29 @@ export function shutdownChildProcess(
     try {
       killProcess(ownedProcessGroupId, 0);
       return true;
-    } catch {
-      ownsProcessGroup = false;
-      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
     }
   }
 
   function signalShutdownTarget(
     signal: NodeJS.Signals,
     allowDirectChildFallback = true,
-  ): void {
+  ): boolean {
     if (ownedProcessGroupId !== null) {
       const killProcess = options.killProcess ?? process.kill.bind(process);
       try {
         killProcess(ownedProcessGroupId, signal);
-        return;
+        return true;
       } catch {
         ownsProcessGroup = false;
         if (!allowDirectChildFallback) {
-          return;
+          return false;
         }
       }
     }
 
     child.kill(signal);
+    return false;
   }
 }

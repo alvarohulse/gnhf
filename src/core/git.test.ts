@@ -103,7 +103,7 @@ describe("git utilities", () => {
   });
 
   describe("hasWorkingTreeChanges", () => {
-    it("forces untracked files to be included", () => {
+    it("checks untracked and ignored files", () => {
       hasWorkingTreeChanges("/repo");
 
       expect(argsOfCall(0)).toEqual([
@@ -111,6 +111,31 @@ describe("git utilities", () => {
         "--porcelain",
         "--untracked-files=all",
       ]);
+      expect(argsOfCall(1)).toEqual([
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+      ]);
+    });
+
+    it("preserves ignored user files", () => {
+      mockExecFileSync
+        .mockReturnValueOnce("")
+        .mockReturnValueOnce("build/result.txt\0");
+
+      expect(hasWorkingTreeChanges("/repo")).toBe(true);
+    });
+
+    it("ignores only gnhf-owned runtime metadata", () => {
+      mockExecFileSync
+        .mockReturnValueOnce("")
+        .mockReturnValueOnce(
+          ".gnhf/runs/run-1/usage.json\0.gnhf/setup-failures/run-1.json\0",
+        );
+
+      expect(hasWorkingTreeChanges("/repo")).toBe(false);
     });
   });
 

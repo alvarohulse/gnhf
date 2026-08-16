@@ -1,11 +1,12 @@
 import { EventEmitter } from "node:events";
-import type { ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
   signalChildProcess,
+  spawnManagedChildProcess,
 } from "./managed-process.js";
 
 function createChildProcess(pid = 1234): ChildProcess {
@@ -54,6 +55,19 @@ describe("ChildProcessShutdownTracker", () => {
     await wait;
     expect(finished).toBe(true);
   });
+
+  it("retains shutdown failures until a waiter observes them", async () => {
+    const tracker = new ChildProcessShutdownTracker();
+    tracker.start(() =>
+      Promise.reject(new Error("process cleanup was not proven")),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await expect(tracker.waitForAll()).rejects.toThrow(
+      "process cleanup was not proven",
+    );
+  });
 });
 
 describe("signalChildProcess", () => {
@@ -89,6 +103,77 @@ describe("signalChildProcess", () => {
 
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
   });
+});
+
+describe("spawnManagedChildProcess", () => {
+  it("places detached commands behind a stable process-group supervisor", () => {
+    const supervisor = Object.assign(createChildProcess(), {
+      stdin: new EventEmitter(),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      send: vi.fn(),
+    });
+    const spawnProcess = vi.fn(() => supervisor);
+
+    const child = spawnManagedChildProcess(
+      spawnProcess,
+      "agent-cli",
+      ["--json"],
+      {
+        cwd: "/repo",
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    expect(spawnProcess).toHaveBeenCalledWith(
+      process.execPath,
+      [
+        "-e",
+        expect.stringContaining('process.on("SIGTERM", () => {})'),
+        "--",
+        "agent-cli",
+        "--json",
+      ],
+      expect.objectContaining({
+        cwd: "/repo",
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe", "ipc"],
+      }),
+    );
+    expect(child.pid).toBe(supervisor.pid);
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "settles with the target status after supervised group cleanup",
+    async () => {
+      const child = spawnManagedChildProcess(
+        spawn,
+        process.execPath,
+        ["-e", 'process.stdout.write("supervised")'],
+        {
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let stdout = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+
+      const result = await new Promise<{
+        code: number | null;
+        signal: NodeJS.Signals | null;
+      }>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", (code, signal) => resolve({ code, signal }));
+      });
+
+      expect(result).toEqual({ code: 0, signal: null });
+      expect(stdout).toBe("supervised");
+    },
+    5_000,
+  );
 });
 
 describe("shutdownChildProcess", () => {
@@ -149,26 +234,24 @@ describe("shutdownChildProcess", () => {
     vi.useRealTimers();
   });
 
-  it("resolves after a hard deadline if the child never closes", async () => {
+  it("surfaces incomplete cleanup if the child never closes", async () => {
     const child = createChildProcess();
-    let resolved = false;
 
     const closePromise = shutdownChildProcess(child, {
       detached: false,
       timeoutMs: 3_000,
-    }).then(() => {
-      resolved = true;
     });
+    const rejection = expect(closePromise).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
 
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
 
     await vi.advanceTimersByTimeAsync(3_000);
     expect(child.kill).toHaveBeenCalledWith("SIGKILL");
-    expect(resolved).toBe(false);
 
     await vi.advanceTimersByTimeAsync(100);
-    await closePromise;
-    expect(resolved).toBe(true);
+    await rejection;
   });
 
   it("clears the force-kill timer when the child closes first", async () => {
@@ -190,7 +273,7 @@ describe("shutdownChildProcess", () => {
     vi.useRealTimers();
   });
 
-  it("continues owned-group escalation after the leader closes", async () => {
+  it("does not escalate an owned group after the leader closes", async () => {
     const child = createChildProcess();
     const killProcess = vi.fn(() => true as const);
 
@@ -201,13 +284,14 @@ describe("shutdownChildProcess", () => {
     });
 
     expect(killProcess).toHaveBeenCalledWith(-1234, "SIGTERM");
+    const rejection = expect(closePromise).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
     child.emit("close", 0, null);
 
-    await vi.advanceTimersByTimeAsync(3_000);
-    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGKILL");
-
     await vi.advanceTimersByTimeAsync(100);
-    await closePromise;
+    await rejection;
+    expect(killProcess).not.toHaveBeenCalledWith(-1234, "SIGKILL");
     vi.useRealTimers();
   });
 
@@ -263,9 +347,11 @@ describe("shutdownChildProcess", () => {
 
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
 
+    const rejection = expect(closePromise).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
     await vi.advanceTimersByTimeAsync(3_000);
-    await vi.advanceTimersByTimeAsync(100);
-    await closePromise;
+    await rejection;
 
     expect(killProcess).not.toHaveBeenCalledWith(-1234, "SIGKILL");
     vi.useRealTimers();
@@ -273,7 +359,14 @@ describe("shutdownChildProcess", () => {
 
   it("shares concurrent shutdown supervision", async () => {
     const child = createChildProcess();
-    const killProcess = vi.fn(() => true as const);
+    const killProcess = vi.fn(
+      (_pid: number, signal?: number | NodeJS.Signals) => {
+        if (signal === "SIGKILL") {
+          queueMicrotask(() => child.emit("close", 0, "SIGKILL"));
+        }
+        return true as const;
+      },
+    );
 
     const firstShutdown = shutdownChildProcess(child, {
       detached: true,
@@ -289,10 +382,10 @@ describe("shutdownChildProcess", () => {
     expect(secondShutdown).toBe(firstShutdown);
     expect(killProcess).toHaveBeenCalledTimes(1);
 
-    await vi.advanceTimersByTimeAsync(3_100);
+    await vi.advanceTimersByTimeAsync(3_000);
     await Promise.all([firstShutdown, secondShutdown]);
-    expect(killProcess).toHaveBeenCalledTimes(3);
-    expect(killProcess).toHaveBeenCalledWith(-1234, 0);
+    expect(killProcess).toHaveBeenCalledTimes(2);
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGKILL");
     vi.useRealTimers();
   });
 

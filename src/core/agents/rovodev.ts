@@ -18,8 +18,10 @@ import { appendDebugLog, serializeError } from "../debug-log.js";
 import { parseAgentJson } from "./json-extract.js";
 import {
   ChildProcessShutdownTracker,
+  IncompleteChildProcessShutdownError,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  spawnManagedChildProcess,
 } from "./managed-process.js";
 
 interface RovoDevRequestUsageEvent {
@@ -287,11 +289,18 @@ export class RovoDevAgent implements Agent {
       signal?.removeEventListener("abort", onAbort);
       logStream?.end();
       if (runServer && sessionId) {
+        let mayDeleteSession = true;
         if (!runCompleted || runController.signal.aborted) {
-          await this.cancelSession(runServer, sessionId);
+          mayDeleteSession = await this.cancelSession(runServer, sessionId);
+          if (!mayDeleteSession) {
+            await this.shutdownServer();
+          }
         }
-        await this.deleteSession(runServer, sessionId);
+        if (mayDeleteSession) {
+          await this.deleteSession(runServer, sessionId);
+        }
       }
+      await this.shutdowns.waitForAll();
     }
   }
 
@@ -317,7 +326,8 @@ export class RovoDevAgent implements Agent {
 
     const port = await this.getPortFn();
     const detached = this.detached;
-    const child = this.spawnFn(
+    const child = spawnManagedChildProcess(
+      this.spawnFn,
       this.bin,
       [
         "rovodev",
@@ -346,6 +356,13 @@ export class RovoDevAgent implements Agent {
       stdout: "",
       stderr: "",
     };
+    child.on("error", (error) => {
+      if (error instanceof IncompleteChildProcessShutdownError) {
+        void this.shutdowns
+          .start(() => Promise.reject(error))
+          .catch(() => undefined);
+      }
+    });
 
     const MAX_OUTPUT = 64 * 1024;
     child.stdout.on("data", (data: Buffer) => {
@@ -374,15 +391,16 @@ export class RovoDevAgent implements Agent {
       });
       if (this.server === server) {
         if (server.detached) {
+          const clearClosedServer = () => {
+            if (this.server === server) {
+              this.server = null;
+            }
+          };
           void this.shutdowns
             .finalizeOwnedProcessGroup(server.child, server.detached, () =>
               this.shutdownServerProcess(server),
             )
-            .finally(() => {
-              if (this.server === server) {
-                this.server = null;
-              }
-            });
+            .then(clearClosedServer, clearClosedServer);
         } else {
           this.server = null;
         }
@@ -520,7 +538,7 @@ export class RovoDevAgent implements Agent {
   private async cancelSession(
     server: RovoDevServer,
     sessionId: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await this.request(server, "/v3/cancel", {
         method: "POST",
@@ -528,12 +546,13 @@ export class RovoDevAgent implements Agent {
         timeoutMs: 1_000,
       });
       appendDebugLog("rovodev:session:cancel", { sessionId });
+      return true;
     } catch (error) {
       appendDebugLog("rovodev:session:cancel-failed", {
         sessionId,
         error: serializeError(error),
       });
-      // Best effort only.
+      return false;
     }
   }
 

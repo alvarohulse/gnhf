@@ -9,6 +9,19 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
+vi.mock("./managed-process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./managed-process.js")>();
+  return {
+    ...actual,
+    spawnManagedChildProcess: (
+      spawnProcess: typeof import("node:child_process").spawn,
+      command: string,
+      args: string[],
+      options: import("node:child_process").SpawnOptions,
+    ) => spawnProcess(command, args, options),
+  };
+});
+
 import { execFileSync, spawn } from "node:child_process";
 import { CursorAgent } from "./cursor.js";
 import { buildAgentOutputSchema, PermanentAgentError } from "./types.js";
@@ -21,6 +34,8 @@ function createMockProcess() {
     end: vi.fn(),
   });
   const proc = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    signalCode: null,
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     stdin,
@@ -663,7 +678,12 @@ describe("CursorAgent", () => {
     vi.useFakeTimers();
     const processKill = vi
       .spyOn(process, "kill")
-      .mockImplementation(() => true);
+      .mockImplementation((_pid, signal) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+        }
+        return true;
+      });
     try {
       const proc = createMockProcess();
       Object.defineProperty(proc, "pid", { value: 4321 });
@@ -701,9 +721,6 @@ describe("CursorAgent", () => {
       await Promise.resolve();
       expect(resolved).toBe(false);
 
-      await vi.advanceTimersByTimeAsync(3_000);
-      expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
-      await vi.advanceTimersByTimeAsync(100);
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "done" },
       });
@@ -771,7 +788,12 @@ describe("CursorAgent", () => {
     vi.useFakeTimers();
     const processKill = vi
       .spyOn(process, "kill")
-      .mockImplementation(() => true);
+      .mockImplementation((_pid, signal) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+        }
+        return true;
+      });
     try {
       const proc = createMockProcess();
       Object.defineProperty(proc, "pid", { value: 4321 });

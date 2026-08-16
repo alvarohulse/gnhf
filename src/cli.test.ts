@@ -50,6 +50,8 @@ const stubRunInfo: RunInfo = {
   stopWhen: undefined,
   commitMessagePath: "/repo/.gnhf/runs/run-abc/commit-message",
   commitMessage: undefined,
+  runtimeLimitsPath: "/repo/.gnhf/runs/run-abc/runtime-limits.json",
+  runtimeLimits: {},
 };
 
 interface CliMockOverrides {
@@ -131,7 +133,26 @@ async function runCliWithMocks(
   };
   let consoleErrorCalls: unknown[][] = [];
   let stdoutWriteCalls: unknown[][] = [];
-  const setupRun = overrides.setupRun ?? vi.fn(() => stubRunInfo);
+  const setupRun =
+    overrides.setupRun ??
+    vi.fn(
+      (
+        _runId: string,
+        _prompt: string,
+        _baseCommit: string,
+        _cwd: string,
+        schemaOptions: {
+          runtimeLimits?: Record<string, number | null | undefined>;
+        },
+      ) => ({
+        ...stubRunInfo,
+        runtimeLimits: Object.fromEntries(
+          Object.entries(schemaOptions.runtimeLimits ?? {}).filter(
+            ([, value]) => value !== null && value !== undefined,
+          ),
+        ),
+      }),
+    );
   const peekRunBaseCommit =
     overrides.peekRunBaseCommit ?? vi.fn(() => stubRunInfo.baseCommit);
   const peekRunMetadata = overrides.peekRunMetadata ?? vi.fn(() => stubRunInfo);
@@ -518,6 +539,7 @@ async function runCliResumeWithActualRun(
   opts: {
     liveCommitMessage?: typeof CONVENTIONAL_COMMIT_MESSAGE;
     storedCommitMessage?: "default" | "conventional";
+    storedRuntimeLimits?: Record<string, number>;
   } = {},
 ) {
   const originalArgv = [...process.argv];
@@ -542,6 +564,7 @@ async function runCliResumeWithActualRun(
   const stopWhenPath = join(runDir, "stop-when");
   const commitMessagePath = join(runDir, "commit-message");
   const schemaPath = join(runDir, "output-schema.json");
+  const runtimeLimitsPath = join(runDir, "runtime-limits.json");
   mkdirSync(runDir, { recursive: true });
   execFileSync("git", ["init", "--quiet"], { cwd: tempDir });
   writeFileSync(promptPath, "existing prompt", "utf-8");
@@ -552,6 +575,13 @@ async function runCliResumeWithActualRun(
   }
   if (opts.storedCommitMessage !== undefined) {
     writeFileSync(commitMessagePath, `${opts.storedCommitMessage}\n`, "utf-8");
+  }
+  if (opts.storedRuntimeLimits !== undefined) {
+    writeFileSync(
+      runtimeLimitsPath,
+      `${JSON.stringify(opts.storedRuntimeLimits, null, 2)}\n`,
+      "utf-8",
+    );
   }
 
   const appendDebugLog = vi.fn();
@@ -637,6 +667,7 @@ async function runCliResumeWithActualRun(
     stopWhenContent?: string;
     commitMessageExists: boolean;
     commitMessageContent?: string;
+    runtimeLimits: Record<string, number>;
   };
 
   try {
@@ -667,6 +698,9 @@ async function runCliResumeWithActualRun(
       commitMessageContent: commitMessageExists
         ? readFileSync(commitMessagePath, "utf-8")
         : undefined,
+      runtimeLimits: JSON.parse(
+        readFileSync(runtimeLimitsPath, "utf-8"),
+      ) as Record<string, number>,
     };
   } finally {
     process.argv = originalArgv;
@@ -1179,6 +1213,52 @@ describe("cli", () => {
     });
   });
 
+  it("restores persisted runtime caps when resuming", async () => {
+    const { orchestratorCtor, runtimeLimits } = await runCliResumeWithActualRun(
+      [],
+      undefined,
+      {
+        storedRuntimeLimits: {
+          maxIterations: 12,
+          maxTokens: 3456,
+          maxReportedCostUsd: 7.25,
+        },
+      },
+    );
+
+    expect(orchestratorCtor.mock.calls[0]?.[6]).toEqual({
+      maxIterations: 12,
+      maxTokens: 3456,
+      maxReportedCostUsd: 7.25,
+      stopWhen: undefined,
+    });
+    expect(runtimeLimits).toEqual({
+      maxIterations: 12,
+      maxTokens: 3456,
+      maxReportedCostUsd: 7.25,
+    });
+  });
+
+  it("clears a persisted runtime cap explicitly", async () => {
+    const { orchestratorCtor, runtimeLimits } = await runCliResumeWithActualRun(
+      ["--clear-max-tokens"],
+      undefined,
+      {
+        storedRuntimeLimits: {
+          maxIterations: 12,
+          maxTokens: 3456,
+        },
+      },
+    );
+
+    expect(orchestratorCtor.mock.calls[0]?.[6]).toEqual({
+      maxIterations: 12,
+      maxTokens: undefined,
+      stopWhen: undefined,
+    });
+    expect(runtimeLimits).toEqual({ maxIterations: 12 });
+  });
+
   it("rejects a non-finite reported-cost cap", async () => {
     await expect(
       runCliWithMocks(["ship it", "--max-reported-cost-usd", "NaN"], {
@@ -1476,6 +1556,55 @@ describe("cli", () => {
     expect(
       writeConfiguredWorktreeReceipt.mock.invocationCallOrder[1],
     ).toBeLessThan(createAgent.mock.invocationCallOrder[0]!);
+    expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(3, {
+      runId: expect.stringMatching(/^ship-it-[0-9a-f]+$/),
+      baseCommit: "abc123",
+      receiptId: "receipt-1",
+      state: "shutdown",
+      disposition: "preserved",
+      preservationReason: "requested",
+      worktreePath: expect.stringMatching(
+        /^[/\\]repo-gnhf-worktrees[/\\]ship-it-[0-9a-f]+$/,
+      ),
+    });
+  });
+
+  it("publishes a terminal receipt after removing a clean worktree", async () => {
+    const removeWorktree = vi.fn();
+    const writeConfiguredWorktreeReceipt = vi.fn(() => "receipt-1");
+
+    await runCliWithMocks(
+      ["ship it", "--worktree"],
+      {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: false,
+      },
+      {
+        removeWorktree,
+        setupRun: vi.fn((runId: string) => ({
+          ...stubRunInfo,
+          runId,
+          baseCommit: "a".repeat(40),
+        })),
+        writeConfiguredWorktreeReceipt,
+      },
+    );
+
+    expect(removeWorktree).toHaveBeenCalledTimes(1);
+    expect(writeConfiguredWorktreeReceipt).toHaveBeenLastCalledWith({
+      runId: expect.stringMatching(/^ship-it-[0-9a-f]+$/),
+      baseCommit: "a".repeat(40),
+      receiptId: "receipt-1",
+      state: "shutdown",
+      disposition: "removed",
+      worktreePath: expect.stringMatching(
+        /^[/\\]repo-gnhf-worktrees[/\\]ship-it-[0-9a-f]+$/,
+      ),
+    });
   });
 
   it("does not emit run:start from the Linux sleep-prevention wrapper process", async () => {
@@ -3414,6 +3543,15 @@ describe("cli", () => {
       expect(
         writeConfiguredWorktreeReceipt.mock.invocationCallOrder[1],
       ).toBeLessThan(setupRun.mock.invocationCallOrder[0]!);
+      expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(3, {
+        runId: basename(createdWorktreePath!),
+        baseCommit: "abc123",
+        receiptId: "receipt-1",
+        state: "shutdown",
+        disposition: "preserved",
+        preservationReason: "setup-failed",
+        worktreePath: createdWorktreePath,
+      });
       expect(consoleErrorSink.flat().join("\n")).toContain(
         `worktree preserved at ${createdWorktreePath}`,
       );

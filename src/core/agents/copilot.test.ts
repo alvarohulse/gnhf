@@ -6,6 +6,19 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
+vi.mock("./managed-process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./managed-process.js")>();
+  return {
+    ...actual,
+    spawnManagedChildProcess: (
+      spawnProcess: typeof import("node:child_process").spawn,
+      command: string,
+      args: string[],
+      options: import("node:child_process").SpawnOptions,
+    ) => spawnProcess(command, args, options),
+  };
+});
+
 import { execFileSync, spawn } from "node:child_process";
 import { CopilotAgent } from "./copilot.js";
 import { buildAgentOutputSchema } from "./types.js";
@@ -14,6 +27,8 @@ const mockSpawn = vi.mocked(spawn);
 
 function createMockProcess() {
   const proc = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    signalCode: null,
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     stdin: null,
@@ -150,7 +165,7 @@ describe("CopilotAgent", () => {
     );
   });
 
-  it("finishes owned-group shutdown after the leader closes on abort", async () => {
+  it("surfaces ownership loss when the group leader closes during abort", async () => {
     vi.useFakeTimers();
     const proc = createMockProcess();
     Object.defineProperty(proc, "pid", { value: 4321 });
@@ -165,17 +180,19 @@ describe("CopilotAgent", () => {
       const runPromise = agent.run("test prompt", "/work/dir", {
         signal: controller.signal,
       });
-      const rejection = expect(runPromise).rejects.toThrow("Agent was aborted");
+      const rejection = expect(runPromise).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
       controller.abort();
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
 
       proc.emit("close", null);
-      await vi.advanceTimersByTimeAsync(3_000);
-      expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
-
       await vi.advanceTimersByTimeAsync(100);
       await rejection;
-      await agent.close();
+      expect(processKill).not.toHaveBeenCalledWith(-4321, "SIGKILL");
+      await expect(agent.close()).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
     } finally {
       processKill.mockRestore();
       vi.useRealTimers();

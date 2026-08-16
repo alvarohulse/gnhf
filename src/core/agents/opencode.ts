@@ -19,8 +19,10 @@ import {
 import { appendDebugLog, serializeError } from "../debug-log.js";
 import {
   ChildProcessShutdownTracker,
+  IncompleteChildProcessShutdownError,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  spawnManagedChildProcess,
 } from "./managed-process.js";
 
 interface OpenCodeMessagePart {
@@ -515,11 +517,18 @@ export class OpenCodeAgent implements Agent {
       signal?.removeEventListener("abort", onAbort);
       logStream?.end();
       if (runServer && sessionId) {
+        let mayDeleteSession = true;
         if (!runCompleted || runController.signal.aborted) {
-          await this.abortSession(runServer, sessionId);
+          mayDeleteSession = await this.abortSession(runServer, sessionId);
+          if (!mayDeleteSession) {
+            await this.shutdownServer();
+          }
         }
-        await this.deleteSession(runServer, sessionId);
+        if (mayDeleteSession) {
+          await this.deleteSession(runServer, sessionId);
+        }
       }
+      await this.shutdowns.waitForAll();
     }
   }
 
@@ -551,7 +560,8 @@ export class OpenCodeAgent implements Agent {
     const port = await this.getPortFn();
     const isWindows = this.platform === "win32";
     const detached = this.detached;
-    const child = this.spawnFn(
+    const child = spawnManagedChildProcess(
+      this.spawnFn,
       this.bin,
       [
         "serve",
@@ -582,6 +592,13 @@ export class OpenCodeAgent implements Agent {
       stderr: "",
       stdout: "",
     };
+    child.on("error", (error) => {
+      if (error instanceof IncompleteChildProcessShutdownError) {
+        void this.shutdowns
+          .start(() => Promise.reject(error))
+          .catch(() => undefined);
+      }
+    });
 
     const maxOutput = 64 * 1024;
     const maxMirroredLineLength = 2048;
@@ -653,15 +670,16 @@ export class OpenCodeAgent implements Agent {
       });
       if (this.server === server) {
         if (server.detached) {
+          const clearClosedServer = () => {
+            if (this.server === server) {
+              this.server = null;
+            }
+          };
           void this.shutdowns
             .finalizeOwnedProcessGroup(server.child, server.detached, () =>
               this.shutdownServerProcess(server),
             )
-            .finally(() => {
-              if (this.server === server) {
-                this.server = null;
-              }
-            });
+            .then(clearClosedServer, clearClosedServer);
         } else {
           this.server = null;
         }
@@ -1295,19 +1313,20 @@ export class OpenCodeAgent implements Agent {
   private async abortSession(
     server: OpenCodeServer,
     sessionId: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await this.request(server, `/session/${sessionId}/abort`, {
         method: "POST",
         timeoutMs: 1_000,
       });
       appendDebugLog("opencode:session:abort", { sessionId });
+      return true;
     } catch (error) {
       appendDebugLog("opencode:session:abort-failed", {
         sessionId,
         error: serializeError(error),
       });
-      // Best effort only.
+      return false;
     }
   }
 

@@ -22,6 +22,7 @@ import {
   ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  spawnManagedChildProcess,
 } from "./managed-process.js";
 import { parseJSONLStream, setupAbortHandler } from "./stream-utils.js";
 
@@ -375,13 +376,18 @@ export class CursorAgent implements Agent {
 
     return new Promise((resolve, reject) => {
       const logStream = logPath ? createWriteStream(logPath) : null;
-      const child = spawn(this.bin, buildCursorArgs(this.extraArgs), {
-        cwd,
-        detached: this.detached,
-        shell: shouldUseWindowsShell(this.bin, this.platform),
-        stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
-      });
+      const child = spawnManagedChildProcess(
+        spawn,
+        this.bin,
+        buildCursorArgs(this.extraArgs),
+        {
+          cwd,
+          detached: this.detached,
+          shell: shouldUseWindowsShell(this.bin, this.platform),
+          stdio: ["pipe", "pipe", "pipe"],
+          env: process.env,
+        },
+      );
       this.activeChild = child;
       child.on("close", () => {
         if (this.activeChild === child) {
@@ -400,8 +406,15 @@ export class CursorAgent implements Agent {
         void (async () => {
           try {
             await finalizeRun();
-          } finally {
             reject(error);
+          } catch (cleanupError) {
+            reject(
+              cleanupError instanceof Error
+                ? cleanupError
+                : new Error(
+                    `Cursor process cleanup failed: ${String(cleanupError)}`,
+                  ),
+            );
           }
         })();
       };
@@ -490,9 +503,18 @@ export class CursorAgent implements Agent {
           clearTimeout(finalResultCleanupTimer);
         }
         logStream?.end();
-        await finalizeRun();
-        if (closedAfterFinalCleanup) {
-          await this.shutdowns.waitForAll();
+        try {
+          await finalizeRun();
+          if (closedAfterFinalCleanup) {
+            await this.shutdowns.waitForAll();
+          }
+        } catch (error) {
+          reject(
+            error instanceof Error
+              ? error
+              : new Error(`Cursor process cleanup failed: ${String(error)}`),
+          );
+          return;
         }
         if (code !== 0 && !closedAfterFinalCleanup) {
           const detail = `cursor exited with code ${code}: ${stderr}`;

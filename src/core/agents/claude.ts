@@ -15,6 +15,7 @@ import {
   ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  spawnManagedChildProcess,
 } from "./managed-process.js";
 import { parseJSONLStream, setupAbortHandler } from "./stream-utils.js";
 
@@ -378,7 +379,8 @@ export class ClaudeAgent implements Agent {
     return new Promise((resolve, reject) => {
       const logStream = logPath ? createWriteStream(logPath) : null;
 
-      const child = spawn(
+      const child = spawnManagedChildProcess(
+        spawn,
         this.bin,
         buildClaudeArgs(prompt, this.schema, this.extraArgs),
         {
@@ -407,8 +409,15 @@ export class ClaudeAgent implements Agent {
         void (async () => {
           try {
             await finalizeRun();
-          } finally {
             reject(error);
+          } catch (cleanupError) {
+            reject(
+              cleanupError instanceof Error
+                ? cleanupError
+                : new Error(
+                    `Claude process cleanup failed: ${String(cleanupError)}`,
+                  ),
+            );
           }
         })();
       };
@@ -597,9 +606,18 @@ export class ClaudeAgent implements Agent {
           clearTimeout(finalResultCleanupTimer);
         }
         logStream?.end();
-        await finalizeRun();
-        if (closedAfterFinalCleanup) {
-          await this.shutdowns.waitForAll();
+        try {
+          await finalizeRun();
+          if (closedAfterFinalCleanup) {
+            await this.shutdowns.waitForAll();
+          }
+        } catch (error) {
+          reject(
+            error instanceof Error
+              ? error
+              : new Error(`Claude process cleanup failed: ${String(error)}`),
+          );
+          return;
         }
         const terminalUsage = getResultUsage();
         if (code !== 0 && !closedAfterFinalCleanup) {

@@ -43,6 +43,7 @@ import {
 } from "./core/git.js";
 import {
   type RunInfo,
+  type RunRuntimeLimitOverrides,
   type RunSchemaOptions,
   setupRun,
   resumeRun,
@@ -195,6 +196,7 @@ function redactDebugArgs(args: string[]): string[] {
 function buildSchemaOptions(
   stopWhen: string | undefined,
   commitMessage: CommitMessageConfig | undefined,
+  runtimeLimits?: RunRuntimeLimitOverrides,
 ): RunSchemaOptions {
   const commitFields = getCommitMessageSchemaFields(commitMessage);
   return {
@@ -202,12 +204,14 @@ function buildSchemaOptions(
     ...(stopWhen === undefined ? {} : { stopWhen }),
     ...(commitMessage === undefined ? {} : { commitMessage }),
     ...(commitFields.length === 0 ? {} : { commitFields }),
+    ...(runtimeLimits === undefined ? {} : { runtimeLimits }),
   };
 }
 
 function buildResumeSchemaOptions(
   stopWhen: string | undefined,
   commitMessage: CommitMessageConfig | undefined,
+  runtimeLimits?: RunRuntimeLimitOverrides,
 ): RunSchemaOptions {
   const commitFields = getCommitMessageSchemaFields(commitMessage);
   if (stopWhen === "") {
@@ -216,9 +220,10 @@ function buildResumeSchemaOptions(
       clearStopWhen: true,
       ...(commitMessage === undefined ? {} : { commitMessage }),
       ...(commitFields.length === 0 ? {} : { commitFields }),
+      ...(runtimeLimits === undefined ? {} : { runtimeLimits }),
     };
   }
-  return buildSchemaOptions(stopWhen, commitMessage);
+  return buildSchemaOptions(stopWhen, commitMessage, runtimeLimits);
 }
 
 function initializeNewBranch(
@@ -301,6 +306,8 @@ interface WorktreeRunResult {
   runInfo: RunInfo;
   worktreePath: string;
   effectiveCwd: string;
+  receiptId?: string;
+  receiptRunId?: string;
   resumed: boolean;
 }
 
@@ -387,45 +394,61 @@ function initializeWorktreeRun(
       return null;
     }
 
-    writeConfiguredWorktreeReceipt({
+    const receiptId = writeConfiguredWorktreeReceipt({
       runId: candidateRunId,
       state: "created",
       worktreePath: candidateWorktreePath,
     });
-    let worktreeBranch: string;
     try {
-      worktreeBranch = getCurrentBranch(candidateWorktreePath);
+      let worktreeBranch: string;
+      try {
+        worktreeBranch = getCurrentBranch(candidateWorktreePath);
+      } catch (error) {
+        throw new Error(
+          `Preserved worktree at ${candidateWorktreePath} is in an unexpected state ` +
+            `(${error instanceof Error ? error.message : String(error)}). ` +
+            `Fix the worktree manually or remove it with ` +
+            `"git worktree remove ${candidateWorktreePath}" before re-running.`,
+        );
+      }
+      if (worktreeBranch !== candidateBranchName) {
+        throw new Error(
+          `Preserved worktree at ${candidateWorktreePath} is on branch ` +
+            `"${worktreeBranch}" rather than "${candidateBranchName}". ` +
+            `Restore it to "${candidateBranchName}" with "git -C ${candidateWorktreePath} ` +
+            `checkout ${candidateBranchName}", or remove the worktree with ` +
+            `"git worktree remove ${candidateWorktreePath}" to start fresh.`,
+        );
+      }
+      const runInfo = resumeRun(
+        candidateRunId,
+        candidateWorktreePath,
+        resumeSchemaOptions,
+      );
+      rmSync(setupFailureRecordPath(candidateWorktreePath, candidateRunId), {
+        force: true,
+      });
+      return {
+        runInfo,
+        worktreePath: candidateWorktreePath,
+        effectiveCwd: candidateWorktreePath,
+        ...(receiptId === undefined ? {} : { receiptId }),
+        ...(receiptId === undefined ? {} : { receiptRunId: candidateRunId }),
+        resumed: true,
+      };
     } catch (error) {
-      throw new Error(
-        `Preserved worktree at ${candidateWorktreePath} is in an unexpected state ` +
-          `(${error instanceof Error ? error.message : String(error)}). ` +
-          `Fix the worktree manually or remove it with ` +
-          `"git worktree remove ${candidateWorktreePath}" before re-running.`,
-      );
+      if (receiptId !== undefined) {
+        writeConfiguredWorktreeReceipt({
+          runId: candidateRunId,
+          receiptId,
+          state: "shutdown",
+          disposition: "preserved",
+          preservationReason: "setup-failed",
+          worktreePath: candidateWorktreePath,
+        });
+      }
+      throw error;
     }
-    if (worktreeBranch !== candidateBranchName) {
-      throw new Error(
-        `Preserved worktree at ${candidateWorktreePath} is on branch ` +
-          `"${worktreeBranch}" rather than "${candidateBranchName}". ` +
-          `Restore it to "${candidateBranchName}" with "git -C ${candidateWorktreePath} ` +
-          `checkout ${candidateBranchName}", or remove the worktree with ` +
-          `"git worktree remove ${candidateWorktreePath}" to start fresh.`,
-      );
-    }
-    const runInfo = resumeRun(
-      candidateRunId,
-      candidateWorktreePath,
-      resumeSchemaOptions,
-    );
-    rmSync(setupFailureRecordPath(candidateWorktreePath, candidateRunId), {
-      force: true,
-    });
-    return {
-      runInfo,
-      worktreePath: candidateWorktreePath,
-      effectiveCwd: candidateWorktreePath,
-      resumed: true,
-    };
   };
 
   let createdBranchName = branchName;
@@ -465,8 +488,34 @@ function initializeWorktreeRun(
     try {
       createWorktree(repoRoot, createdWorktreePath, createdBranchName);
     } catch (error) {
-      if (!isCollisionError(error)) throw error;
+      if (!isCollisionError(error)) {
+        if (worktreeReceiptId !== undefined) {
+          const worktreeWasCreated = existsSync(createdWorktreePath);
+          writeConfiguredWorktreeReceipt({
+            runId: createdRunId,
+            baseCommit,
+            receiptId: worktreeReceiptId,
+            state: "shutdown",
+            disposition: worktreeWasCreated ? "preserved" : "removed",
+            ...(worktreeWasCreated
+              ? { preservationReason: "setup-failed" }
+              : {}),
+            worktreePath: createdWorktreePath,
+          });
+        }
+        throw error;
+      }
       if (suffix === 99) {
+        if (worktreeReceiptId !== undefined) {
+          writeConfiguredWorktreeReceipt({
+            runId: createdRunId,
+            baseCommit,
+            receiptId: worktreeReceiptId,
+            state: "shutdown",
+            disposition: "removed",
+            worktreePath: createdWorktreePath,
+          });
+        }
         throw new Error(`Unable to create a unique worktree for ${branchName}`);
       }
       continue;
@@ -493,12 +542,27 @@ function initializeWorktreeRun(
     );
   } catch (error) {
     preserveWorktreeAfterSetupFailure(createdWorktreePath, createdRunId, error);
+    if (worktreeReceiptId !== undefined) {
+      writeConfiguredWorktreeReceipt({
+        runId: createdRunId,
+        baseCommit,
+        receiptId: worktreeReceiptId,
+        state: "shutdown",
+        disposition: "preserved",
+        preservationReason: "setup-failed",
+        worktreePath: createdWorktreePath,
+      });
+    }
     throw error;
   }
   return {
     runInfo,
     worktreePath: createdWorktreePath,
     effectiveCwd: createdWorktreePath,
+    ...(worktreeReceiptId === undefined
+      ? {}
+      : { receiptId: worktreeReceiptId }),
+    ...(worktreeReceiptId === undefined ? {} : { receiptRunId: createdRunId }),
     resumed: false,
   };
 }
@@ -664,18 +728,25 @@ program
   )
   .option(
     "--max-iterations <n>",
-    "Abort after N total iterations",
+    "Abort after N total iterations; persists for this run",
     parseNonNegativeInteger,
   )
+  .option("--clear-max-iterations", "Clear the persisted iteration cap", false)
   .option(
     "--max-tokens <n>",
-    "Abort after N total input+output tokens",
+    "Abort after N total input+output tokens; persists for this run",
     parseNonNegativeInteger,
   )
+  .option("--clear-max-tokens", "Clear the persisted token cap", false)
   .option(
     "--max-reported-cost-usd <amount>",
-    "Abort after the harness reports this total cost in USD",
+    "Abort after the harness reports this total cost in USD; persists for this run",
     parseNonNegativeNumber,
+  )
+  .option(
+    "--clear-max-reported-cost-usd",
+    "Clear the persisted reported-cost cap",
+    false,
   )
   .option(
     "--stop-when <condition>",
@@ -721,6 +792,9 @@ program
         maxIterations?: number;
         maxTokens?: number;
         maxReportedCostUsd?: number;
+        clearMaxIterations: boolean;
+        clearMaxTokens: boolean;
+        clearMaxReportedCostUsd: boolean;
         stopWhen?: string;
         preventSleep?: boolean;
         worktree: boolean;
@@ -850,6 +924,10 @@ program
       const cwd = process.cwd();
       let effectiveCwd = cwd;
       let worktreePath: string | null = null;
+      let worktreeReceiptId: string | undefined;
+      let worktreeReceiptRunId: string | undefined;
+      let worktreeReceiptBaseCommit: string | undefined;
+      let worktreeReceiptFinalized = false;
       let worktreeCleanup: (() => boolean) | null = null;
       let worktreePreservationReason:
         | WorktreePreservationReason
@@ -858,6 +936,31 @@ program
         | null = null;
       let worktreePreservationNoticeEmitted = false;
       let readPendingWorkspaceRecovery = () => false;
+      const publishWorktreeShutdownReceipt = (
+        disposition: "preserved" | "removed",
+        preservationReason?: string,
+      ) => {
+        if (
+          worktreeReceiptId === undefined ||
+          worktreeReceiptRunId === undefined ||
+          worktreePath === null ||
+          worktreeReceiptFinalized
+        ) {
+          return;
+        }
+        writeConfiguredWorktreeReceipt({
+          runId: worktreeReceiptRunId,
+          ...(worktreeReceiptBaseCommit === undefined
+            ? {}
+            : { baseCommit: worktreeReceiptBaseCommit }),
+          receiptId: worktreeReceiptId,
+          state: "shutdown",
+          disposition,
+          ...(preservationReason === undefined ? {} : { preservationReason }),
+          worktreePath,
+        });
+        worktreeReceiptFinalized = true;
+      };
       const preserveWorktree = (
         preservationReason:
           | WorktreePreservationReason
@@ -869,6 +972,7 @@ program
         }
         worktreeCleanup = null;
         worktreePreservationReason = preservationReason;
+        publishWorktreeShutdownReceipt("preserved", preservationReason);
         worktreePreservationNoticeEmitted = true;
         appendDebugLog("worktree:preserved", {
           worktreePath,
@@ -892,6 +996,45 @@ program
         process.exit(1);
       }
 
+      for (const [value, clear, label] of [
+        [options.maxIterations, options.clearMaxIterations, "max iterations"],
+        [options.maxTokens, options.clearMaxTokens, "max tokens"],
+        [
+          options.maxReportedCostUsd,
+          options.clearMaxReportedCostUsd,
+          "max reported cost",
+        ],
+      ] as const) {
+        if (value !== undefined && clear) {
+          console.error(
+            `Cannot set and clear ${label} in the same invocation.`,
+          );
+          process.exit(1);
+        }
+      }
+
+      const parsedRuntimeLimitOverrides: RunRuntimeLimitOverrides = {
+        ...(options.clearMaxIterations
+          ? { maxIterations: null }
+          : options.maxIterations === undefined
+            ? {}
+            : { maxIterations: options.maxIterations }),
+        ...(options.clearMaxTokens
+          ? { maxTokens: null }
+          : options.maxTokens === undefined
+            ? {}
+            : { maxTokens: options.maxTokens }),
+        ...(options.clearMaxReportedCostUsd
+          ? { maxReportedCostUsd: null }
+          : options.maxReportedCostUsd === undefined
+            ? {}
+            : { maxReportedCostUsd: options.maxReportedCostUsd }),
+      };
+      const runtimeLimitOverrides =
+        Object.keys(parsedRuntimeLimitOverrides).length === 0
+          ? undefined
+          : parsedRuntimeLimitOverrides;
+
       const cliStopWhen =
         options.stopWhen === "" ? undefined : options.stopWhen;
       let effectiveStopWhen = cliStopWhen;
@@ -899,6 +1042,7 @@ program
       let schemaOptions = buildSchemaOptions(
         effectiveStopWhen,
         effectiveCommitMessage,
+        runtimeLimitOverrides,
       );
 
       let runInfo: RunInfo;
@@ -923,11 +1067,18 @@ program
           prompt,
           cwd,
           schemaOptions,
-          buildResumeSchemaOptions(options.stopWhen, effectiveCommitMessage),
+          buildResumeSchemaOptions(
+            options.stopWhen,
+            effectiveCommitMessage,
+            runtimeLimitOverrides,
+          ),
         );
         runInfo = wt.runInfo;
         effectiveCwd = wt.effectiveCwd;
         worktreePath = wt.worktreePath;
+        worktreeReceiptId = wt.receiptId;
+        worktreeReceiptRunId = wt.receiptRunId;
+        worktreeReceiptBaseCommit = runInfo.baseCommit;
 
         if (options.preserveWorktree) {
           worktreePreservationReason = "requested";
@@ -950,6 +1101,7 @@ program
           schemaOptions = buildSchemaOptions(
             effectiveStopWhen,
             effectiveCommitMessage,
+            runtimeLimitOverrides,
           );
           startIteration = getLastIterationNumber(runInfo);
           console.error(
@@ -960,11 +1112,13 @@ program
           worktreeCleanup = () => {
             try {
               removeWorktree(cwd, wt.worktreePath);
-              return true;
             } catch {
               preserveWorktree("uncertain");
               return false;
             }
+            worktreeCleanup = null;
+            publishWorktreeShutdownReceipt("removed");
+            return true;
           };
 
           // Ensure worktree cleanup runs even if die() or process.exit() is
@@ -996,7 +1150,11 @@ program
         const existing = resumeCurrentBranchRun(
           prompt,
           cwd,
-          buildResumeSchemaOptions(options.stopWhen, effectiveCommitMessage),
+          buildResumeSchemaOptions(
+            options.stopWhen,
+            effectiveCommitMessage,
+            runtimeLimitOverrides,
+          ),
         );
 
         if (existing) {
@@ -1006,6 +1164,7 @@ program
           schemaOptions = buildSchemaOptions(
             effectiveStopWhen,
             effectiveCommitMessage,
+            runtimeLimitOverrides,
           );
           startIteration = getLastIterationNumber(existing);
         } else {
@@ -1027,12 +1186,14 @@ program
             buildResumeSchemaOptions(
               options.stopWhen,
               existingMetadata.commitMessage,
+              runtimeLimitOverrides,
             ),
           );
           const resumeStopWhen = existing.stopWhen;
           const resumeSchemaOptions = buildSchemaOptions(
             resumeStopWhen,
             existing.commitMessage,
+            runtimeLimitOverrides,
           );
           prompt = existingPrompt;
           runInfo = existing;
@@ -1059,12 +1220,14 @@ program
               buildResumeSchemaOptions(
                 options.stopWhen,
                 existingMetadata.commitMessage,
+                runtimeLimitOverrides,
               ),
             );
             const resumeStopWhen = existing.stopWhen;
             const resumeSchemaOptions = buildSchemaOptions(
               resumeStopWhen,
               existing.commitMessage,
+              runtimeLimitOverrides,
             );
             runInfo = setupRun(
               existingRunId,
@@ -1083,6 +1246,7 @@ program
             schemaOptions = buildSchemaOptions(
               effectiveStopWhen,
               effectiveCommitMessage,
+              runtimeLimitOverrides,
             );
             runInfo = initializeNewBranch(prompt, cwd, schemaOptions);
           } else {
@@ -1124,9 +1288,9 @@ program
         promptLength: prompt.length,
         promptFromStdin,
         startIteration,
-        maxIterations: options.maxIterations,
-        maxTokens: options.maxTokens,
-        maxReportedCostUsd: options.maxReportedCostUsd,
+        maxIterations: runInfo.runtimeLimits.maxIterations,
+        maxTokens: runInfo.runtimeLimits.maxTokens,
+        maxReportedCostUsd: runInfo.runtimeLimits.maxReportedCostUsd,
         stopWhen: effectiveStopWhen,
         commitMessage: effectiveCommitMessage,
         preventSleep: config.preventSleep,
@@ -1149,7 +1313,7 @@ program
         nativeAgent ? config.agentPathOverride[nativeAgent] : undefined,
         nativeAgent ? config.agentArgsOverride?.[nativeAgent] : undefined,
         {
-          ...schemaOptions,
+          ...buildSchemaOptions(effectiveStopWhen, effectiveCommitMessage),
           acpRegistryOverrides: config.acpRegistryOverrides,
         },
       );
@@ -1161,10 +1325,12 @@ program
         effectiveCwd,
         startIteration,
         {
-          maxIterations: options.maxIterations,
-          maxTokens: options.maxTokens,
-          ...(options.maxReportedCostUsd !== undefined
-            ? { maxReportedCostUsd: options.maxReportedCostUsd }
+          maxIterations: runInfo.runtimeLimits.maxIterations,
+          maxTokens: runInfo.runtimeLimits.maxTokens,
+          ...(runInfo.runtimeLimits.maxReportedCostUsd !== undefined
+            ? {
+                maxReportedCostUsd: runInfo.runtimeLimits.maxReportedCostUsd,
+              }
             : {}),
           stopWhen: effectiveStopWhen,
           ...(options.push ? { push: true } : {}),

@@ -8,6 +8,7 @@ import {
   type AgentOutput,
   type TokenUsage,
 } from "./agents/types.js";
+import { IncompleteChildProcessShutdownError } from "./agents/managed-process.js";
 import { redactAgentSpecForLogs, type Config } from "./config.js";
 import type { RunInfo, WorkspaceRecovery } from "./run.js";
 import {
@@ -306,7 +307,9 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   async start(): Promise<void> {
     this.state.startTime = new Date();
     this.state.status = "running";
-    this.activeIterationTokensAvailable = false;
+    if (this.state.currentIteration === 0) {
+      this.activeIterationTokensAvailable = false;
+    }
     // Preserve a pre-start graceful-stop request. ctrl+c can land after the
     // renderer starts listening but before the orchestrator loop begins.
     this.emit("state", this.getState());
@@ -681,7 +684,9 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         this.reportedCostUnavailable = true;
         this.state.reportedCostUsd = null;
         const outcome: AgentRunOutcome =
-          this.pendingAbortReason !== null || err instanceof PermanentAgentError
+          this.pendingAbortReason !== null ||
+          err instanceof PermanentAgentError ||
+          err instanceof IncompleteChildProcessShutdownError
             ? "aborted"
             : this.stopRequested
               ? "stopped"
@@ -735,6 +740,11 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           this.resetWorkspace();
         }
         this.state.lastAgentError = err.detail;
+        return { type: "aborted", reason: err.message };
+      }
+
+      if (err instanceof IncompleteChildProcessShutdownError) {
+        this.preserveWorkspaceAfterUnsafeShutdown(err);
         return { type: "aborted", reason: err.message };
       }
 
@@ -1090,11 +1100,28 @@ ${recovery.detail}
           appendDebugLog("agent:close:error", {
             error: serializeError(err),
           });
-          // Best-effort cleanup only.
+          if (err instanceof IncompleteChildProcessShutdownError) {
+            this.preserveWorkspaceAfterUnsafeShutdown(err);
+            throw err;
+          }
         }
       })();
     }
     await this.closePromise;
+  }
+
+  private preserveWorkspaceAfterUnsafeShutdown(
+    error: IncompleteChildProcessShutdownError,
+  ): void {
+    if (this.pendingWorkspaceRecovery === null) {
+      this.pendingWorkspaceRecovery = {
+        kind: "interrupted",
+        detail: error.message,
+      };
+      writeWorkspaceRecovery(this.runInfo, this.pendingWorkspaceRecovery);
+    }
+    this.activeWorkspaceRecoveryMarker = false;
+    this.state.lastAgentError = error.message;
   }
 
   private emitStopped(): void {

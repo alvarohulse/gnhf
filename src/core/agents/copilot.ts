@@ -19,6 +19,7 @@ import {
   ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  spawnManagedChildProcess,
 } from "./managed-process.js";
 
 interface CopilotAssistantMessageEvent {
@@ -246,7 +247,8 @@ export class CopilotAgent implements Agent {
     return new Promise((resolve, reject) => {
       const logStream = logPath ? createWriteStream(logPath) : null;
 
-      const child = spawn(
+      const child = spawnManagedChildProcess(
+        spawn,
         this.bin,
         buildCopilotArgs(prompt, this.schema, this.extraArgs),
         {

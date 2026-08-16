@@ -6,6 +6,23 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
+vi.mock("./managed-process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./managed-process.js")>();
+  return {
+    ...actual,
+    spawnManagedChildProcess: actualSpawn,
+  };
+
+  function actualSpawn(
+    spawnProcess: typeof import("node:child_process").spawn,
+    command: string,
+    args: string[],
+    options: import("node:child_process").SpawnOptions,
+  ) {
+    return spawnProcess(command, args, options);
+  }
+});
+
 import { execFileSync, spawn } from "node:child_process";
 import { ClaudeAgent } from "./claude.js";
 import { PermanentAgentError, buildAgentOutputSchema } from "./types.js";
@@ -18,6 +35,8 @@ const STOP_SCHEMA = buildAgentOutputSchema({
 
 function createMockProcess() {
   const proc = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    signalCode: null,
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     stdin: null,
@@ -263,7 +282,7 @@ describe("ClaudeAgent", () => {
     expect(proc.kill).not.toHaveBeenCalled();
   });
 
-  it("force kills an active process group during close", async () => {
+  it("surfaces ownership loss when the group leader closes during abort", async () => {
     vi.useFakeTimers();
     const proc = createMockProcess();
     Object.defineProperty(proc, "pid", { value: 4321 });
@@ -278,16 +297,19 @@ describe("ClaudeAgent", () => {
       const runPromise = unixAgent.run("test prompt", "/work/dir", {
         signal: controller.signal,
       });
-      const rejection = expect(runPromise).rejects.toThrow("Agent was aborted");
+      const rejection = expect(runPromise).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
       controller.abort();
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
       proc.emit("close", null);
 
-      await vi.advanceTimersByTimeAsync(3_000);
-
-      expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
       await vi.advanceTimersByTimeAsync(100);
       await rejection;
-      await unixAgent.close();
+      expect(processKill).not.toHaveBeenCalledWith(-4321, "SIGKILL");
+      await expect(unixAgent.close()).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
     } finally {
       processKill.mockRestore();
       vi.useRealTimers();
@@ -298,7 +320,12 @@ describe("ClaudeAgent", () => {
     vi.useFakeTimers();
     const processKill = vi
       .spyOn(process, "kill")
-      .mockImplementation(() => true);
+      .mockImplementation((_pid, signal) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+        }
+        return true;
+      });
     try {
       const proc = createMockProcess();
       Object.defineProperty(proc, "pid", { value: 4321 });
@@ -342,9 +369,6 @@ describe("ClaudeAgent", () => {
       await Promise.resolve();
       expect(resolved).toBe(false);
 
-      await vi.advanceTimersByTimeAsync(3_000);
-      expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
-      await vi.advanceTimersByTimeAsync(100);
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "done" },
       });
@@ -418,7 +442,12 @@ describe("ClaudeAgent", () => {
     vi.useFakeTimers();
     const processKill = vi
       .spyOn(process, "kill")
-      .mockImplementation(() => true);
+      .mockImplementation((_pid, signal) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+        }
+        return true;
+      });
     try {
       const proc = createMockProcess();
       Object.defineProperty(proc, "pid", { value: 4321 });
@@ -495,7 +524,12 @@ describe("ClaudeAgent", () => {
     vi.useFakeTimers();
     const processKill = vi
       .spyOn(process, "kill")
-      .mockImplementation(() => true);
+      .mockImplementation((_pid, signal) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+        }
+        return true;
+      });
     try {
       const proc = createMockProcess();
       Object.defineProperty(proc, "pid", { value: 4321 });

@@ -5,6 +5,7 @@ import { appendDebugLog, serializeError } from "./debug-log.js";
 
 const NOT_GIT_REPOSITORY_MESSAGE =
   'This command must be run inside a Git repository. Change into a repo or run "git init" first.';
+const GNHF_OWNED_METADATA_PREFIXES = [".gnhf/runs/", ".gnhf/setup-failures/"];
 
 function translateGitError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -117,9 +118,20 @@ export function ensureCleanWorkingTree(cwd: string): void {
 }
 
 export function hasWorkingTreeChanges(cwd: string): boolean {
-  return (
-    git(["status", "--porcelain", "--untracked-files=all"], cwd).length > 0
-  );
+  if (git(["status", "--porcelain", "--untracked-files=all"], cwd).length > 0) {
+    return true;
+  }
+
+  return git(
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    cwd,
+  )
+    .split("\0")
+    .some(
+      (path) =>
+        path.length > 0 &&
+        !GNHF_OWNED_METADATA_PREFIXES.some((prefix) => path.startsWith(prefix)),
+    );
 }
 
 export function createBranch(branchName: string, cwd: string): void {

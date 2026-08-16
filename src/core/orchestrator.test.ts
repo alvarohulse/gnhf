@@ -62,6 +62,7 @@ import {
   type AgentResult,
   type TokenUsage,
 } from "./agents/types.js";
+import { IncompleteChildProcessShutdownError } from "./agents/managed-process.js";
 import { CONVENTIONAL_COMMIT_MESSAGE } from "./commit-message.js";
 import type { Config } from "./config.js";
 import type { RunInfo } from "./run.js";
@@ -99,6 +100,8 @@ const runInfo: RunInfo = {
   stopWhen: undefined,
   commitMessagePath: "/repo/.gnhf/runs/run-abc/commit-message",
   commitMessage: undefined,
+  runtimeLimitsPath: "/repo/.gnhf/runs/run-abc/runtime-limits.json",
+  runtimeLimits: {},
 };
 
 function createSuccessResult(summary = "done"): AgentResult {
@@ -399,6 +402,7 @@ describe("Orchestrator stop limits", () => {
       totalInputTokens: 4,
       totalOutputTokens: 2,
       reportedCostUsd: 0.4,
+      tokensAvailable: true,
     });
   });
 
@@ -2120,6 +2124,34 @@ describe("Orchestrator backoff behavior", () => {
       consecutiveErrors: 0,
       lastMessage: "claude credit balance too low - see gnhf.log",
       lastAgentError: "claude exited with code 1: Credit balance is too low",
+    });
+  });
+
+  it("preserves the workspace when agent cleanup cannot be proven", async () => {
+    const cleanupError = new IncompleteChildProcessShutdownError(1234);
+    const agent: Agent = {
+      name: "opencode",
+      run: vi.fn(() => Promise.reject(cleanupError)),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+    );
+
+    await orchestrator.start();
+
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      hasPendingWorkspaceRecovery: true,
+      lastAgentError: cleanupError.message,
     });
   });
 

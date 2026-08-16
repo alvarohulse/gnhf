@@ -17,6 +17,7 @@ import {
   ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  spawnManagedChildProcess,
 } from "./managed-process.js";
 
 interface CodexItemCompleted {
@@ -170,7 +171,8 @@ export class CodexAgent implements Agent {
     return new Promise((resolve, reject) => {
       const logStream = logPath ? createWriteStream(logPath) : null;
 
-      const child = spawn(
+      const child = spawnManagedChildProcess(
+        spawn,
         this.bin,
         buildCodexArgs(prompt, this.schemaPath, this.extraArgs),
         {

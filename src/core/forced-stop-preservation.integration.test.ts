@@ -212,6 +212,8 @@ describe("forced-stop preservation", () => {
       stopWhen: undefined,
       commitMessagePath: join(runDirectory, "commit-message"),
       commitMessage: undefined,
+      runtimeLimitsPath: join(runDirectory, "runtime-limits.json"),
+      runtimeLimits: {},
     };
     return { baseCommit, cwd, runInfo };
   }

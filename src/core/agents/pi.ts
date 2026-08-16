@@ -20,6 +20,7 @@ import {
   ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  spawnManagedChildProcess,
 } from "./managed-process.js";
 
 interface PiAgentDeps {
@@ -262,13 +263,18 @@ export class PiAgent implements Agent {
 
     return new Promise((resolve, reject) => {
       const logStream = logPath ? createWriteStream(logPath) : null;
-      const child = spawn(this.bin, buildPiArgs(this.extraArgs), {
-        cwd,
-        detached: this.detached,
-        shell: shouldUseWindowsShell(this.bin, this.platform),
-        stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
-      });
+      const child = spawnManagedChildProcess(
+        spawn,
+        this.bin,
+        buildPiArgs(this.extraArgs),
+        {
+          cwd,
+          detached: this.detached,
+          shell: shouldUseWindowsShell(this.bin, this.platform),
+          stdio: ["pipe", "pipe", "pipe"],
+          env: process.env,
+        },
+      );
       this.activeChild = child;
       child.on("close", () => {
         if (this.activeChild === child) {

@@ -247,6 +247,28 @@ describe("setupRun", () => {
     );
   });
 
+  it("persists runtime limits for the run", () => {
+    const info = setupRun("run-abc", "test", "abc123", P, {
+      includeStopField: false,
+      runtimeLimits: {
+        maxIterations: 12,
+        maxTokens: 3456,
+        maxReportedCostUsd: 7.25,
+      },
+    });
+
+    expect(mockWriteFileSync).toHaveBeenCalledWith(
+      join(info.runDir, "runtime-limits.json"),
+      `${JSON.stringify(info.runtimeLimits, null, 2)}\n`,
+      { encoding: "utf-8", mode: 0o600 },
+    );
+    expect(info.runtimeLimits).toEqual({
+      maxIterations: 12,
+      maxTokens: 3456,
+      maxReportedCostUsd: 7.25,
+    });
+  });
+
   it("preserves the existing branch base commit on overwrite", () => {
     const baseCommitPath = join(P, ".gnhf", "runs", "run-abc", "base-commit");
     mockExistsSync.mockImplementation((path) => path === baseCommitPath);
@@ -306,6 +328,8 @@ describe("setupRun", () => {
       stopWhen: undefined,
       commitMessagePath: join(runDir, "commit-message"),
       commitMessage: undefined,
+      runtimeLimitsPath: join(runDir, "runtime-limits.json"),
+      runtimeLimits: {},
     });
   });
 });
@@ -430,6 +454,43 @@ describe("resumeRun", () => {
     const info = resumeRun("run-abc", P, { includeStopField: false });
 
     expect(info.stopWhen).toBeUndefined();
+  });
+
+  it("restores, overrides, and clears persisted runtime limits", () => {
+    const runDir = join(P, ".gnhf", "runs", "run-abc");
+    const runtimeLimitsPath = join(runDir, "runtime-limits.json");
+    mockExistsSync.mockImplementation(
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) ||
+        path === runtimeLimitsPath,
+    );
+    mockReadFileSync.mockImplementation((path) =>
+      path === runtimeLimitsPath
+        ? JSON.stringify({
+            maxIterations: 12,
+            maxTokens: 3456,
+            maxReportedCostUsd: 7.25,
+          })
+        : "",
+    );
+
+    const info = resumeRun("run-abc", P, {
+      includeStopField: false,
+      runtimeLimits: {
+        maxIterations: 20,
+        maxTokens: null,
+      },
+    });
+
+    expect(info.runtimeLimits).toEqual({
+      maxIterations: 20,
+      maxReportedCostUsd: 7.25,
+    });
+    expect(mockWriteFileSync).toHaveBeenCalledWith(
+      runtimeLimitsPath,
+      `${JSON.stringify(info.runtimeLimits, null, 2)}\n`,
+      { encoding: "utf-8", mode: 0o600 },
+    );
   });
 
   it("uses stored default commit message metadata on resume even when live config is conventional", () => {

@@ -35,6 +35,8 @@ export interface RunInfo {
   stopWhen: string | undefined;
   commitMessagePath: string;
   commitMessage: CommitMessageConfig | undefined;
+  runtimeLimitsPath: string;
+  runtimeLimits: RunRuntimeLimits;
 }
 
 export interface RunMetadata {
@@ -45,6 +47,16 @@ export interface RunMetadata {
   commitMessagePath: string;
   commitMessage: CommitMessageConfig | undefined;
 }
+
+export interface RunRuntimeLimits {
+  maxIterations?: number;
+  maxTokens?: number;
+  maxReportedCostUsd?: number;
+}
+
+export type RunRuntimeLimitOverrides = {
+  [Key in keyof RunRuntimeLimits]?: RunRuntimeLimits[Key] | null;
+};
 
 export type WorkspaceRecovery = {
   kind: "commit-failure" | "interrupted";
@@ -74,6 +86,7 @@ const STOP_WHEN_FILENAME = "stop-when";
 const COMMIT_MESSAGE_FILENAME = "commit-message";
 const WORKSPACE_RECOVERY_FILENAME = "workspace-recovery.json";
 const USAGE_STATE_FILENAME = "usage.json";
+const RUNTIME_LIMITS_FILENAME = "runtime-limits.json";
 const LOCAL_METADATA_EXCLUDES = [".gnhf/runs/", ".gnhf/setup-failures/"];
 
 function writeSchemaFile(
@@ -100,6 +113,85 @@ export interface RunSchemaOptions {
   commitMessage?: CommitMessageConfig;
   stopWhen?: string;
   clearStopWhen?: boolean;
+  runtimeLimits?: RunRuntimeLimitOverrides;
+}
+
+function resolveRunRuntimeLimits(
+  runtimeLimitsPath: string,
+  overrides: RunRuntimeLimitOverrides = {},
+): RunRuntimeLimits {
+  const runtimeLimits = readRunRuntimeLimits(runtimeLimitsPath);
+  for (const key of [
+    "maxIterations",
+    "maxTokens",
+    "maxReportedCostUsd",
+  ] as const) {
+    const override = overrides[key];
+    if (override === undefined) {
+      continue;
+    }
+    if (override === null) {
+      delete runtimeLimits[key];
+      continue;
+    }
+    runtimeLimits[key] = override;
+  }
+  if (!isRunRuntimeLimits(runtimeLimits)) {
+    throw new Error(`Invalid runtime limits: ${runtimeLimitsPath}`);
+  }
+  writeFileSync(
+    runtimeLimitsPath,
+    `${JSON.stringify(runtimeLimits, null, 2)}\n`,
+    { encoding: "utf-8", mode: 0o600 },
+  );
+  return runtimeLimits;
+}
+
+function readRunRuntimeLimits(runtimeLimitsPath: string): RunRuntimeLimits {
+  if (!existsSync(runtimeLimitsPath)) {
+    return {};
+  }
+  const value = JSON.parse(readFileSync(runtimeLimitsPath, "utf-8")) as unknown;
+  if (!isRunRuntimeLimits(value)) {
+    throw new Error(`Invalid runtime limits: ${runtimeLimitsPath}`);
+  }
+  return value;
+}
+
+function isRunRuntimeLimits(value: unknown): value is RunRuntimeLimits {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const limits = value as Record<string, unknown>;
+  if (
+    Object.keys(limits).some(
+      (key) =>
+        key !== "maxIterations" &&
+        key !== "maxTokens" &&
+        key !== "maxReportedCostUsd",
+    )
+  ) {
+    return false;
+  }
+  return (
+    isOptionalNonNegativeInteger(limits.maxIterations) &&
+    isOptionalNonNegativeInteger(limits.maxTokens) &&
+    isOptionalNonNegativeFiniteNumber(limits.maxReportedCostUsd)
+  );
+}
+
+function isOptionalNonNegativeInteger(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+  );
+}
+
+function isOptionalNonNegativeFiniteNumber(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (typeof value === "number" && Number.isFinite(value) && value >= 0)
+  );
 }
 
 function readStopWhen(stopWhenPath: string): string | undefined {
@@ -261,6 +353,11 @@ export function setupRun(
   const commitMessagePath = join(runDir, COMMIT_MESSAGE_FILENAME);
   const commitMessage = schemaOptions.commitMessage;
   writeCommitMessageMetadata(commitMessagePath, commitMessage);
+  const runtimeLimitsPath = join(runDir, RUNTIME_LIMITS_FILENAME);
+  const runtimeLimits = resolveRunRuntimeLimits(
+    runtimeLimitsPath,
+    schemaOptions.runtimeLimits,
+  );
 
   return {
     runId,
@@ -275,6 +372,8 @@ export function setupRun(
     stopWhen,
     commitMessagePath,
     commitMessage,
+    runtimeLimitsPath,
+    runtimeLimits,
   };
 }
 
@@ -314,6 +413,11 @@ export function resumeRun(
   }
   const commitMessagePath = join(runDir, COMMIT_MESSAGE_FILENAME);
   const commitMessage = resolveRunCommitMessage(commitMessagePath, schemaPath);
+  const runtimeLimitsPath = join(runDir, RUNTIME_LIMITS_FILENAME);
+  const runtimeLimits = resolveRunRuntimeLimits(
+    runtimeLimitsPath,
+    schemaOptions.runtimeLimits,
+  );
   writeSchemaFile(schemaPath, {
     ...schemaOptions,
     commitMessage,
@@ -334,6 +438,8 @@ export function resumeRun(
     stopWhen,
     commitMessagePath,
     commitMessage,
+    runtimeLimitsPath,
+    runtimeLimits,
   };
 }
 

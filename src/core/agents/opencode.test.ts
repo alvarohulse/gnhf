@@ -11,6 +11,19 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
+vi.mock("./managed-process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./managed-process.js")>();
+  return {
+    ...actual,
+    spawnManagedChildProcess: (
+      spawnProcess: typeof import("node:child_process").spawn,
+      command: string,
+      args: string[],
+      options: import("node:child_process").SpawnOptions,
+    ) => spawnProcess(command, args, options),
+  };
+});
+
 vi.mock("../debug-log.js", () => ({
   appendDebugLog: vi.fn(),
   initDebugLog: vi.fn(),
@@ -37,6 +50,8 @@ const mockSpawn = vi.mocked(spawn);
 
 function createMockProcess() {
   const proc = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    signalCode: null,
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     stdin: null,
@@ -1321,7 +1336,7 @@ describe("OpenCodeAgent", () => {
     vi.useRealTimers();
   });
 
-  it("finalizes the owned process group after the server leader exits", async () => {
+  it("surfaces an owned group that remains after the server leader exits", async () => {
     vi.useFakeTimers();
     const proc = createMockProcess();
     Object.defineProperty(proc, "pid", { value: 5678 });
@@ -1341,11 +1356,14 @@ describe("OpenCodeAgent", () => {
     proc.emit("close", 0, null);
 
     const closePromise = detachedAgent.close();
-    expect(killProcess).toHaveBeenCalledWith(-5678, "SIGTERM");
+    const rejection = expect(closePromise).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
 
-    await vi.advanceTimersByTimeAsync(3_100);
-    await closePromise;
-    expect(killProcess).toHaveBeenCalledWith(-5678, "SIGKILL");
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    expect(killProcess).toHaveBeenCalledWith(-5678, 0);
+    expect(killProcess).not.toHaveBeenCalledWith(-5678, "SIGKILL");
     vi.useRealTimers();
   });
 
@@ -1453,6 +1471,35 @@ describe("OpenCodeAgent", () => {
       "http://127.0.0.1:8765/session/session-123",
       expect.objectContaining({ method: "DELETE" }),
     );
+  });
+
+  it("retains the session and shuts down when abort is not acknowledged", async () => {
+    const proc = createMockProcess();
+    vi.mocked(proc.kill).mockImplementation((signal) => {
+      queueMicrotask(() => proc.emit("close", 0, signal));
+      return true;
+    });
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(sseResponse(""))
+      .mockResolvedValueOnce(promptAsyncResponse())
+      .mockResolvedValueOnce(new Response("abort failed", { status: 500 }));
+
+    await expect(agent.run("test", "/repo")).rejects.toThrow(
+      "OpenCode produced no final answer",
+    );
+
+    const calledUrls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(calledUrls).toContain(
+      "http://127.0.0.1:8765/session/session-123/abort",
+    );
+    expect(calledUrls).not.toContain(
+      "http://127.0.0.1:8765/session/session-123",
+    );
+    expect(proc.kill).toHaveBeenCalledWith("SIGTERM");
   });
 
   it("retries the health check when a request rejects with a per-request timeout error", async () => {

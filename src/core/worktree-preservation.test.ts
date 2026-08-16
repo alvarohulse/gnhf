@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -32,6 +32,20 @@ describe("getWorktreePreservationReason", () => {
     writeFileSync(join(cwd, "result.txt"), "unfinished\n", "utf-8");
 
     expect(getWorktreePreservationReason(baseCommit, cwd, false)).toBe("dirty");
+  });
+
+  it("preserves ignored user work when no commit was created", () => {
+    const cwd = createRepo();
+    writeFileSync(join(cwd, ".gitignore"), "build/\n", "utf-8");
+    git(cwd, ["add", ".gitignore"]);
+    git(cwd, ["commit", "-m", "ignore build output"]);
+    const ignoredBaseCommit = git(cwd, ["rev-parse", "HEAD"]);
+    mkdirSync(join(cwd, "build"));
+    writeFileSync(join(cwd, "build", "result.txt"), "unfinished\n", "utf-8");
+
+    expect(getWorktreePreservationReason(ignoredBaseCommit, cwd, false)).toBe(
+      "dirty",
+    );
   });
 
   it("preserves a clean worktree while commit repair is pending", () => {

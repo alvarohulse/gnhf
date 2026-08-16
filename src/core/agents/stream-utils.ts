@@ -26,7 +26,13 @@ export function setupChildProcessHandlers(
       settle();
       return;
     }
-    void finalize().then(settle, settle);
+    void finalize().then(settle, (error: unknown) => {
+      reject(
+        error instanceof Error
+          ? error
+          : new Error(`Agent process cleanup failed: ${String(error)}`),
+      );
+    });
   };
 
   child.on("error", (err) => {
@@ -93,7 +99,13 @@ export function setupAbortHandler(
       const shutdown = abortChild();
       if (shutdown !== undefined) {
         const rejectAborted = () => reject(new Error("Agent was aborted"));
-        void shutdown.then(rejectAborted, rejectAborted);
+        void shutdown.then(rejectAborted, (error: unknown) => {
+          reject(
+            error instanceof Error
+              ? error
+              : new Error(`Agent process cleanup failed: ${String(error)}`),
+          );
+        });
         return;
       }
     } catch {

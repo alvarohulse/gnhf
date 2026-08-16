@@ -4,40 +4,55 @@ import {
   constants,
   fsyncSync,
   linkSync,
+  mkdirSync,
   openSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+
+type WorktreeReceiptDisposition = "preserved" | "removed";
 
 type WriteConfiguredWorktreeReceiptParams = {
   runId: string;
   baseCommit?: string;
   environment?: NodeJS.ProcessEnv;
   receiptId?: string;
-  state: "created" | "pending";
   worktreePath: string;
-};
+} & (
+  | { state: "created" | "pending" }
+  | {
+      state: "shutdown";
+      disposition: WorktreeReceiptDisposition;
+      preservationReason?: string;
+    }
+);
 
 type WorktreeReceipt = {
   schemaVersion: 1;
   receiptId: string;
   runId: string;
   baseCommit?: string;
-  state: "created" | "pending";
+  disposition?: WorktreeReceiptDisposition;
+  preservationReason?: string;
+  state: "created" | "pending" | "shutdown";
   worktreePath: string;
 };
 
-export function writeConfiguredWorktreeReceipt({
-  runId,
-  baseCommit,
-  environment = process.env,
-  receiptId,
-  state,
-  worktreePath,
-}: WriteConfiguredWorktreeReceiptParams): string | undefined {
+export function writeConfiguredWorktreeReceipt(
+  params: WriteConfiguredWorktreeReceiptParams,
+): string | undefined {
+  const {
+    runId,
+    baseCommit,
+    environment = process.env,
+    receiptId,
+    state,
+    worktreePath,
+  } = params;
   const configuredPath = environment.GNHF_WORKTREE_RECEIPT_PATH;
   if (configuredPath === undefined) {
     return undefined;
@@ -57,6 +72,12 @@ export function writeConfiguredWorktreeReceipt({
   if (baseCommit !== undefined) {
     receipt.baseCommit = baseCommit;
   }
+  if (state === "shutdown") {
+    receipt.disposition = params.disposition;
+    if (params.preservationReason !== undefined) {
+      receipt.preservationReason = params.preservationReason;
+    }
+  }
 
   const directory = dirname(configuredPath);
   const temporaryPath = join(
@@ -64,34 +85,56 @@ export function writeConfiguredWorktreeReceipt({
     `.${basename(configuredPath)}.${process.pid}.${randomUUID()}.tmp`,
   );
   try {
-    const descriptor = openSync(
-      temporaryPath,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
-      0o600,
-    );
-    try {
-      writeFileSync(
-        descriptor,
-        `${JSON.stringify(receipt, null, 2)}\n`,
-        "utf-8",
+    withReceiptLock(configuredPath, () => {
+      const descriptor = openSync(
+        temporaryPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+        0o600,
       );
-      fsyncSync(descriptor);
-    } finally {
-      closeSync(descriptor);
-    }
+      try {
+        writeFileSync(
+          descriptor,
+          `${JSON.stringify(receipt, null, 2)}\n`,
+          "utf-8",
+        );
+        fsyncSync(descriptor);
+      } finally {
+        closeSync(descriptor);
+      }
 
-    if (receiptId === undefined) {
-      linkSync(temporaryPath, configuredPath);
-      unlinkSync(temporaryPath);
-    } else {
-      assertReceiptOwnership(configuredPath, receiptId);
-      renameSync(temporaryPath, configuredPath);
-    }
-    fsyncDirectory(directory);
+      if (receiptId === undefined) {
+        linkSync(temporaryPath, configuredPath);
+        unlinkSync(temporaryPath);
+      } else {
+        assertReceiptOwnership(configuredPath, receiptId);
+        renameSync(temporaryPath, configuredPath);
+      }
+      fsyncDirectory(directory);
+    });
     return activeReceiptId;
   } catch (error) {
     unlinkIfPresent(temporaryPath);
     throw error;
+  }
+}
+
+function withReceiptLock<T>(configuredPath: string, action: () => T): T {
+  const directory = dirname(configuredPath);
+  const lockPath = join(directory, `.${basename(configuredPath)}.lock`);
+  try {
+    mkdirSync(lockPath, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error("Configured worktree receipt is being updated");
+    }
+    throw error;
+  }
+
+  try {
+    return action();
+  } finally {
+    rmdirSync(lockPath);
+    fsyncDirectory(directory);
   }
 }
 

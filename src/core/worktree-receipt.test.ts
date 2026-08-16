@@ -1,5 +1,6 @@
 import {
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -99,6 +100,64 @@ describe("writeConfiguredWorktreeReceipt", () => {
       worktreePath,
     });
     expect(readdirSync(directory)).toEqual(["worktree.json"]);
+  });
+
+  it("publishes a terminal preservation receipt for the same owner", () => {
+    const directory = mkdtempSync(join(tmpdir(), "gnhf-worktree-receipt-"));
+    temporaryDirectories.push(directory);
+    const receiptPath = join(directory, "worktree.json");
+    const environment = { GNHF_WORKTREE_RECEIPT_PATH: receiptPath };
+    const worktreePath = join(directory, "worktree");
+    const receiptId = writeConfiguredWorktreeReceipt({
+      runId: "fixture-run",
+      environment,
+      state: "created",
+      worktreePath,
+    });
+
+    writeConfiguredWorktreeReceipt({
+      runId: "fixture-run",
+      environment,
+      receiptId: receiptId!,
+      state: "shutdown",
+      disposition: "preserved",
+      preservationReason: "dirty",
+      worktreePath,
+    });
+
+    expect(JSON.parse(readFileSync(receiptPath, "utf-8"))).toMatchObject({
+      receiptId,
+      state: "shutdown",
+      disposition: "preserved",
+      preservationReason: "dirty",
+    });
+  });
+
+  it("does not update while another owner holds the receipt lock", () => {
+    const directory = mkdtempSync(join(tmpdir(), "gnhf-worktree-receipt-"));
+    temporaryDirectories.push(directory);
+    const receiptPath = join(directory, "worktree.json");
+    const environment = { GNHF_WORKTREE_RECEIPT_PATH: receiptPath };
+    const worktreePath = join(directory, "worktree");
+    const receiptId = writeConfiguredWorktreeReceipt({
+      runId: "fixture-run",
+      environment,
+      state: "pending",
+      worktreePath,
+    });
+    const original = readFileSync(receiptPath, "utf-8");
+    mkdirSync(join(directory, ".worktree.json.lock"));
+
+    expect(() =>
+      writeConfiguredWorktreeReceipt({
+        runId: "fixture-run",
+        environment,
+        receiptId: receiptId!,
+        state: "created",
+        worktreePath,
+      }),
+    ).toThrow("being updated");
+    expect(readFileSync(receiptPath, "utf-8")).toBe(original);
   });
 
   it("refuses to replace an existing receipt", () => {
