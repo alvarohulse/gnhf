@@ -149,7 +149,9 @@ describe("forced-stop preservation", () => {
   });
 
   it("preserves a commit when notes persistence fails", async () => {
-    const fixture = createFixture({ createMetadataDirectory: false });
+    const fixture = createFixture();
+    rmSync(fixture.runInfo.notesPath);
+    mkdirSync(fixture.runInfo.notesPath);
     const agent: Agent = {
       name: "claude",
       run: vi.fn((_prompt, cwd) => {
@@ -177,7 +179,7 @@ describe("forced-stop preservation", () => {
     ).toBe("1");
   });
 
-  function createFixture(options: { createMetadataDirectory?: boolean } = {}): {
+  function createFixture(): {
     baseCommit: string;
     cwd: string;
     runInfo: RunInfo;
@@ -187,10 +189,8 @@ describe("forced-stop preservation", () => {
     const cwd = join(root, "repo");
     const runDirectory = join(root, "metadata", "run");
     mkdirSync(cwd, { recursive: true });
-    if (options.createMetadataDirectory !== false) {
-      mkdirSync(runDirectory, { recursive: true });
-      writeFileSync(join(runDirectory, "notes.md"), "# Notes\n", "utf-8");
-    }
+    mkdirSync(runDirectory, { recursive: true });
+    writeFileSync(join(runDirectory, "notes.md"), "# Notes\n", "utf-8");
 
     git(cwd, ["init", "-b", "main"]);
     git(cwd, ["config", "user.name", "gnhf tests"]);

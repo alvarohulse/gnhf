@@ -753,7 +753,7 @@ describe("gnhf e2e", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "cleans up the worktree when no changes are made in --worktree mode",
+    "preserves an interrupted worktree when no changes are made",
     async () => {
       const cwd = createRepo();
       tempDirs.push(cwd);
@@ -768,8 +768,7 @@ describe("gnhf e2e", () => {
       // server: when it detects "slow cleanup" in the prompt text, the message
       // handler deliberately never sends a response (it only listens for the
       // request to close). This simulates a long-running agent that hasn't
-      // produced any commits. We then send SIGINT to trigger graceful shutdown,
-      // which should cause gnhf to clean up the worktree (0 commits = auto-remove).
+      // produced any commits. We then force shutdown with two SIGINTs.
       const child = spawn(
         process.execPath,
         [distCliPath, "slow cleanup", "--agent", "opencode", "--worktree"],
@@ -810,11 +809,9 @@ describe("gnhf e2e", () => {
       // Original repo should still be on main
       expect(git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)).toBe("main");
 
-      // Worktree should have been cleaned up (no commits were made)
-      if (existsSync(worktreeParent)) {
-        const remaining = readdirSync(worktreeParent);
-        expect(remaining.length).toBe(0);
-      }
+      expect(existsSync(worktreeParent)).toBe(true);
+      expect(readdirSync(worktreeParent)).toHaveLength(1);
+      expect(sigintResult.stderr).toContain("worktree preserved at");
     },
     30_000,
   );
