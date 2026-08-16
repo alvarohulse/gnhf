@@ -647,6 +647,56 @@ describe("Orchestrator stop limits", () => {
     });
   });
 
+  it("accepts a lower authoritative cost correction within one generation", async () => {
+    const agent: Agent = {
+      name: "opencode",
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.({
+          inputTokens: 4,
+          outputTokens: 2,
+          cacheReadTokens: 3,
+          cacheCreationTokens: 1,
+          totalTokens: 12,
+          reportedCostUsd: 0.4,
+          tokensAvailable: true,
+        });
+        return {
+          ...createSuccessResult(),
+          usage: {
+            inputTokens: 4,
+            outputTokens: 2,
+            cacheReadTokens: 3,
+            cacheCreationTokens: 1,
+            totalTokens: 12,
+            reportedCostUsd: 0.25,
+            tokensAvailable: true,
+          },
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(orchestrator.getState().reportedCostUsd).toBe(0.25);
+    expect(mockWriteRunUsageState).toHaveBeenLastCalledWith(
+      runInfo,
+      expect.objectContaining({
+        generation: 1,
+        phase: "terminal",
+        reportedCostUsd: 0.25,
+      }),
+    );
+  });
+
   it("aborts after completing the configured number of iterations", async () => {
     const agent: Agent = {
       name: "claude",

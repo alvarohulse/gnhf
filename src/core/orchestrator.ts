@@ -573,10 +573,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         this.totalTokens = totalTokenLowerBound;
       }
       if (usage.reportedCostUsd !== undefined) {
-        this.reportedCostLowerBoundUsd = Math.max(
-          this.reportedCostLowerBoundUsd ?? 0,
-          (baseReportedCostLowerBoundUsd ?? 0) + usage.reportedCostUsd,
-        );
+        this.reportedCostLowerBoundUsd =
+          (baseReportedCostLowerBoundUsd ?? 0) + usage.reportedCostUsd;
         this.state.reportedCostUsd = !this.reportedCostUnavailable
           ? this.reportedCostLowerBoundUsd
           : null;
@@ -806,10 +804,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         orchestrator.reportedCostUnavailable = true;
         orchestrator.state.reportedCostUsd = null;
       } else {
-        orchestrator.reportedCostLowerBoundUsd = Math.max(
-          orchestrator.reportedCostLowerBoundUsd ?? 0,
-          (baseReportedCostLowerBoundUsd ?? 0) + usage.reportedCostUsd,
-        );
+        orchestrator.reportedCostLowerBoundUsd =
+          (baseReportedCostLowerBoundUsd ?? 0) + usage.reportedCostUsd;
         orchestrator.state.reportedCostUsd =
           !orchestrator.reportedCostUnavailable
             ? orchestrator.reportedCostLowerBoundUsd
