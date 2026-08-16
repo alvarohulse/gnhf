@@ -703,7 +703,9 @@ describe("RovoDevAgent", () => {
       .mockResolvedValueOnce(jsonResponse({ message: "deleted" }));
 
     await windowsAgent.run("test", "/repo");
-    await windowsAgent.close();
+    const closePromise = windowsAgent.close();
+    proc.emit("close", 0, null);
+    await closePromise;
 
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
       "taskkill",

@@ -272,6 +272,7 @@ describe("ClaudeAgent", () => {
       signal: controller.signal,
     });
     controller.abort();
+    proc.emit("close", null, null);
 
     await expect(promise).rejects.toThrow("Agent was aborted");
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
@@ -380,12 +381,19 @@ describe("ClaudeAgent", () => {
 
   it("force kills Claude if it ignores the final-result shutdown signal", async () => {
     vi.useFakeTimers();
+    let groupPresent = true;
     const processKill = vi
       .spyOn(process, "kill")
       .mockImplementation((pid, signal) => {
         if (pid === -4321 && signal === "SIGKILL") {
+          groupPresent = false;
           queueMicrotask(() => {
             proc.emit("close", null);
+          });
+        }
+        if (pid === -4321 && signal === 0 && !groupPresent) {
+          throw Object.assign(new Error("process group exited"), {
+            code: "ESRCH",
           });
         }
         return true;
@@ -1245,6 +1253,7 @@ describe("ClaudeAgent", () => {
     const promise = agent.run("prompt", "/cwd");
 
     proc.emit("error", new Error("ENOENT"));
+    proc.emit("close", null, null);
 
     await expect(promise).rejects.toThrow("Failed to spawn claude: ENOENT");
   });

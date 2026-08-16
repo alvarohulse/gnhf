@@ -116,6 +116,27 @@ describe("setupChildProcessHandlers", () => {
     expect(logStream.end).toHaveBeenCalledTimes(1);
     expect(onSuccess).toHaveBeenCalledTimes(1);
   });
+
+  it("shuts down spawn errors before finalizing closed processes", async () => {
+    const child = createMockChild();
+    const reject = vi.fn();
+    const onSuccess = vi.fn();
+    const shutdown = vi.fn(() => Promise.resolve());
+    const finalize = vi.fn(() => Promise.resolve());
+
+    setupChildProcessHandlers(child as never, "pi", null, reject, onSuccess, {
+      shutdown,
+      finalize,
+    });
+
+    child.emit("error", new Error("ENOENT"));
+    await vi.waitFor(() => expect(shutdown).toHaveBeenCalledTimes(1));
+    expect(finalize).not.toHaveBeenCalled();
+
+    child.emit("close", 0);
+    await vi.waitFor(() => expect(finalize).toHaveBeenCalledTimes(1));
+    expect(onSuccess).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("setupAbortHandler", () => {

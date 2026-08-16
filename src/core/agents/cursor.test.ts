@@ -290,6 +290,7 @@ describe("CursorAgent", () => {
       signal: controller.signal,
     });
     controller.abort();
+    proc.emit("close", null, null);
 
     await expect(promise).rejects.toThrow("Agent was aborted");
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
@@ -732,12 +733,19 @@ describe("CursorAgent", () => {
 
   it("force kills cursor if it ignores the final-result shutdown signal", async () => {
     vi.useFakeTimers();
+    let groupPresent = true;
     const processKill = vi
       .spyOn(process, "kill")
       .mockImplementation((pid, signal) => {
         if (pid === -4321 && signal === "SIGKILL") {
+          groupPresent = false;
           queueMicrotask(() => {
             proc.emit("close", null);
+          });
+        }
+        if (pid === -4321 && signal === 0 && !groupPresent) {
+          throw Object.assign(new Error("process group exited"), {
+            code: "ESRCH",
           });
         }
         return true;
