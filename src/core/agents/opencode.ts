@@ -5,6 +5,7 @@ import {
   buildAgentOutputSchema,
   isValidTokenCount,
   parseAgentOutput,
+  validateAgentOutput,
   type Agent,
   type AgentOutput,
   type AgentOutputSchema,
@@ -567,6 +568,7 @@ export class OpenCodeAgent implements Agent {
         env: buildOpencodeChildEnv(),
       },
       this.shutdowns,
+      this.platform,
     ) as unknown as ChildProcessWithoutNullStreams;
 
     const server: OpenCodeServer = {
@@ -824,7 +826,9 @@ export class OpenCodeAgent implements Agent {
     let lastFinalAnswerText: string | null = null;
     let lastFinalAnswerMessageId: string | null = null;
     let lastUsageSignature = "0:0:0:0:0:na:true";
-    let structuredOutputFromSSE: AgentOutput | null = null;
+    const structuredOutputByMessageId = new Map<string, AgentOutput>();
+    const usageReceiptMessageIds = new Set<string>();
+    let sawUnboundStructuredOutput = false;
     let streamErrorInfo: OpenCodeStreamErrorInfo | null = null;
 
     // Telemetry: capture "what was happening on the stream right up until
@@ -971,6 +975,9 @@ export class OpenCodeAgent implements Agent {
         }
         return;
       }
+      if (tokens !== undefined || cost !== undefined) {
+        usageReceiptMessageIds.add(messageId);
+      }
       if (!tokens && cost === undefined && !requireReceipt) {
         return;
       }
@@ -1104,16 +1111,16 @@ export class OpenCodeAgent implements Agent {
       }
 
       if (payload?.type === "message.updated") {
-        if (properties.info?.role === "assistant") {
-          updateUsage(
-            properties.info.id,
-            properties.info.tokens,
-            properties.info.cost,
-            true,
-          );
-        }
-        if (properties.info?.structured) {
-          structuredOutputFromSSE = properties.info.structured;
+        const info = properties.info;
+        if (info?.role === "assistant") {
+          updateUsage(info.id, info.tokens, info.cost, true);
+          if (info.structured) {
+            if (info.id === undefined) {
+              sawUnboundStructuredOutput = true;
+            } else {
+              structuredOutputByMessageId.set(info.id, info.structured);
+            }
+          }
         }
         return false;
       }
@@ -1276,37 +1283,68 @@ export class OpenCodeAgent implements Agent {
       }
     }
 
-    if (structuredOutputFromSSE) {
-      appendDebugLog("opencode:output:structured", {
-        sessionId,
-        source: "sse",
-      });
-      return {
-        output: structuredOutputFromSSE,
-        usage,
-        sawSessionIdle,
-      };
-    }
-
     if (streamErrorInfo) {
+      markUsageUnavailable();
       throw new Error(buildProviderErrorMessage(streamErrorInfo));
     }
 
     const finalOutputText = toNonEmptyString(lastFinalAnswerText);
 
-    if (finalOutputText === null) {
+    if (
+      finalOutputText === null &&
+      structuredOutputByMessageId.size === 0 &&
+      !sawUnboundStructuredOutput
+    ) {
       appendDebugLog("opencode:output:missing", {
         sessionId,
-        hasStructuredOutput: structuredOutputFromSSE !== null,
+        hasStructuredOutput: false,
       });
       throw new Error("OpenCode produced no final answer");
     }
 
+    const terminalMessageId = lastFinalAnswerMessageId;
+    const structuredOutput =
+      terminalMessageId === null
+        ? undefined
+        : structuredOutputByMessageId.get(terminalMessageId);
+    const hasMatchingUsageReceipt =
+      terminalMessageId !== null &&
+      usageReceiptMessageIds.has(terminalMessageId);
+    const structuredOutputMismatch =
+      sawUnboundStructuredOutput ||
+      (structuredOutputByMessageId.size > 0 && structuredOutput === undefined);
     if (
-      lastFinalAnswerMessageId === null ||
-      !usageByMessageId.has(lastFinalAnswerMessageId)
+      finalOutputText === null ||
+      terminalMessageId === null ||
+      !hasMatchingUsageReceipt ||
+      structuredOutputMismatch
     ) {
       markUsageUnavailable();
+      appendDebugLog("opencode:output:identity-error", {
+        sessionId,
+        terminalMessageId,
+        hasFinalAnswer: finalOutputText !== null,
+        hasMatchingStructuredOutput: structuredOutput !== undefined,
+        hasMatchingUsageReceipt,
+        sawUnboundStructuredOutput,
+      });
+      throw new Error(
+        "OpenCode terminal output identity could not be verified",
+      );
+    }
+
+    if (structuredOutput !== undefined) {
+      const output = validateAgentOutput(structuredOutput, this.schema);
+      appendDebugLog("opencode:output:structured", {
+        sessionId,
+        messageId: terminalMessageId,
+        source: "sse",
+      });
+      return {
+        output,
+        usage,
+        sawSessionIdle,
+      };
     }
 
     try {
