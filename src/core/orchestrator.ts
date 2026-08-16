@@ -191,6 +191,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       this.cwd,
     );
     this.pendingWorkspaceRecovery = readWorkspaceRecovery(this.runInfo);
+    this.unsafeShutdownDetected =
+      this.pendingWorkspaceRecovery?.cleanupUncertain === true;
     const usageState = readRunUsageState(this.runInfo);
     if (usageState !== null) {
       const usageGenerationComplete =
@@ -560,6 +562,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         kind: "interrupted",
         detail:
           "The previous invocation stopped before the active iteration completed.",
+        cleanupUncertain: false,
       });
       this.activeWorkspaceRecoveryMarker = true;
     }
@@ -1053,6 +1056,7 @@ ${recovery.detail}
     this.pendingWorkspaceRecovery = {
       kind: "commit-failure",
       detail: error.detail,
+      cleanupUncertain: this.unsafeShutdownDetected,
     };
     this.activeWorkspaceRecoveryMarker = false;
     writeWorkspaceRecovery(this.runInfo, this.pendingWorkspaceRecovery);
@@ -1276,13 +1280,15 @@ ${recovery.detail}
     surfaceAsAgentError = true,
   ): void {
     this.unsafeShutdownDetected = true;
-    if (this.pendingWorkspaceRecovery === null) {
-      this.pendingWorkspaceRecovery = {
-        kind: "interrupted",
-        detail: error.message,
-      };
-      writeWorkspaceRecovery(this.runInfo, this.pendingWorkspaceRecovery);
-    }
+    this.pendingWorkspaceRecovery =
+      this.pendingWorkspaceRecovery?.kind === "commit-failure"
+        ? { ...this.pendingWorkspaceRecovery, cleanupUncertain: true }
+        : {
+            kind: "interrupted",
+            detail: error.message,
+            cleanupUncertain: true,
+          };
+    writeWorkspaceRecovery(this.runInfo, this.pendingWorkspaceRecovery);
     this.activeWorkspaceRecoveryMarker = false;
     if (surfaceAsAgentError) {
       this.state.lastAgentError = error.message;

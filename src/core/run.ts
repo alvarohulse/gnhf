@@ -62,6 +62,7 @@ export type RunRuntimeLimitOverrides = {
 export type WorkspaceRecovery = {
   kind: "commit-failure" | "interrupted";
   detail: string;
+  cleanupUncertain: boolean;
 };
 
 export interface RunUsageState {
@@ -593,11 +594,19 @@ export function readWorkspaceRecovery(
     !("kind" in value) ||
     (value.kind !== "commit-failure" && value.kind !== "interrupted") ||
     !("detail" in value) ||
-    typeof value.detail !== "string"
+    typeof value.detail !== "string" ||
+    ("cleanupUncertain" in value && typeof value.cleanupUncertain !== "boolean")
   ) {
     throw new Error(`Invalid workspace recovery metadata: ${recoveryPath}`);
   }
-  return { kind: value.kind, detail: value.detail };
+  return {
+    kind: value.kind,
+    detail: value.detail,
+    cleanupUncertain:
+      "cleanupUncertain" in value && typeof value.cleanupUncertain === "boolean"
+        ? value.cleanupUncertain
+        : true,
+  };
 }
 
 export function writeWorkspaceRecovery(
