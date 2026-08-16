@@ -1,0 +1,11 @@
+Target commit: 1af801d206b487988d7266d5fbf4af47f00544ff
+
+Targeted automated validation:
+  pnpm exec vitest run src/core/agents/managed-process.test.ts src/core/agents/opencode.test.ts src/core/agents/pi.test.ts src/core/forced-stop-preservation.integration.test.ts src/core/orchestrator.test.ts src/core/run.test.ts src/core/sleep.test.ts src/core/worktree-preservation.test.ts src/core/worktree-receipt.test.ts
+  Result: PASS (272) FAIL (0) skipped (1)
+
+Focused end-user CLI validation:
+  pnpm exec vitest run e2e/e2e.test.ts -t 'preserves dirty work after a forced worktree shutdown|rejects push mode without changing the current branch|re-execs through systemd-inhibit'
+  Result: PASS (2) FAIL (0) skipped (13)
+
+The focused CLI checks exercised forced worktree preservation and the explicit no-push safety contract. The systemd-inhibit case was unavailable in this environment and was skipped by the existing test condition.
