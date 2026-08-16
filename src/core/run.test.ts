@@ -860,6 +860,18 @@ describe("workspace recovery", () => {
       cleanupUncertain: true,
     });
   });
+
+  it("keeps legacy commit failures cleanup-certain", () => {
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ kind: "commit-failure", detail: "hook failed" }),
+    );
+
+    expect(readWorkspaceRecovery({ runDir: "/run" })).toEqual({
+      kind: "commit-failure",
+      detail: "hook failed",
+      cleanupUncertain: false,
+    });
+  });
 });
 
 describe("run usage state", () => {
