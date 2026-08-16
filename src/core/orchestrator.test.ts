@@ -2761,6 +2761,84 @@ describe("Orchestrator backoff behavior", () => {
     });
   });
 
+  it("preserves a reported failure before finalizing unverified cleanup", async () => {
+    const cleanupError = new UnverifiedAgentCleanupError(
+      "descendant cleanup was not verified",
+    );
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        output: {
+          success: false,
+          summary: "could not finish",
+          key_changes_made: [],
+          key_learnings: ["provider stopped"],
+        },
+      })),
+      getUnverifiedCleanupError: vi.fn(() => cleanupError),
+      close: vi.fn(() => Promise.reject(cleanupError)),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      failCount: 1,
+      hasPendingWorkspaceRecovery: true,
+      lastAgentError: null,
+      iterations: [expect.objectContaining({ summary: "could not finish" })],
+    });
+  });
+
+  it("preserves a primary error before finalizing unverified cleanup", async () => {
+    const cleanupError = new UnverifiedAgentCleanupError(
+      "descendant cleanup was not verified",
+    );
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(async () => {
+        throw new Error("provider failed");
+      }),
+      getUnverifiedCleanupError: vi.fn(() => cleanupError),
+      close: vi.fn(() => Promise.reject(cleanupError)),
+    };
+    const orchestrator = new Orchestrator(
+      { ...config, maxConsecutiveFailures: 1 },
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+    );
+
+    await orchestrator.start();
+
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      failCount: 1,
+      hasPendingWorkspaceRecovery: true,
+      lastAgentError: "provider failed",
+      iterations: [expect.objectContaining({ summary: "provider failed" })],
+    });
+  });
+
   it("prioritizes incomplete cleanup over a pending runtime cap", async () => {
     const cleanupError = new IncompleteChildProcessShutdownError(1234);
     const agent: Agent = {

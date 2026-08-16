@@ -83,6 +83,7 @@ describe("ChildProcessShutdownTracker", () => {
     );
     tracker.recordUnverifiedCleanup(error);
 
+    expect(tracker.getUnverifiedCleanupError()).toBe(error);
     await expect(tracker.waitForAll()).resolves.toBeUndefined();
     await expect(tracker.finalize()).rejects.toBe(error);
   });

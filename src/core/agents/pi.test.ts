@@ -429,6 +429,50 @@ describe("PiAgent", () => {
     });
   });
 
+  it("removes streamed cost when agent_end omits it", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const onUsage = vi.fn();
+    const agent = new PiAgent();
+
+    const promise = agent.run("test prompt", "/work/dir", { onUsage });
+    emitJson(proc, {
+      type: "message_update",
+      message: { role: "assistant", responseId: "r1" },
+      usage: {
+        input: 4,
+        output: 2,
+        totalTokens: 6,
+        cost: { total: 0.4 },
+      },
+    });
+    expect(onUsage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ reportedCostUsd: 0.4 }),
+    );
+
+    emitJson(proc, {
+      type: "agent_end",
+      messages: [
+        {
+          role: "assistant",
+          responseId: "r1",
+          usage: { input: 4, output: 2, totalTokens: 6 },
+          content: finalOutput(),
+        },
+      ],
+    });
+    proc.emit("close", 0);
+
+    const result = await promise;
+    expect(result.usage).toMatchObject({
+      inputTokens: 4,
+      outputTokens: 2,
+      totalTokens: 6,
+      tokensAvailable: true,
+    });
+    expect(result.usage).not.toHaveProperty("reportedCostUsd");
+  });
+
   it("replaces anonymous live usage when the terminal message adds an id", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
