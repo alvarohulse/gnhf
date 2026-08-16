@@ -342,6 +342,7 @@ function isPermanentCursorError(output: string): boolean {
 export class CursorAgent implements Agent {
   name = "cursor";
 
+  private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
   private extraArgs?: string[];
   private finalResultGraceMs: number;
@@ -378,6 +379,12 @@ export class CursorAgent implements Agent {
         shell: shouldUseWindowsShell(this.bin, this.platform),
         stdio: ["pipe", "pipe", "pipe"],
         env: process.env,
+      });
+      this.activeChild = child;
+      child.on("close", () => {
+        if (this.activeChild === child) {
+          this.activeChild = null;
+        }
       });
 
       child.stdin?.write(buildCursorPrompt(prompt, this.schema));
@@ -438,13 +445,15 @@ export class CursorAgent implements Agent {
             "cursor reported an error result";
         }
 
-        if (result.usage) {
-          const nextUsage = usageFromRecord(result.usage);
-          if (nextUsage) {
-            usage = nextUsage;
-            onUsage?.({ ...usage });
-          }
-        }
+        const nextUsage = result.usage ? usageFromRecord(result.usage) : null;
+        usage = nextUsage ?? {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: false,
+        };
+        onUsage?.({ ...usage });
 
         if (isNonErrorResult(result)) {
           if (finalResultCleanupTimer) {
@@ -505,5 +514,10 @@ export class CursorAgent implements Agent {
         }
       });
     });
+  }
+
+  async close(): Promise<void> {
+    if (this.activeChild === null) return;
+    await shutdownCursorProcess(this.activeChild, this.platform, this.detached);
   }
 }

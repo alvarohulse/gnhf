@@ -263,6 +263,40 @@ describe("ClaudeAgent", () => {
     expect(proc.kill).not.toHaveBeenCalled();
   });
 
+  it("force kills an active process group during close", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 4321 });
+    mockSpawn.mockReturnValue(proc);
+    const processKill = vi
+      .spyOn(process, "kill")
+      .mockImplementation((pid, signal) => {
+        if (pid === -4321 && signal === "SIGKILL") {
+          queueMicrotask(() => proc.emit("close", null));
+        }
+        return true;
+      });
+    const controller = new AbortController();
+    const unixAgent = new ClaudeAgent({ platform: "linux" });
+
+    try {
+      const runPromise = unixAgent.run("test prompt", "/work/dir", {
+        signal: controller.signal,
+      });
+      controller.abort();
+      await expect(runPromise).rejects.toThrow("Agent was aborted");
+
+      const closePromise = unixAgent.close();
+      await vi.advanceTimersByTimeAsync(3_000);
+
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
+      await closePromise;
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("terminates the process group after a final structured output if Claude stays alive", async () => {
     vi.useFakeTimers();
     const processKill = vi
@@ -1398,6 +1432,37 @@ describe("ClaudeAgent", () => {
       cacheReadTokens: 24,
       cacheCreationTokens: 6,
       tokensAvailable: true,
+    });
+  });
+
+  it("marks usage unavailable when the latest result omits usage", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    const promise = agent.run("prompt", "/cwd");
+
+    emitLine(proc, {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      usage: { input_tokens: 10, output_tokens: 4 },
+      structured_output: {
+        success: true,
+        summary: "done",
+        key_changes_made: [],
+        key_learnings: [],
+      },
+    });
+    emitLine(proc, {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      structured_output: null,
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: { tokensAvailable: false },
     });
   });
 

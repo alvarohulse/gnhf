@@ -125,7 +125,9 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private pendingAbortReason: string | null = null;
   private pendingWorkspaceRecovery: WorkspaceRecovery | null = null;
   private activeWorkspaceRecoveryMarker = false;
+  private activeIterationTokensAvailable: boolean | null = null;
   private activeIterationTokensEstimated = false;
+  private hasAuthoritativeTokenReceipt = false;
   private tokensUnavailable = false;
   private reportedCostUnavailable = false;
   private loopDone = false;
@@ -183,7 +185,9 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       ...this.state,
       tokensEstimated:
         this.state.tokensEstimated || this.activeIterationTokensEstimated,
-      tokensAvailable: !this.tokensUnavailable,
+      tokensAvailable:
+        !this.tokensUnavailable &&
+        this.activeIterationTokensAvailable !== false,
       interruptHint: getInterruptHint(this.state),
       hasPendingCommitFailure:
         this.pendingWorkspaceRecovery?.kind === "commit-failure",
@@ -503,12 +507,16 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
     this.activeAbortController = new AbortController();
     this.pendingAbortReason = null;
+    this.activeIterationTokensAvailable = null;
     this.activeIterationTokensEstimated = false;
 
     const onUsage = (usage: TokenUsage) => {
       latestUsage = { ...usage };
       const tokensAvailable = hasCompleteTokenUsage(usage);
+      const tokensAuthoritative = tokensAvailable && usage.estimated !== true;
+      this.activeIterationTokensAvailable = tokensAvailable;
       if (tokensAvailable) {
+        this.hasAuthoritativeTokenReceipt ||= tokensAuthoritative;
         this.state.totalInputTokens = baseInputTokens + usage.inputTokens;
         this.state.totalOutputTokens = baseOutputTokens + usage.outputTokens;
       }
@@ -562,8 +570,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       });
 
       latestUsage = result.usage;
+      this.activeIterationTokensAvailable = hasCompleteTokenUsage(result.usage);
       this.activeIterationTokensEstimated = false;
       if (hasCompleteTokenUsage(result.usage)) {
+        this.hasAuthoritativeTokenReceipt ||= result.usage.estimated !== true;
         this.state.totalInputTokens =
           baseInputTokens + result.usage.inputTokens;
         this.state.totalOutputTokens =
@@ -694,6 +704,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       };
     } finally {
       this.activeAbortController = null;
+      this.activeIterationTokensAvailable = null;
       this.pendingAbortReason = null;
     }
   }
@@ -933,7 +944,11 @@ ${recovery.detail}
   }
 
   private getTokenAbortReason(): string | null {
-    if (this.limits.maxTokens === undefined || this.tokensUnavailable) {
+    if (
+      this.limits.maxTokens === undefined ||
+      this.tokensUnavailable ||
+      !this.hasAuthoritativeTokenReceipt
+    ) {
       return null;
     }
 

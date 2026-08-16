@@ -432,6 +432,34 @@ describe("CursorAgent", () => {
     });
   });
 
+  it("marks usage unavailable when the latest result omits usage", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const content = JSON.stringify({
+      success: true,
+      summary: "ok",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+    const promise = new CursorAgent().run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "result",
+      subtype: "success",
+      result: content,
+      usage: { inputTokens: 10, outputTokens: 4 },
+    });
+    emitJson(proc, {
+      type: "result",
+      subtype: "success",
+      result: content,
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: { tokensAvailable: false },
+    });
+  });
+
   it("rejects stale structured output when the last assistant message is prose", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);

@@ -55,6 +55,7 @@ const LOG_FILENAME = "gnhf.log";
 const STOP_WHEN_FILENAME = "stop-when";
 const COMMIT_MESSAGE_FILENAME = "commit-message";
 const WORKSPACE_RECOVERY_FILENAME = "workspace-recovery.json";
+const LOCAL_METADATA_EXCLUDES = [".gnhf/runs/", ".gnhf/setup-failures/"];
 
 function writeSchemaFile(
   schemaPath: string,
@@ -171,18 +172,27 @@ function ensureRunMetadataIgnored(cwd: string): void {
   const resolved = isAbsolute(excludePath)
     ? excludePath
     : join(cwd, excludePath);
-  const entry = ".gnhf/runs/";
   mkdirSync(dirname(resolved), { recursive: true });
 
   if (existsSync(resolved)) {
     const content = readFileSync(resolved, "utf-8");
-    if (content.split("\n").some((line) => line.trim() === entry)) return;
+    const existingEntries = new Set(
+      content.split("\n").map((line) => line.trim()),
+    );
+    const missingEntries = LOCAL_METADATA_EXCLUDES.filter(
+      (entry) => !existingEntries.has(entry),
+    );
+    if (missingEntries.length === 0) return;
     const separator = content.length > 0 && !content.endsWith("\n") ? "\n" : "";
-    appendFileSync(resolved, `${separator}${entry}\n`, "utf-8");
+    appendFileSync(
+      resolved,
+      `${separator}${missingEntries.join("\n")}\n`,
+      "utf-8",
+    );
   } else {
     // This ignore rule is runtime metadata, so keep it local to the clone
     // instead of mutating tracked .gitignore state on startup.
-    writeFileSync(resolved, `${entry}\n`, "utf-8");
+    writeFileSync(resolved, `${LOCAL_METADATA_EXCLUDES.join("\n")}\n`, "utf-8");
   }
 }
 

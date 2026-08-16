@@ -72,12 +72,26 @@ describe("setupRun", () => {
     );
   });
 
-  it("writes the ignore rule to .git/info/exclude", () => {
+  it("writes runtime metadata ignore rules to .git/info/exclude", () => {
     setupRun("run-abc", "test", "abc123", P, { includeStopField: false });
 
     expect(mockWriteFileSync).toHaveBeenCalledWith(
       join(P, ".git", "info", "exclude"),
-      ".gnhf/runs/\n",
+      ".gnhf/runs/\n.gnhf/setup-failures/\n",
+      "utf-8",
+    );
+  });
+
+  it("adds missing runtime metadata rules to an existing exclude file", () => {
+    const excludePath = join(P, ".git", "info", "exclude");
+    mockExistsSync.mockImplementationOnce((path) => path === excludePath);
+    mockReadFileSync.mockReturnValueOnce(".gnhf/runs/\n");
+
+    setupRun("run-abc", "test", "abc123", P, { includeStopField: false });
+
+    expect(mockAppendFileSync).toHaveBeenCalledWith(
+      excludePath,
+      ".gnhf/setup-failures/\n",
       "utf-8",
     );
   });

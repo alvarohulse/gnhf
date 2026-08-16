@@ -545,6 +545,42 @@ describe("Orchestrator stop limits", () => {
     });
   });
 
+  it("does not enforce a zero token cap before receiving usage", async () => {
+    const unavailableUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      tokensAvailable: false,
+    };
+    const agent: Agent = {
+      name: "acp:test",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: unavailableUsage,
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1, maxTokens: 0 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledWith("max iterations reached (1)");
+    expect(abort).not.toHaveBeenCalledWith(
+      expect.stringContaining("max tokens"),
+    );
+  });
+
   it("does not enforce token caps without explicit usage availability", async () => {
     const incompleteUsage = {
       inputTokens: 7,
@@ -585,6 +621,83 @@ describe("Orchestrator stop limits", () => {
       totalOutputTokens: 0,
       tokensAvailable: false,
     });
+  });
+
+  it("does not enforce token caps from estimated usage", async () => {
+    const estimatedUsage = {
+      inputTokens: 7,
+      outputTokens: 4,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      tokensAvailable: true,
+      estimated: true,
+    };
+    const agent: Agent = {
+      name: "acp:test",
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.(estimatedUsage);
+        return {
+          ...createSuccessResult(),
+          usage: estimatedUsage,
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1, maxTokens: 1 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(abort).toHaveBeenCalledWith("max iterations reached (1)");
+    expect(abort).not.toHaveBeenCalledWith(
+      expect.stringContaining("max tokens"),
+    );
+  });
+
+  it("exposes unavailable token usage while an iteration is active", async () => {
+    let resolveRun!: (result: AgentResult) => void;
+    const unavailableUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      tokensAvailable: false,
+    };
+    const agent: Agent = {
+      name: "acp:test",
+      run: vi.fn(
+        (_prompt, _cwd, options) =>
+          new Promise<AgentResult>((resolve) => {
+            resolveRun = resolve;
+            options?.onUsage?.(unavailableUsage);
+          }),
+      ),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    const startPromise = orchestrator.start();
+    await vi.waitFor(() => {
+      expect(orchestrator.getState().tokensAvailable).toBe(false);
+    });
+
+    resolveRun({ ...createSuccessResult(), usage: unavailableUsage });
+    await startPromise;
   });
 
   it("aborts when harness-reported cost reaches the configured cap", async () => {

@@ -276,6 +276,40 @@ describe("PiAgent", () => {
     });
   });
 
+  it("marks aggregate usage unavailable when a completed message omits usage", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent();
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        responseId: "r1",
+        usage: { input: 5, output: 3 },
+        content: "working",
+      },
+    });
+    emitJson(proc, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        responseId: "r2",
+        content: finalOutput(),
+      },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 5,
+        outputTokens: 3,
+        tokensAvailable: false,
+      },
+    });
+  });
+
   it("uses the final assistant message from agent_end as a fallback", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
@@ -294,6 +328,39 @@ describe("PiAgent", () => {
     await expect(promise).resolves.toMatchObject({
       output: { success: true, summary: "ok" },
       usage: { tokensAvailable: false },
+    });
+  });
+
+  it("tracks every completed assistant message from agent_end", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent();
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "agent_end",
+      messages: [
+        {
+          role: "assistant",
+          responseId: "r1",
+          content: "working",
+          usage: { input: 5, output: 3 },
+        },
+        {
+          role: "assistant",
+          responseId: "r2",
+          content: finalOutput(),
+        },
+      ],
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 5,
+        outputTokens: 3,
+        tokensAvailable: false,
+      },
     });
   });
 

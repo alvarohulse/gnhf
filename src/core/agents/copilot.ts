@@ -15,6 +15,7 @@ import {
   setupAbortHandler,
   setupChildProcessHandlers,
 } from "./stream-utils.js";
+import { shutdownChildProcess } from "./managed-process.js";
 
 interface CopilotAssistantMessageEvent {
   type: "assistant.message";
@@ -86,6 +87,18 @@ function terminateCopilotProcess(
   }
 
   child.kill("SIGTERM");
+}
+
+async function shutdownCopilotProcess(
+  child: ReturnType<typeof spawn>,
+  platform: NodeJS.Platform,
+): Promise<void> {
+  if (platform === "win32") {
+    terminateCopilotProcess(child, platform);
+    return;
+  }
+
+  await shutdownChildProcess(child, { detached: false });
 }
 
 function userSpecifiedPermissionMode(userArgs: string[]): boolean {
@@ -196,6 +209,7 @@ function usageFromRecord(usage: Record<string, unknown>): TokenUsage | null {
 export class CopilotAgent implements Agent {
   name = "copilot";
 
+  private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
   private extraArgs?: string[];
   private platform: NodeJS.Platform;
@@ -230,6 +244,12 @@ export class CopilotAgent implements Agent {
           env: process.env,
         },
       );
+      this.activeChild = child;
+      child.on("close", () => {
+        if (this.activeChild === child) {
+          this.activeChild = null;
+        }
+      });
 
       if (
         setupAbortHandler(signal, child, reject, () =>
@@ -299,5 +319,10 @@ export class CopilotAgent implements Agent {
         }
       });
     });
+  }
+
+  async close(): Promise<void> {
+    if (this.activeChild === null) return;
+    await shutdownCopilotProcess(this.activeChild, this.platform);
   }
 }

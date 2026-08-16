@@ -816,9 +816,21 @@ export class OpenCodeAgent implements Agent {
     const updateUsage = (
       messageId: string | undefined,
       tokens?: OpenCodeTokens,
+      requireReceipt = false,
     ) => {
-      if (!messageId || !tokens) return;
-      usageByMessageId.set(messageId, toUsage(tokens));
+      if (!messageId || (!tokens && !requireReceipt)) return;
+      usageByMessageId.set(
+        messageId,
+        tokens
+          ? toUsage(tokens)
+          : {
+              inputTokens: 0,
+              outputTokens: 0,
+              cacheReadTokens: 0,
+              cacheCreationTokens: 0,
+              tokensAvailable: false,
+            },
+      );
 
       let nextInputTokens = 0;
       let nextOutputTokens = 0;
@@ -918,7 +930,7 @@ export class OpenCodeAgent implements Agent {
 
       if (payload?.type === "message.updated") {
         if (properties.info?.role === "assistant") {
-          updateUsage(properties.info.id, properties.info.tokens);
+          updateUsage(properties.info.id, properties.info.tokens, true);
         }
         if (properties.info?.structured) {
           structuredOutputFromSSE = properties.info.structured;

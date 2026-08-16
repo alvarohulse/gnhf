@@ -16,7 +16,10 @@ import {
   setupAbortHandler,
   setupChildProcessHandlers,
 } from "./stream-utils.js";
-import { shouldDetachAgentProcess } from "./managed-process.js";
+import {
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+} from "./managed-process.js";
 
 interface PiAgentDeps {
   bin?: string;
@@ -85,6 +88,19 @@ function terminatePiProcess(
   }
 
   child.kill("SIGTERM");
+}
+
+async function shutdownPiProcess(
+  child: ReturnType<typeof spawn>,
+  platform: NodeJS.Platform,
+  detached: boolean,
+): Promise<void> {
+  if (platform === "win32") {
+    terminatePiProcess(child, platform, detached);
+    return;
+  }
+
+  await shutdownChildProcess(child, { detached });
 }
 
 function buildPiPrompt(prompt: string, schema: AgentOutputSchema): string {
@@ -209,6 +225,7 @@ function textByIndexToString(textByIndex: Map<number, string>): string {
 export class PiAgent implements Agent {
   name = "pi";
 
+  private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
   private detached: boolean;
   private extraArgs?: string[];
@@ -243,6 +260,12 @@ export class PiAgent implements Agent {
         stdio: ["pipe", "pipe", "pipe"],
         env: process.env,
       });
+      this.activeChild = child;
+      child.on("close", () => {
+        if (this.activeChild === child) {
+          this.activeChild = null;
+        }
+      });
 
       child.stdin?.write(buildPiPrompt(prompt, this.schema));
       child.stdin?.end();
@@ -269,11 +292,15 @@ export class PiAgent implements Agent {
       let anonymousKeySeq = 0;
       let currentStreamingMessageKey: string | null = null;
 
-      const updateUsage = (message: JsonRecord, streaming = false) => {
+      const updateUsage = (
+        message: JsonRecord,
+        streaming = false,
+        requireReceipt = false,
+      ) => {
         const usage = isRecord(message.usage)
           ? toTokenUsage(message.usage)
           : null;
-        if (!usage) return;
+        if (!usage && !requireReceipt) return;
 
         let key = messageKey(message);
         if (key === null) {
@@ -284,7 +311,16 @@ export class PiAgent implements Agent {
             if (streaming) currentStreamingMessageKey = key;
           }
         }
-        usageByMessageKey.set(key, usage);
+        usageByMessageKey.set(
+          key,
+          usage ?? {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            tokensAvailable: false,
+          },
+        );
 
         const cumulative: TokenUsage = {
           inputTokens: 0,
@@ -312,10 +348,11 @@ export class PiAgent implements Agent {
       const rememberAssistantMessage = (
         message: unknown,
         streaming = false,
+        requireReceipt = false,
       ) => {
         if (!isRecord(message) || roleOf(message) !== "assistant") return;
         latestAssistantMessage = message;
-        updateUsage(message, streaming);
+        updateUsage(message, streaming, requireReceipt);
       };
 
       parseJSONLStream<JsonRecord>(child.stdout!, logStream, (event) => {
@@ -358,7 +395,7 @@ export class PiAgent implements Agent {
         }
 
         if (event.type === "message_end" || event.type === "turn_end") {
-          rememberAssistantMessage(event.message, true);
+          rememberAssistantMessage(event.message, true, true);
           currentStreamingMessageKey = null;
         }
 
@@ -367,11 +404,9 @@ export class PiAgent implements Agent {
           Array.isArray(event.messages) &&
           !latestAssistantMessage
         ) {
-          for (let i = event.messages.length - 1; i >= 0; i -= 1) {
-            const message = event.messages[i];
+          for (const message of event.messages) {
             if (roleOf(message) === "assistant") {
-              rememberAssistantMessage(message);
-              break;
+              rememberAssistantMessage(message, false, true);
             }
           }
         }
@@ -417,5 +452,10 @@ export class PiAgent implements Agent {
         resolve({ output, usage: lastEmittedUsage });
       });
     });
+  }
+
+  async close(): Promise<void> {
+    if (this.activeChild === null) return;
+    await shutdownPiProcess(this.activeChild, this.platform, this.detached);
   }
 }

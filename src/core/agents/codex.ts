@@ -13,6 +13,7 @@ import {
   setupAbortHandler,
   setupChildProcessHandlers,
 } from "./stream-utils.js";
+import { shutdownChildProcess } from "./managed-process.js";
 
 interface CodexItemCompleted {
   type: "item.completed";
@@ -85,6 +86,18 @@ function terminateCodexProcess(
   child.kill("SIGTERM");
 }
 
+async function shutdownCodexProcess(
+  child: ReturnType<typeof spawn>,
+  platform: NodeJS.Platform,
+): Promise<void> {
+  if (platform === "win32") {
+    terminateCodexProcess(child, platform);
+    return;
+  }
+
+  await shutdownChildProcess(child, { detached: false });
+}
+
 function buildCodexArgs(
   prompt: string,
   schemaPath: string,
@@ -121,6 +134,7 @@ function buildCodexArgs(
 export class CodexAgent implements Agent {
   name = "codex";
 
+  private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
   private extraArgs?: string[];
   private platform: NodeJS.Platform;
@@ -154,6 +168,12 @@ export class CodexAgent implements Agent {
           env: process.env,
         },
       );
+      this.activeChild = child;
+      child.on("close", () => {
+        if (this.activeChild === child) {
+          this.activeChild = null;
+        }
+      });
 
       if (
         setupAbortHandler(signal, child, reject, () =>
@@ -224,5 +244,10 @@ export class CodexAgent implements Agent {
         }
       });
     });
+  }
+
+  async close(): Promise<void> {
+    if (this.activeChild === null) return;
+    await shutdownCodexProcess(this.activeChild, this.platform);
   }
 }

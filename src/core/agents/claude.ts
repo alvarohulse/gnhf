@@ -343,6 +343,7 @@ function describeExitFailure(
 export class ClaudeAgent implements Agent {
   name = "claude";
 
+  private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
   private extraArgs?: string[];
   private finalResultGraceMs: number;
@@ -386,6 +387,12 @@ export class ClaudeAgent implements Agent {
           env: process.env,
         },
       );
+      this.activeChild = child;
+      child.on("close", () => {
+        if (this.activeChild === child) {
+          this.activeChild = null;
+        }
+      });
 
       if (
         setupAbortHandler(signal, child, reject, () =>
@@ -536,11 +543,15 @@ export class ClaudeAgent implements Agent {
 
         if (event.type === "result") {
           const next = event as ClaudeResultEvent;
-          const nextUsage = toResultUsage(next);
-          if (nextUsage !== null) {
-            latestResultUsage = nextUsage;
-            onUsage?.({ ...nextUsage });
-          }
+          const nextUsage = toResultUsage(next) ?? {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            tokensAvailable: false,
+          };
+          latestResultUsage = nextUsage;
+          onUsage?.({ ...nextUsage });
           if (isFinalStructuredResult(next)) {
             finalStructuredResultEvent = next;
             if (finalResultCleanupTimer) {
@@ -609,5 +620,10 @@ export class ClaudeAgent implements Agent {
         resolve({ output, usage: terminalUsage });
       });
     });
+  }
+
+  async close(): Promise<void> {
+    if (this.activeChild === null) return;
+    await shutdownClaudeProcess(this.activeChild, this.platform, this.detached);
   }
 }
