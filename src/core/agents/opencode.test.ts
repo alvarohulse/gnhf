@@ -1253,6 +1253,34 @@ describe("OpenCodeAgent", () => {
     vi.useRealTimers();
   });
 
+  it("finalizes the owned process group after the server leader exits", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 5678 });
+    const killProcess = vi.fn(() => true as const);
+    mockSpawn.mockReturnValue(proc);
+    const detachedAgent = new OpenCodeAgent({
+      fetch: fetchMock as typeof fetch,
+      getPort,
+      killProcess,
+      platform: "linux",
+    });
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ healthy: true, version: "1.3.13" }),
+    );
+
+    await detachedAgent["ensureServer"]("/repo");
+    proc.emit("close", 0, null);
+
+    const closePromise = detachedAgent.close();
+    expect(killProcess).toHaveBeenCalledWith(-5678, "SIGTERM");
+
+    await vi.advanceTimersByTimeAsync(3_100);
+    await closePromise;
+    expect(killProcess).toHaveBeenCalledWith(-5678, "SIGKILL");
+    vi.useRealTimers();
+  });
+
   it("aborts the session before deleting it and normalizes abort errors", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
@@ -1320,6 +1348,33 @@ describe("OpenCodeAgent", () => {
     rejectStreamRead(abortError);
 
     await expect(runPromise).rejects.toThrow("Agent was aborted");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      "http://127.0.0.1:8765/session/session-123/abort",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      "http://127.0.0.1:8765/session/session-123",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  it("aborts the active turn before deleting a session after an error", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(sseResponse(""))
+      .mockResolvedValueOnce(promptAsyncResponse())
+      .mockResolvedValueOnce(jsonResponse(true))
+      .mockResolvedValueOnce(jsonResponse(true));
+
+    await expect(agent.run("test", "/repo")).rejects.toThrow(
+      "OpenCode produced no final answer",
+    );
     expect(fetchMock).toHaveBeenNthCalledWith(
       5,
       "http://127.0.0.1:8765/session/session-123/abort",

@@ -211,6 +211,66 @@ describe("shutdownChildProcess", () => {
     vi.useRealTimers();
   });
 
+  it("stops escalation after the owned process group disappears", async () => {
+    const child = createChildProcess();
+    const killProcess = vi.fn(
+      (_pid: number, signal?: number | NodeJS.Signals) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("process group no longer exists"), {
+            code: "ESRCH",
+          });
+        }
+        return true as const;
+      },
+    );
+
+    const closePromise = shutdownChildProcess(child, {
+      detached: true,
+      killProcess,
+      timeoutMs: 3_000,
+    });
+
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGTERM");
+    child.emit("close", 0, null);
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    await closePromise;
+
+    expect(killProcess).toHaveBeenCalledWith(-1234, 0);
+    expect(killProcess).not.toHaveBeenCalledWith(-1234, "SIGKILL");
+    expect(child.kill).not.toHaveBeenCalledWith("SIGKILL");
+    vi.useRealTimers();
+  });
+
+  it("does not signal a recycled group after the initial group signal fails", async () => {
+    const child = createChildProcess();
+    const killProcess = vi.fn(
+      (_pid: number, signal?: number | NodeJS.Signals) => {
+        if (signal === "SIGTERM") {
+          throw Object.assign(new Error("process group no longer exists"), {
+            code: "ESRCH",
+          });
+        }
+        return true as const;
+      },
+    );
+
+    const closePromise = shutdownChildProcess(child, {
+      detached: true,
+      killProcess,
+      timeoutMs: 3_000,
+    });
+
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    await vi.advanceTimersByTimeAsync(100);
+    await closePromise;
+
+    expect(killProcess).not.toHaveBeenCalledWith(-1234, "SIGKILL");
+    vi.useRealTimers();
+  });
+
   it("shares concurrent shutdown supervision", async () => {
     const child = createChildProcess();
     const killProcess = vi.fn(() => true as const);
@@ -231,7 +291,8 @@ describe("shutdownChildProcess", () => {
 
     await vi.advanceTimersByTimeAsync(3_100);
     await Promise.all([firstShutdown, secondShutdown]);
-    expect(killProcess).toHaveBeenCalledTimes(2);
+    expect(killProcess).toHaveBeenCalledTimes(3);
+    expect(killProcess).toHaveBeenCalledWith(-1234, 0);
     vi.useRealTimers();
   });
 

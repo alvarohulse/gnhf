@@ -17,6 +17,7 @@ import { validateAgentOutput } from "./types.js";
 import { appendDebugLog, serializeError } from "../debug-log.js";
 import { parseAgentJson } from "./json-extract.js";
 import {
+  ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
 } from "./managed-process.js";
@@ -189,6 +190,7 @@ export class RovoDevAgent implements Agent {
   private spawnFn: typeof spawn;
   private server: RovoDevServer | null = null;
   private closingPromise: Promise<void> | null = null;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(schemaPath: string, deps: RovoDevDeps = {}) {
     this.bin = deps.bin ?? "acli";
@@ -213,6 +215,8 @@ export class RovoDevAgent implements Agent {
     const { onUsage, onMessage, signal, logPath } = options ?? {};
     const logStream = logPath ? createWriteStream(logPath) : null;
     const runController = new AbortController();
+    let runCompleted = false;
+    let runServer: RovoDevServer | null = null;
     let sessionId: string | null = null;
     const runStartedAt = Date.now();
 
@@ -236,6 +240,7 @@ export class RovoDevAgent implements Agent {
 
     try {
       const server = await this.ensureServer(cwd, runController.signal);
+      runServer = server;
       sessionId = await this.createSession(server, runController.signal);
       await this.setInlineSystemPrompt(server, sessionId, runController.signal);
       await this.setChatMessage(
@@ -259,6 +264,7 @@ export class RovoDevAgent implements Agent {
         inputTokens: result.usage.inputTokens,
         outputTokens: result.usage.outputTokens,
       });
+      runCompleted = true;
       return result;
     } catch (error) {
       if (runController.signal.aborted || isAbortError(error)) {
@@ -280,23 +286,26 @@ export class RovoDevAgent implements Agent {
     } finally {
       signal?.removeEventListener("abort", onAbort);
       logStream?.end();
-      if (this.server && sessionId) {
-        if (runController.signal.aborted) {
-          await this.cancelSession(this.server, sessionId);
+      if (runServer && sessionId) {
+        if (!runCompleted || runController.signal.aborted) {
+          await this.cancelSession(runServer, sessionId);
         }
-        await this.deleteSession(this.server, sessionId);
+        await this.deleteSession(runServer, sessionId);
       }
     }
   }
 
   async close(): Promise<void> {
     await this.shutdownServer();
+    await this.shutdowns.waitForAll();
   }
 
   private async ensureServer(
     cwd: string,
     signal?: AbortSignal,
   ): Promise<RovoDevServer> {
+    await this.shutdowns.waitForAll();
+
     if (this.server && !this.server.closed && this.server.cwd === cwd) {
       await this.server.readyPromise;
       return this.server;
@@ -364,7 +373,19 @@ export class RovoDevAgent implements Agent {
         stdout: server.stdout.slice(-2048),
       });
       if (this.server === server) {
-        this.server = null;
+        if (server.detached) {
+          void this.shutdowns
+            .finalizeOwnedProcessGroup(server.child, server.detached, () =>
+              this.shutdownServerProcess(server),
+            )
+            .finally(() => {
+              if (this.server === server) {
+                this.server = null;
+              }
+            });
+        } else {
+          this.server = null;
+        }
       }
     });
 
@@ -821,8 +842,12 @@ export class RovoDevAgent implements Agent {
   }
 
   private async shutdownServer(): Promise<void> {
-    if (!this.server || this.server.closed) {
-      this.server = null;
+    if (!this.server) {
+      return;
+    }
+
+    if (this.server.closed) {
+      await this.shutdowns.waitForAll();
       return;
     }
 
@@ -839,47 +864,52 @@ export class RovoDevAgent implements Agent {
       pid: server.child.pid,
     });
 
-    this.closingPromise =
-      this.platform === "win32"
-        ? new Promise<void>((resolve) => {
-            const handleClose = () => {
-              server.child.off("close", handleClose);
-              resolve();
-            };
-
-            server.child.on("close", handleClose);
-
-            try {
-              terminateRovoDevProcess(server.child, this.platform);
-            } catch {
-              server.child.off("close", handleClose);
-              resolve();
-              return;
-            }
-
-            setTimeout(() => {
-              server.child.off("close", handleClose);
-              resolve();
-            }, 100).unref?.();
-          })
-        : shutdownChildProcess(server.child, {
-            detached: server.detached,
-            killProcess: this.killProcessFn,
-            timeoutMs: 3_000,
-          });
-
-    this.closingPromise = this.closingPromise.finally(() => {
-      if (this.server === server) {
-        this.server = null;
-      }
-      this.closingPromise = null;
-      appendDebugLog("rovodev:shutdown:done", {
-        port: server.port,
-        elapsedMs: Date.now() - shutdownStartedAt,
+    this.closingPromise = this.shutdowns
+      .start(() => this.shutdownServerProcess(server))
+      .finally(() => {
+        if (this.server === server) {
+          this.server = null;
+        }
+        this.closingPromise = null;
+        appendDebugLog("rovodev:shutdown:done", {
+          port: server.port,
+          elapsedMs: Date.now() - shutdownStartedAt,
+        });
       });
-    });
 
     await this.closingPromise;
+  }
+
+  private shutdownServerProcess(server: RovoDevServer): Promise<void> {
+    if (this.platform !== "win32") {
+      return shutdownChildProcess(server.child, {
+        detached: server.detached,
+        killProcess: this.killProcessFn,
+        timeoutMs: 3_000,
+      });
+    }
+
+    return new Promise<void>((resolve) => {
+      const handleClose = () => {
+        server.child.off("close", handleClose);
+        resolve();
+      };
+
+      server.child.on("close", handleClose);
+
+      try {
+        terminateRovoDevProcess(server.child, this.platform);
+      } catch {
+        server.child.off("close", handleClose);
+        resolve();
+        return;
+      }
+
+      setTimeout(() => {
+        server.child.off("close", handleClose);
+        resolve();
+      }, 100).unref?.();
+    });
   }
 
   private async requestJSON<T>(

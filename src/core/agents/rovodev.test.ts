@@ -627,6 +627,32 @@ describe("RovoDevAgent", () => {
     vi.useRealTimers();
   });
 
+  it("finalizes the owned process group after the server leader exits", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 6789 });
+    const killProcess = vi.fn(() => true as const);
+    mockSpawn.mockReturnValue(proc);
+    const detachedAgent = new RovoDevAgent(schemaPath, {
+      fetch: fetchMock as typeof fetch,
+      getPort,
+      killProcess,
+      platform: "linux",
+    });
+    fetchMock.mockResolvedValueOnce(jsonResponse({ status: "healthy" }));
+
+    await detachedAgent["ensureServer"]("/repo");
+    proc.emit("close", 0, null);
+
+    const closePromise = detachedAgent.close();
+    expect(killProcess).toHaveBeenCalledWith(-6789, "SIGTERM");
+
+    await vi.advanceTimersByTimeAsync(3_100);
+    await closePromise;
+    expect(killProcess).toHaveBeenCalledWith(-6789, "SIGKILL");
+    vi.useRealTimers();
+  });
+
   it("kills the full process tree on Windows when closing", async () => {
     const proc = createMockProcess();
     Object.defineProperty(proc, "pid", { value: 6789 });
@@ -739,6 +765,36 @@ describe("RovoDevAgent", () => {
     expect(calledUrls).toContain("http://127.0.0.1:8765/v3/cancel");
     expect(calledUrls).toContain(
       "http://127.0.0.1:8765/v3/sessions/session-123",
+    );
+  });
+
+  it("cancels the active turn before deleting a session after an error", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ status: "healthy" }))
+      .mockResolvedValueOnce(
+        jsonResponse({ session_id: "session-123", title: "gnhf" }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ message: "ok", prompt_set: true }))
+      .mockResolvedValueOnce(jsonResponse({ response: "Chat message set" }))
+      .mockResolvedValueOnce(textResponse(""))
+      .mockResolvedValueOnce(jsonResponse({ message: "cancelled" }))
+      .mockResolvedValueOnce(jsonResponse({ message: "deleted" }));
+
+    await expect(agent.run("test", "/repo")).rejects.toThrow(
+      "rovodev returned no text output",
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      "http://127.0.0.1:8765/v3/cancel",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      7,
+      "http://127.0.0.1:8765/v3/sessions/session-123",
+      expect.objectContaining({ method: "DELETE" }),
     );
   });
 });

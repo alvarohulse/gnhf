@@ -18,6 +18,7 @@ import {
 } from "./types.js";
 import { appendDebugLog, serializeError } from "../debug-log.js";
 import {
+  ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
 } from "./managed-process.js";
@@ -410,6 +411,7 @@ export class OpenCodeAgent implements Agent {
   private spawnFn: typeof spawn;
   private server: OpenCodeServer | null = null;
   private closingPromise: Promise<void> | null = null;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(deps: OpenCodeDeps = {}) {
     this.bin = deps.bin ?? "opencode";
@@ -435,6 +437,8 @@ export class OpenCodeAgent implements Agent {
     const { onUsage, onMessage, signal, logPath } = options ?? {};
     const logStream = logPath ? createWriteStream(logPath) : null;
     const runController = new AbortController();
+    let runCompleted = false;
+    let runServer: OpenCodeServer | null = null;
     let sessionId: string | null = null;
     const runStartedAt = Date.now();
 
@@ -458,6 +462,7 @@ export class OpenCodeAgent implements Agent {
 
     try {
       const server = await this.ensureServer(cwd, runController.signal);
+      runServer = server;
       sessionId = await this.createSession(server, cwd, runController.signal);
       const result = await this.streamMessage(
         server,
@@ -474,6 +479,7 @@ export class OpenCodeAgent implements Agent {
         inputTokens: result.usage.inputTokens,
         outputTokens: result.usage.outputTokens,
       });
+      runCompleted = true;
       return result;
     } catch (error) {
       if (runController.signal.aborted || isAbortError(error)) {
@@ -495,23 +501,26 @@ export class OpenCodeAgent implements Agent {
     } finally {
       signal?.removeEventListener("abort", onAbort);
       logStream?.end();
-      if (this.server && sessionId) {
-        if (runController.signal.aborted) {
-          await this.abortSession(this.server, sessionId);
+      if (runServer && sessionId) {
+        if (!runCompleted || runController.signal.aborted) {
+          await this.abortSession(runServer, sessionId);
         }
-        await this.deleteSession(this.server, sessionId);
+        await this.deleteSession(runServer, sessionId);
       }
     }
   }
 
   async close(): Promise<void> {
     await this.shutdownServer();
+    await this.shutdowns.waitForAll();
   }
 
   private async ensureServer(
     cwd: string,
     signal?: AbortSignal,
   ): Promise<OpenCodeServer> {
+    await this.shutdowns.waitForAll();
+
     if (this.server && !this.server.closed) {
       if (this.server.cwd !== cwd) {
         await this.shutdownServer();
@@ -630,7 +639,19 @@ export class OpenCodeAgent implements Agent {
         stdout: server.stdout.slice(-2048),
       });
       if (this.server === server) {
-        this.server = null;
+        if (server.detached) {
+          void this.shutdowns
+            .finalizeOwnedProcessGroup(server.child, server.detached, () =>
+              this.shutdownServerProcess(server),
+            )
+            .finally(() => {
+              if (this.server === server) {
+                this.server = null;
+              }
+            });
+        } else {
+          this.server = null;
+        }
       }
     });
 
@@ -1278,8 +1299,12 @@ export class OpenCodeAgent implements Agent {
   }
 
   private async shutdownServer(): Promise<void> {
-    if (!this.server || this.server.closed) {
-      this.server = null;
+    if (!this.server) {
+      return;
+    }
+
+    if (this.server.closed) {
+      await this.shutdowns.waitForAll();
       return;
     }
 
@@ -1296,26 +1321,32 @@ export class OpenCodeAgent implements Agent {
       pid: server.child.pid,
     });
 
-    this.closingPromise = (
-      this.platform === "win32" && server.child.pid
-        ? killWindowsProcessTree(server.child.pid)
-        : shutdownChildProcess(server.child, {
-            detached: server.detached,
-            killProcess: this.killProcessFn,
-            timeoutMs: 3_000,
-          })
-    ).finally(() => {
-      if (this.server === server) {
-        this.server = null;
-      }
-      this.closingPromise = null;
-      appendDebugLog("opencode:shutdown:done", {
-        port: server.port,
-        elapsedMs: Date.now() - shutdownStartedAt,
+    this.closingPromise = this.shutdowns
+      .start(() => this.shutdownServerProcess(server))
+      .finally(() => {
+        if (this.server === server) {
+          this.server = null;
+        }
+        this.closingPromise = null;
+        appendDebugLog("opencode:shutdown:done", {
+          port: server.port,
+          elapsedMs: Date.now() - shutdownStartedAt,
+        });
       });
-    });
 
     await this.closingPromise;
+  }
+
+  private shutdownServerProcess(server: OpenCodeServer): Promise<void> {
+    if (this.platform === "win32" && server.child.pid) {
+      return killWindowsProcessTree(server.child.pid);
+    }
+
+    return shutdownChildProcess(server.child, {
+      detached: server.detached,
+      killProcess: this.killProcessFn,
+      timeoutMs: 3_000,
+    });
   }
 
   private async requestJSON<T>(

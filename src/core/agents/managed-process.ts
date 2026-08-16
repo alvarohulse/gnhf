@@ -81,6 +81,7 @@ export function shutdownChildProcess(
   }
 
   const ownedProcessGroupId = options.detached && child.pid ? -child.pid : null;
+  let ownsProcessGroup = ownedProcessGroupId !== null;
   if (
     ownedProcessGroupId === null &&
     (child.exitCode != null || child.signalCode != null)
@@ -136,8 +137,16 @@ export function shutdownChildProcess(
       }
 
       forceKillTimer = setTimeout(() => {
+        if (
+          ownedProcessGroupId !== null &&
+          (!ownsProcessGroup || !isOwnedProcessGroupAlive())
+        ) {
+          settle();
+          return;
+        }
+
         try {
-          signalShutdownTarget("SIGKILL");
+          signalShutdownTarget("SIGKILL", ownedProcessGroupId === null);
         } catch {
           // Best-effort cleanup only.
         }
@@ -155,14 +164,35 @@ export function shutdownChildProcess(
     });
   }
 
-  function signalShutdownTarget(signal: NodeJS.Signals): void {
+  function isOwnedProcessGroupAlive(): boolean {
+    if (ownedProcessGroupId === null) {
+      return false;
+    }
+
+    const killProcess = options.killProcess ?? process.kill.bind(process);
+    try {
+      killProcess(ownedProcessGroupId, 0);
+      return true;
+    } catch {
+      ownsProcessGroup = false;
+      return false;
+    }
+  }
+
+  function signalShutdownTarget(
+    signal: NodeJS.Signals,
+    allowDirectChildFallback = true,
+  ): void {
     if (ownedProcessGroupId !== null) {
       const killProcess = options.killProcess ?? process.kill.bind(process);
       try {
         killProcess(ownedProcessGroupId, signal);
         return;
       } catch {
-        // Fall back to the exact child below.
+        ownsProcessGroup = false;
+        if (!allowDirectChildFallback) {
+          return;
+        }
       }
     }
 
