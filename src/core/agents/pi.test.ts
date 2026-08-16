@@ -473,6 +473,39 @@ describe("PiAgent", () => {
     expect(result.usage).not.toHaveProperty("reportedCostUsd");
   });
 
+  it("discards provisional usage when agent_end has no messages", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent();
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "message_update",
+      usage: {
+        input: 4,
+        output: 2,
+        totalTokens: 6,
+        cost: { total: 0.4 },
+      },
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: finalOutput(),
+      },
+    });
+    emitJson(proc, { type: "agent_end", messages: [] });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      output: { success: true },
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        tokensAvailable: false,
+      },
+    });
+  });
+
   it("replaces anonymous live usage when the terminal message adds an id", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
