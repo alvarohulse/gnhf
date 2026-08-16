@@ -1151,7 +1151,7 @@ ${recovery.detail}
   private observeUnverifiedAgentCleanup(): void {
     const error = this.agent.getUnverifiedCleanupError?.();
     if (error !== undefined && error !== null) {
-      this.unsafeShutdownDetected = true;
+      this.preserveWorkspaceAfterUnsafeShutdown(error, false);
     }
   }
 
