@@ -4,7 +4,7 @@ Command: gnhf "receipt preservation evidence" --max-iterations 0 --prevent-sleep
 Exit code: 0
 
 --- Inhibitor harness invocation ---
-harness pid=2366124 args=--what=idle:sleep --mode=block --who=gnhf --why=Prevent sleep while gnhf is running /home/ubuntu/.nvm/versions/node/v22.23.1/bin/node /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/dist/cli.mjs receipt preservation evidence --agent opencode --max-iterations 0 --prevent-sleep on --worktree --preserve-worktree
+harness pid=<pid> args=--what=idle:sleep --mode=block --who=gnhf --why=Prevent sleep while gnhf is running <node> <checkout>/dist/cli.mjs receipt preservation evidence --agent opencode --max-iterations 0 --prevent-sleep on --worktree --preserve-worktree
 --- CLI permanent stdout summary ---
 ╭────────────────────────────────────────────────────────────╮
 │ × gnhf stopped                                             │
@@ -16,8 +16,8 @@ harness pid=2366124 args=--what=idle:sleep --mode=block --who=gnhf --why=Prevent
   branch diff     0 commits     +0           -0
   files           0 added       0 updated    0 deleted
 
-  notes           /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-linux-reexec.aLVvDe/repo-gnhf-worktrees/receipt-preservation-64abd0/.gnhf/runs/receipt-preservation-64abd0/notes.md
-  debug log       /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-linux-reexec.aLVvDe/repo-gnhf-worktrees/receipt-preservation-64abd0/.gnhf/runs/receipt-preservation-64abd0/gnhf.log
+  notes           <fixture>/repo-gnhf-worktrees/<run-id>/.gnhf/runs/<run-id>/notes.md
+  debug log       <fixture>/repo-gnhf-worktrees/<run-id>/.gnhf/runs/<run-id>/gnhf.log
 
   next steps      git log --oneline 53a86c3a26ac..HEAD
                   git diff --stat 53a86c3a26ac..HEAD
@@ -27,27 +27,27 @@ harness pid=2366124 args=--what=idle:sleep --mode=block --who=gnhf --why=Prevent
   to review?      https://github.com/kunchenguid/no-mistakes
 --- CLI stderr ---
 
-  gnhf: Run log: /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-linux-reexec.aLVvDe/repo-gnhf-worktrees/receipt-preservation-64abd0/.gnhf/runs/receipt-preservation-64abd0/gnhf.log
+  gnhf: Run log: <fixture>/repo-gnhf-worktrees/<run-id>/.gnhf/runs/<run-id>/gnhf.log
 
 
-  gnhf: worktree preserved at /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-linux-reexec.aLVvDe/repo-gnhf-worktrees/receipt-preservation-64abd0
-  gnhf: merge the branch and remove with: git worktree remove "/home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-linux-reexec.aLVvDe/repo-gnhf-worktrees/receipt-preservation-64abd0"
+  gnhf: worktree preserved at <fixture>/repo-gnhf-worktrees/<run-id>
+  gnhf: merge the branch and remove with: git worktree remove "<fixture>/repo-gnhf-worktrees/<run-id>"
 
 --- Atomic worktree receipt ---
 {
   "schemaVersion": 1,
-  "receiptId": "4d339a46-981b-4d99-b779-a5297dfd7133",
-  "runId": "receipt-preservation-64abd0",
+  "receiptId": "<receipt-id>",
+  "runId": "<run-id>",
   "state": "created",
-  "worktreePath": "/home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-linux-reexec.aLVvDe/repo-gnhf-worktrees/receipt-preservation-64abd0",
+  "worktreePath": "<fixture>/repo-gnhf-worktrees/<run-id>",
   "baseCommit": "53a86c3a26ac0f1c6716099b582a383268c5378f"
 }
 --- Git and lifecycle verification ---
 original branch: main
 original commit count: 1
-preserved branch: gnhf/receipt-preservation-64abd0
+preserved branch: gnhf/<run-id>
 preserved worktree status: clean
 receipt mode: 600
 lifecycle events:
-{"timestamp":"2026-08-16T06:16:01.213Z","pid":2366124,"event":"run:complete","signal":null,"status":"aborted","iterations":0,"successCount":0,"failCount":0,"totalInputTokens":0,"totalOutputTokens":0,"tokensAvailable":true,"reportedCostUsd":null,"commitCount":0,"worktreePath":"/home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-linux-reexec.aLVvDe/repo-gnhf-worktrees/receipt-preservation-64abd0"}
-{"timestamp":"2026-08-16T06:16:01.213Z","pid":2366124,"event":"worktree:preserved","worktreePath":"/home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-linux-reexec.aLVvDe/repo-gnhf-worktrees/receipt-preservation-64abd0","reason":"requested"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"run:complete","signal":null,"status":"aborted","iterations":0,"successCount":0,"failCount":0,"totalInputTokens":0,"totalOutputTokens":0,"tokensAvailable":true,"reportedCostUsd":null,"commitCount":0,"worktreePath":"<fixture>/repo-gnhf-worktrees/<run-id>"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"worktree:preserved","worktreePath":"<fixture>/repo-gnhf-worktrees/<run-id>","reason":"requested"}

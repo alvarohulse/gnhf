@@ -42,7 +42,7 @@ Prompts, notes, run metadata, and logs live under `.gnhf/` and stay local, so th
 Telemetry is anonymous, never carrying prompts, paths, or branch names, and a single env var turns it off.
 Richer diagnostics are welcome when they are opt-in, stay anonymous, and change nothing for anyone who does not enable them.
 Raw agent commands are redacted from logs, errors, and telemetry so local paths and secrets are never written out.
-Publishing is always an explicit user choice, such as `--push`.
+Publishing is always a separate user action; gnhf never pushes user work.
 
 ## Delight is part of the contract
 

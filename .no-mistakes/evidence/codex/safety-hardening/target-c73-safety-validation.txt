@@ -15,7 +15,7 @@ CLI permanent summary:
   gnhf: worktree preserved at <fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-c-0ee8bc
 
 Published receipt:
-{"schemaVersion":1,"receiptId":"42dd4ed2-cba8-44d0-af94-191e62fa3072","runId":"slow-cleanup-dirty-c-0ee8bc","state":"created","worktreePath":"<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-c-0ee8bc","baseCommit":"a79967c6a6e1f589c82cde3120309a70b62f3019"}
+{"schemaVersion":1,"receiptId": "<receipt-id>","runId":"slow-cleanup-dirty-c-0ee8bc","state":"created","worktreePath":"<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-c-0ee8bc","baseCommit":"a79967c6a6e1f589c82cde3120309a70b62f3019"}
 
 Preserved Git status: M README.md
 Preserved marker: - mock change 1786866955699
@@ -41,7 +41,7 @@ CLI permanent summary:
   gnhf: worktree preserved at <fixture>/repo-gnhf-worktrees/linux-reexec-current-8243a2
 
 Atomic receipt:
-{"schemaVersion":1,"receiptId":"95cb20fb-7b1f-4173-bca6-e5c6d9ae0d12","runId":"linux-reexec-current-8243a2","state":"created","worktreePath":"<fixture>/repo-gnhf-worktrees/linux-reexec-current-8243a2","baseCommit":"d7ecd75d3bed2db417bde03aa6745fb0bc12514c"}
+{"schemaVersion":1,"receiptId": "<receipt-id>","runId":"linux-reexec-current-8243a2","state":"created","worktreePath":"<fixture>/repo-gnhf-worktrees/linux-reexec-current-8243a2","baseCommit":"d7ecd75d3bed2db417bde03aa6745fb0bc12514c"}
 Receipt mode: 600
 Preserved branch: gnhf/linux-reexec-current-8243a2
 Preserved Git status: clean

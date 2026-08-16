@@ -3,12 +3,12 @@ import { join } from "node:path";
 import {
   getTokenUsageTotal,
   hasCompleteTokenUsage,
+  IncompleteAgentShutdownError,
   PermanentAgentError,
   type Agent,
   type AgentOutput,
   type TokenUsage,
 } from "./agents/types.js";
-import { IncompleteChildProcessShutdownError } from "./agents/managed-process.js";
 import { redactAgentSpecForLogs, type Config } from "./config.js";
 import type { RunInfo, WorkspaceRecovery } from "./run.js";
 import {
@@ -27,7 +27,6 @@ import {
   getBranchCommitCount,
   getCurrentBranch,
   getHeadCommit,
-  pushCurrentBranch,
   resetHard,
 } from "./git.js";
 import {
@@ -88,7 +87,6 @@ export interface RunLimits {
   maxTokens?: number;
   maxReportedCostUsd?: number;
   stopWhen?: string;
-  push?: boolean;
   preserveWorkspaceOnForceStop?: boolean;
 }
 
@@ -321,7 +319,6 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       maxIterations: this.limits.maxIterations,
       maxTokens: this.limits.maxTokens,
       maxReportedCostUsd: this.limits.maxReportedCostUsd,
-      push: this.limits.push === true,
       maxConsecutiveFailures: this.config.maxConsecutiveFailures,
       baseCommit: this.runInfo.baseCommit,
       initialCommitCount: this.state.commitCount,
@@ -523,6 +520,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     const baseTotalTokens = this.totalTokens;
     const baseReportedCostUsd = this.state.reportedCostUsd;
     let agentRunReceiptWritten = false;
+    let pendingAbortUsage: TokenUsage | null = null;
 
     if (
       this.limits.preserveWorkspaceOnForceStop === true &&
@@ -567,13 +565,15 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       const reason =
         (tokensAuthoritative ? this.getTokenAbortReason(true) : null) ??
         this.getReportedCostAbortReason();
-      if (
-        reason &&
-        this.activeAbortController &&
-        !this.activeAbortController.signal.aborted
-      ) {
+      if (reason && this.pendingAbortReason === null) {
         this.pendingAbortReason = reason;
-        this.activeAbortController.abort();
+        pendingAbortUsage = { ...usage };
+        if (
+          this.activeAbortController &&
+          !this.activeAbortController.signal.aborted
+        ) {
+          this.activeAbortController.abort();
+        }
       }
     };
 
@@ -603,6 +603,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         logPath,
       });
 
+      if (this.pendingAbortReason !== null && pendingAbortUsage !== null) {
+        return await settleRuntimeLimitAbort(this, pendingAbortUsage);
+      }
+
       if (this.stopRequested) {
         restoreLiveUsage(this);
         this.reportedCostUnavailable = true;
@@ -618,30 +622,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         return { type: "stopped" };
       }
 
-      this.activeIterationTokensAvailable = hasCompleteTokenUsage(result.usage);
-      this.activeIterationTokensEstimated = false;
-      if (hasCompleteTokenUsage(result.usage)) {
-        this.hasAuthoritativeTokenReceipt ||= result.usage.estimated !== true;
-        this.state.totalInputTokens =
-          baseInputTokens + result.usage.inputTokens;
-        this.state.totalOutputTokens =
-          baseOutputTokens + result.usage.outputTokens;
-        this.totalTokens = baseTotalTokens + getTokenUsageTotal(result.usage);
-      } else {
-        this.state.totalInputTokens = baseInputTokens;
-        this.state.totalOutputTokens = baseOutputTokens;
-        this.totalTokens = baseTotalTokens;
-      }
-      if (result.usage.estimated) {
-        this.state.tokensEstimated = true;
-      }
-      if (result.usage.reportedCostUsd === undefined) {
-        this.reportedCostUnavailable = true;
-        this.state.reportedCostUsd = null;
-      } else if (!this.reportedCostUnavailable) {
-        this.state.reportedCostUsd =
-          (baseReportedCostUsd ?? 0) + result.usage.reportedCostUsd;
-      }
+      applyTerminalUsage(this, result.usage);
 
       this.appendAgentRunReceipt({
         iteration: this.state.currentIteration,
@@ -656,15 +637,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
       if (result.output.success) {
         const record = this.recordSuccess(result.output);
-        const abortReason =
-          record.success && this.limits.push === true
-            ? this.pushAfterSuccess()
-            : undefined;
         return {
           type: "completed",
           record,
           shouldFullyStop: record.success ? shouldFullyStop : false,
-          ...(abortReason === undefined ? {} : { abortReason }),
         };
       }
       return {
@@ -679,6 +655,9 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       };
     } catch (err) {
       const elapsedMs = Date.now() - agentStartedAt;
+      if (this.pendingAbortReason !== null && pendingAbortUsage !== null) {
+        return await settleRuntimeLimitAbort(this, pendingAbortUsage);
+      }
       if (!agentRunReceiptWritten) {
         restoreLiveUsage(this);
         this.reportedCostUnavailable = true;
@@ -686,7 +665,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         const outcome: AgentRunOutcome =
           this.pendingAbortReason !== null ||
           err instanceof PermanentAgentError ||
-          err instanceof IncompleteChildProcessShutdownError
+          err instanceof IncompleteAgentShutdownError
             ? "aborted"
             : this.stopRequested
               ? "stopped"
@@ -698,23 +677,6 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           success: null,
           usage: null,
         });
-      }
-
-      if (
-        this.pendingAbortReason &&
-        err instanceof Error &&
-        err.message === "Agent was aborted"
-      ) {
-        appendDebugLog("agent:run:aborted", {
-          iteration: this.state.currentIteration,
-          elapsedMs,
-          reason: this.pendingAbortReason,
-        });
-        await this.closeAgent();
-        if (this.pendingWorkspaceRecovery === null) {
-          this.resetWorkspace();
-        }
-        return { type: "aborted", reason: this.pendingAbortReason };
       }
 
       if (this.stopRequested) {
@@ -743,7 +705,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         return { type: "aborted", reason: err.message };
       }
 
-      if (err instanceof IncompleteChildProcessShutdownError) {
+      if (err instanceof IncompleteAgentShutdownError) {
         this.preserveWorkspaceAfterUnsafeShutdown(err);
         return { type: "aborted", reason: err.message };
       }
@@ -768,6 +730,66 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       orchestrator.state.reportedCostUsd = baseReportedCostUsd;
       orchestrator.activeIterationTokensAvailable = false;
       orchestrator.activeIterationTokensEstimated = false;
+    }
+
+    function applyTerminalUsage(
+      orchestrator: Orchestrator,
+      usage: TokenUsage,
+    ): void {
+      orchestrator.activeIterationTokensAvailable =
+        hasCompleteTokenUsage(usage);
+      orchestrator.activeIterationTokensEstimated = false;
+      if (hasCompleteTokenUsage(usage)) {
+        orchestrator.hasAuthoritativeTokenReceipt ||= usage.estimated !== true;
+        orchestrator.state.totalInputTokens =
+          baseInputTokens + usage.inputTokens;
+        orchestrator.state.totalOutputTokens =
+          baseOutputTokens + usage.outputTokens;
+        orchestrator.totalTokens = baseTotalTokens + getTokenUsageTotal(usage);
+      } else {
+        orchestrator.state.totalInputTokens = baseInputTokens;
+        orchestrator.state.totalOutputTokens = baseOutputTokens;
+        orchestrator.totalTokens = baseTotalTokens;
+      }
+      if (usage.estimated === true) {
+        orchestrator.state.tokensEstimated = true;
+      }
+      if (usage.reportedCostUsd === undefined) {
+        orchestrator.reportedCostUnavailable = true;
+        orchestrator.state.reportedCostUsd = null;
+      } else if (!orchestrator.reportedCostUnavailable) {
+        orchestrator.state.reportedCostUsd =
+          (baseReportedCostUsd ?? 0) + usage.reportedCostUsd;
+      }
+    }
+
+    async function settleRuntimeLimitAbort(
+      orchestrator: Orchestrator,
+      usage: TokenUsage,
+    ): Promise<RunIterationResult> {
+      const reason = orchestrator.pendingAbortReason;
+      if (reason === null) {
+        throw new Error("Runtime limit abort reason is missing");
+      }
+      applyTerminalUsage(orchestrator, usage);
+      orchestrator.appendAgentRunReceipt({
+        iteration: orchestrator.state.currentIteration,
+        startedAt: agentStartedAt,
+        outcome: "aborted",
+        success: null,
+        usage,
+      });
+      agentRunReceiptWritten = true;
+      appendDebugLog("agent:run:aborted", {
+        iteration: orchestrator.state.currentIteration,
+        elapsedMs: Date.now() - agentStartedAt,
+        reason,
+      });
+      await orchestrator.closeAgent();
+      if (orchestrator.pendingWorkspaceRecovery === null) {
+        orchestrator.resetWorkspace();
+      }
+      return { type: "aborted", reason };
     }
   }
 
@@ -916,23 +938,6 @@ ${recovery.detail}
       keyLearnings: [error.detail],
       timestamp: new Date(),
     };
-  }
-
-  private pushAfterSuccess(): string | undefined {
-    try {
-      pushCurrentBranch(this.cwd);
-      appendDebugLog("git:push:success", {
-        iteration: this.state.currentIteration,
-      });
-      return undefined;
-    } catch (err) {
-      appendDebugLog("git:push:error", {
-        iteration: this.state.currentIteration,
-        error: serializeError(err),
-      });
-      const message = err instanceof Error ? err.message : String(err);
-      return `push failed: ${message}`;
-    }
   }
 
   private recordFailure(
@@ -1100,7 +1105,7 @@ ${recovery.detail}
           appendDebugLog("agent:close:error", {
             error: serializeError(err),
           });
-          if (err instanceof IncompleteChildProcessShutdownError) {
+          if (err instanceof IncompleteAgentShutdownError) {
             this.preserveWorkspaceAfterUnsafeShutdown(err);
             throw err;
           }
@@ -1111,7 +1116,7 @@ ${recovery.detail}
   }
 
   private preserveWorkspaceAfterUnsafeShutdown(
-    error: IncompleteChildProcessShutdownError,
+    error: IncompleteAgentShutdownError,
   ): void {
     if (this.pendingWorkspaceRecovery === null) {
       this.pendingWorkspaceRecovery = {

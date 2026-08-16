@@ -8,7 +8,11 @@ import {
   resetDebugLogForTests,
   serializeError,
 } from "../debug-log.js";
-import { PermanentAgentError, type AgentOutputSchema } from "./types.js";
+import {
+  IncompleteAgentShutdownError,
+  PermanentAgentError,
+  type AgentOutputSchema,
+} from "./types.js";
 import type {
   AcpRuntimeEnsureInput,
   AcpRuntimeEvent,
@@ -46,7 +50,7 @@ interface FakeTurn {
   events: AcpRuntimeEvent[];
   startError?: unknown;
   eventError?: unknown;
-  result: AcpRuntimeTurnResult;
+  result: AcpRuntimeTurnResult | Promise<AcpRuntimeTurnResult>;
   cancel?: () => Promise<void>;
 }
 
@@ -114,6 +118,7 @@ function createFakeRuntime(turns: FakeTurn[]) {
         cancel: vi.fn(async () => {
           cancelled = true;
           calls.cancelCalls += 1;
+          await turn.cancel?.();
         }),
         closeStream: vi.fn(async () => {}),
       };
@@ -223,6 +228,32 @@ describe("AcpAgent", () => {
       resetDebugLogForTests();
       rmSync(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it("cancels and settles a turn before propagating a stream error", async () => {
+    let resolveResult!: (result: AcpRuntimeTurnResult) => void;
+    const turnResult = new Promise<AcpRuntimeTurnResult>((resolve) => {
+      resolveResult = resolve;
+    });
+    const { runtime, calls } = createFakeRuntime([
+      {
+        events: [],
+        eventError: new Error("stream failed"),
+        result: turnResult,
+      },
+    ]);
+    const agent = makeAgent(runtime);
+    const runPromise = agent.run("p", "/w");
+    let settled = false;
+    void runPromise.catch(() => {
+      settled = true;
+    });
+
+    await vi.waitFor(() => expect(calls.cancelCalls).toBe(1));
+    expect(settled).toBe(false);
+
+    resolveResult({ status: "cancelled" });
+    await expect(runPromise).rejects.toThrow("stream failed");
   });
 
   it("redacts raw command targets when ACP startup throws before streaming", async () => {
@@ -743,6 +774,26 @@ describe("AcpAgent", () => {
 
     expect(calls.closeInputs).toHaveLength(1);
     expect(calls.closeInputs[0]!.handle).toBe(STUB_HANDLE);
+  });
+
+  it("surfaces incomplete runtime cleanup and retains it for retry", async () => {
+    const { runtime, calls } = createFakeRuntime([
+      {
+        events: [textDelta(JSON.stringify(VALID_OUTPUT))],
+        result: { status: "completed" },
+      },
+    ]);
+    runtime.close.mockRejectedValueOnce(new Error("runtime still active"));
+    const agent = makeAgent(runtime);
+
+    await agent.run("p", "/w");
+    await expect(agent.close()).rejects.toBeInstanceOf(
+      IncompleteAgentShutdownError,
+    );
+    await agent.close();
+
+    expect(runtime.close).toHaveBeenCalledTimes(2);
+    expect(calls.closeInputs).toHaveLength(1);
   });
 
   it("close() is a no-op when no session was opened", async () => {

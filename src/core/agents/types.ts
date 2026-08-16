@@ -171,7 +171,10 @@ export function hasCompleteTokenUsage(
 export function getTokenUsageTotal(usage: TokenUsage): number {
   return isValidTokenCount(usage.totalTokens)
     ? usage.totalTokens
-    : usage.inputTokens + usage.outputTokens + usage.cacheCreationTokens;
+    : usage.inputTokens +
+        usage.outputTokens +
+        usage.cacheReadTokens +
+        usage.cacheCreationTokens;
 }
 
 export interface AgentResult {
@@ -186,6 +189,13 @@ export class PermanentAgentError extends Error {
     super(message, { cause: detail });
     this.name = "PermanentAgentError";
     this.detail = detail;
+  }
+}
+
+export class IncompleteAgentShutdownError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "IncompleteAgentShutdownError";
   }
 }
 

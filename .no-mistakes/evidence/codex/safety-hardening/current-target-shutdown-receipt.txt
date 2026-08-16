@@ -19,7 +19,7 @@ CLI permanent summary:
 Final supervisor receipt:
 {
   "schemaVersion": 1,
-  "receiptId": "c6155460-136c-44b4-a1a6-72dacf61e80f",
+  "receiptId": "<receipt-id>",
   "runId": "current-target-recei-61a0eb",
   "state": "shutdown",
   "worktreePath": "<fixture>/fixture-gnhf-worktrees/current-target-recei-61a0eb",

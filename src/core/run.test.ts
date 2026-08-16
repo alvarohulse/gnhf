@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { basename, dirname, join } from "node:path";
 
 vi.mock("node:fs", () => ({
+  cpSync: vi.fn(),
   mkdirSync: vi.fn(),
   writeFileSync: vi.fn(),
   appendFileSync: vi.fn(),
@@ -23,6 +24,7 @@ vi.mock("./git.js", () => ({
 
 import { execFileSync } from "node:child_process";
 import {
+  cpSync,
   mkdirSync,
   writeFileSync,
   appendFileSync,
@@ -30,6 +32,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  rmSync,
 } from "node:fs";
 import { findLegacyRunBaseCommit, getHeadCommit } from "./git.js";
 import {
@@ -38,6 +41,7 @@ import {
   getLastIterationNumber,
   resumeRun,
   peekRunMetadata,
+  persistRunEvidence,
   readRunUsageState,
   toStringArray,
   writeRunUsageState,
@@ -47,12 +51,14 @@ import { CONVENTIONAL_COMMIT_MESSAGE } from "./commit-message.js";
 const P = "/project";
 
 const mockMkdirSync = vi.mocked(mkdirSync);
+const mockCpSync = vi.mocked(cpSync);
 const mockWriteFileSync = vi.mocked(writeFileSync);
 const mockAppendFileSync = vi.mocked(appendFileSync);
 const mockExistsSync = vi.mocked(existsSync);
 const mockReadFileSync = vi.mocked(readFileSync);
 const mockReaddirSync = vi.mocked(readdirSync);
 const mockRenameSync = vi.mocked(renameSync);
+const mockRmSync = vi.mocked(rmSync);
 const mockExecFileSync = vi.mocked(execFileSync);
 const mockFindLegacyRunBaseCommit = vi.mocked(findLegacyRunBaseCommit);
 const mockGetHeadCommit = vi.mocked(getHeadCommit);
@@ -260,10 +266,20 @@ describe("setupRun", () => {
       },
     });
 
-    expect(mockWriteFileSync).toHaveBeenCalledWith(
-      join(info.runDir, "runtime-limits.json"),
+    const runtimeLimitsWrite = mockWriteFileSync.mock.calls.find(
+      (call) =>
+        typeof call[0] === "string" &&
+        basename(call[0]).startsWith(".runtime-limits.json."),
+    );
+    expect(runtimeLimitsWrite).toBeDefined();
+    expect(runtimeLimitsWrite).toEqual([
+      expect.stringMatching(/\.runtime-limits\.json\..+\.tmp$/),
       `${JSON.stringify(info.runtimeLimits, null, 2)}\n`,
-      { encoding: "utf-8", mode: 0o600 },
+      { encoding: "utf-8", flag: "wx", mode: 0o600 },
+    ]);
+    expect(mockRenameSync).toHaveBeenCalledWith(
+      runtimeLimitsWrite![0],
+      join(info.runDir, "runtime-limits.json"),
     );
     expect(info.runtimeLimits).toEqual({
       maxIterations: 12,
@@ -489,10 +505,19 @@ describe("resumeRun", () => {
       maxIterations: 20,
       maxReportedCostUsd: 7.25,
     });
-    expect(mockWriteFileSync).toHaveBeenCalledWith(
-      runtimeLimitsPath,
+    const runtimeLimitsWrite = mockWriteFileSync.mock.calls.find(
+      (call) =>
+        typeof call[0] === "string" &&
+        basename(call[0]).startsWith(".runtime-limits.json."),
+    );
+    expect(runtimeLimitsWrite).toEqual([
+      expect.stringMatching(/\.runtime-limits\.json\..+\.tmp$/),
       `${JSON.stringify(info.runtimeLimits, null, 2)}\n`,
-      { encoding: "utf-8", mode: 0o600 },
+      { encoding: "utf-8", flag: "wx", mode: 0o600 },
+    ]);
+    expect(mockRenameSync).toHaveBeenCalledWith(
+      runtimeLimitsWrite![0],
+      runtimeLimitsPath,
     );
   });
 
@@ -611,6 +636,50 @@ describe("resumeRun", () => {
 
     expect(mockGetHeadCommit).toHaveBeenCalledWith(P);
     expect(info.baseCommit).toBe("head456");
+  });
+});
+
+describe("persistRunEvidence", () => {
+  it("atomically copies worktree evidence into the originating checkout", () => {
+    const runDir = "/worktree/.gnhf/runs/run-abc";
+    const runInfo = {
+      runId: "run-abc",
+      runDir,
+      promptPath: join(runDir, "prompt.md"),
+      notesPath: join(runDir, "notes.md"),
+      schemaPath: join(runDir, "output-schema.json"),
+      logPath: join(runDir, "gnhf.log"),
+      baseCommit: "abc123",
+      baseCommitPath: join(runDir, "base-commit"),
+      stopWhenPath: join(runDir, "stop-when"),
+      stopWhen: undefined,
+      commitMessagePath: join(runDir, "commit-message"),
+      commitMessage: undefined,
+      runtimeLimitsPath: join(runDir, "runtime-limits.json"),
+      runtimeLimits: {},
+    };
+
+    const persisted = persistRunEvidence(runInfo, "/repo");
+    const temporaryPath = mockCpSync.mock.calls[0]![1] as string;
+    const persistedRunDir = "/repo/.gnhf/runs/run-abc";
+
+    expect(mockCpSync).toHaveBeenCalledWith(runDir, temporaryPath, {
+      recursive: true,
+      errorOnExist: true,
+      force: false,
+    });
+    expect(dirname(temporaryPath)).toBe("/repo/.gnhf/runs");
+    expect(basename(temporaryPath)).toMatch(/^\.run-abc\..+\.tmp$/);
+    expect(mockRmSync).toHaveBeenCalledWith(persistedRunDir, {
+      recursive: true,
+      force: true,
+    });
+    expect(mockRenameSync).toHaveBeenCalledWith(temporaryPath, persistedRunDir);
+    expect(persisted).toMatchObject({
+      runDir: persistedRunDir,
+      notesPath: join(persistedRunDir, "notes.md"),
+      logPath: join(persistedRunDir, "gnhf.log"),
+    });
   });
 });
 

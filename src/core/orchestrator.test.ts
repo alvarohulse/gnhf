@@ -8,7 +8,6 @@ vi.mock("./git.js", async (importOriginal) => {
     getBranchCommitCount: vi.fn(() => 0),
     getCurrentBranch: vi.fn(() => "gnhf/run-abc"),
     getHeadCommit: vi.fn(() => "head123"),
-    pushCurrentBranch: vi.fn(),
     resetHard: vi.fn(),
   };
 });
@@ -40,12 +39,7 @@ vi.mock("../templates/iteration-prompt.js", () => ({
   buildIterationPrompt: vi.fn(() => "iteration prompt"),
 }));
 
-import {
-  CommitFailedError,
-  commitAll,
-  pushCurrentBranch,
-  resetHard,
-} from "./git.js";
+import { CommitFailedError, commitAll, resetHard } from "./git.js";
 import {
   appendNotes,
   clearWorkspaceRecovery,
@@ -68,7 +62,6 @@ import type { Config } from "./config.js";
 import type { RunInfo } from "./run.js";
 
 const mockCommitAll = vi.mocked(commitAll);
-const mockPushCurrentBranch = vi.mocked(pushCurrentBranch);
 const mockAppendNotes = vi.mocked(appendNotes);
 const mockClearWorkspaceRecovery = vi.mocked(clearWorkspaceRecovery);
 const mockReadRunUsageState = vi.mocked(readRunUsageState);
@@ -686,7 +679,7 @@ describe("Orchestrator stop limits", () => {
     expect(orchestrator.getState().status).toBe("aborted");
   });
 
-  it("does not promote live token usage after a cap abort", async () => {
+  it("persists live token usage after a cap abort and enforces it on resume", async () => {
     let resolveClose!: () => void;
     const closePromise = new Promise<void>((resolve) => {
       resolveClose = resolve;
@@ -739,9 +732,87 @@ describe("Orchestrator stop limits", () => {
     expect(abort).toHaveBeenCalledWith("max tokens reached (11/10)");
     expect(orchestrator.getState()).toMatchObject({
       status: "aborted",
-      totalInputTokens: 0,
-      totalOutputTokens: 0,
-      tokensAvailable: false,
+      totalInputTokens: 7,
+      totalOutputTokens: 2,
+      tokensAvailable: true,
+    });
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(runInfo, {
+      generation: 1,
+      phase: "terminal",
+      totalInputTokens: 7,
+      totalOutputTokens: 2,
+      totalTokens: 11,
+      reportedCostUsd: null,
+      tokensUnavailable: false,
+      reportedCostUnavailable: true,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 1,
+      phase: "terminal",
+      totalInputTokens: 7,
+      totalOutputTokens: 2,
+      totalTokens: 11,
+      reportedCostUsd: null,
+      tokensUnavailable: false,
+      reportedCostUnavailable: true,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const resumedAgent: Agent = { name: "claude", run: vi.fn() };
+    const resumed = new Orchestrator(
+      config,
+      resumedAgent,
+      runInfo,
+      "ship it",
+      "/repo",
+      1,
+      { maxTokens: 10 },
+    );
+
+    await resumed.start();
+
+    expect(resumedAgent.run).not.toHaveBeenCalled();
+    expect(resumed.getState().lastMessage).toBe("max tokens reached (11/10)");
+  });
+
+  it("treats a live cap as authoritative when the agent resolves", async () => {
+    const usage: TokenUsage = {
+      inputTokens: 7,
+      outputTokens: 2,
+      cacheReadTokens: 1,
+      cacheCreationTokens: 0,
+      tokensAvailable: true,
+    };
+    const agent: Agent = {
+      name: "claude",
+      close: vi.fn(async () => undefined),
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.(usage);
+        return { ...createSuccessResult(), usage };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxTokens: 10 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockCommitAll).not.toHaveBeenCalled();
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      totalInputTokens: 7,
+      totalOutputTokens: 2,
+      tokensAvailable: true,
+      lastMessage: "max tokens reached (10/10)",
     });
   });
 
@@ -753,7 +824,7 @@ describe("Orchestrator stop limits", () => {
         (_prompt, _cwd, options) =>
           new Promise<AgentResult>((_resolve, reject) => {
             options?.signal?.addEventListener("abort", () => {
-              reject(new Error("Agent was aborted"));
+              reject(new Error("request cancelled by provider"));
             });
             options?.onUsage?.({
               inputTokens: 4,
@@ -1027,20 +1098,32 @@ describe("Orchestrator stop limits", () => {
     );
     expect(orchestrator.getState()).toMatchObject({
       status: "aborted",
-      reportedCostUsd: null,
+      reportedCostUsd: 1.25,
+    });
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(runInfo, {
+      generation: 1,
+      phase: "terminal",
+      totalInputTokens: 7,
+      totalOutputTokens: 4,
+      totalTokens: 11,
+      reportedCostUsd: 1.25,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
     });
     expect(mockAppendDebugLog).toHaveBeenCalledWith("agent:run:end", {
       iteration: 1,
       elapsedMs: expect.any(Number),
       outcome: "aborted",
       success: null,
-      inputTokens: null,
-      outputTokens: null,
-      cacheReadTokens: null,
-      cacheCreationTokens: null,
-      reportedCostUsd: null,
-      reportedCostAvailable: false,
-      tokensAvailable: false,
+      inputTokens: 7,
+      outputTokens: 4,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      reportedCostUsd: 1.25,
+      reportedCostAvailable: true,
+      tokensAvailable: true,
       estimated: false,
     });
   });
@@ -2322,61 +2405,5 @@ describe("Orchestrator crash resilience", () => {
     expect(mockAppendNotes).toHaveBeenCalledTimes(1);
     expect(mockCommitAll).toHaveBeenCalledTimes(1);
     expect(mockResetHard).not.toHaveBeenCalled();
-  });
-
-  it("pushes the current branch after each successful commit when requested", async () => {
-    const agent: Agent = {
-      name: "claude",
-      run: vi.fn(async () => createSuccessResult()),
-    };
-
-    const orchestrator = new Orchestrator(
-      config,
-      agent,
-      runInfo,
-      "ship it",
-      "/repo",
-      0,
-      { maxIterations: 1, push: true },
-    );
-
-    await orchestrator.start();
-
-    expect(mockCommitAll).toHaveBeenCalledTimes(1);
-    expect(mockPushCurrentBranch).toHaveBeenCalledWith("/repo");
-    expect(mockResetHard).not.toHaveBeenCalled();
-  });
-
-  it("aborts without resetting when pushing a successful commit fails", async () => {
-    mockPushCurrentBranch.mockImplementation(() => {
-      throw new Error("remote rejected push");
-    });
-    const agent: Agent = {
-      name: "claude",
-      run: vi.fn(async () => createSuccessResult()),
-    };
-
-    const orchestrator = new Orchestrator(
-      config,
-      agent,
-      runInfo,
-      "ship it",
-      "/repo",
-      0,
-      { maxIterations: 2, push: true },
-    );
-    const abort = vi.fn();
-    const iterationEnd = vi.fn();
-    orchestrator.on("abort", abort);
-    orchestrator.on("iteration:end", iterationEnd);
-
-    await orchestrator.start();
-
-    expect(mockCommitAll).toHaveBeenCalledTimes(1);
-    expect(mockPushCurrentBranch).toHaveBeenCalledWith("/repo");
-    expect(mockResetHard).not.toHaveBeenCalled();
-    expect(iterationEnd).toHaveBeenCalledTimes(1);
-    expect(abort).toHaveBeenCalledWith("push failed: remote rejected push");
-    expect(orchestrator.getState().status).toBe("aborted");
   });
 });

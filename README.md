@@ -72,8 +72,8 @@ $ gnhf --worktree "refactor the API layer" &
 ```
 
 ```sh
-# Commit directly on the current branch and push after each successful iteration
-$ gnhf --current-branch --push "keep improving this app"
+# Commit directly on the current branch
+$ gnhf --current-branch "keep improving this app"
 ```
 
 Run `gnhf` from inside a Git repository with a clean working tree. If you are starting from a plain directory, run `git init` first.
@@ -152,7 +152,7 @@ After installing from npm, the skill is available under the installed package di
 
 - **Incremental commits** - each successful iteration is a separate unsigned git commit, so you can cherry-pick or revert individual changes without GPG or SSH signing prompts blocking the run; if `git commit` fails, gnhf preserves the uncommitted work and asks the next agent iteration to repair it
 - **Failure handling** - failed iterations are rolled back with `git reset --hard` unless recovery metadata protects the workspace, including after a commit failure or an interrupted worktree run; agent-reported failures proceed to the next iteration immediately, retryable hard agent errors use exponential backoff, and permanent agent errors such as Claude low credit balance abort immediately and print the run log path. Complete no-op iterations are reported as failures and count toward the consecutive-failure abort limit. If the run exits with a pending commit failure, the exit summary warns that uncommitted changes were left for repair.
-- **Runtime caps** - `--max-iterations` stops before the next iteration begins, `--max-tokens` can abort mid-iteration once the harness reports a complete provider-reported token total, and `--max-reported-cost-usd` can abort when the harness reports a cumulative cost. Provider totals may include reasoning and cache components in addition to input and output. These caps persist for the run and are restored on resume; pass a new value to replace one or its matching `--clear-*` flag to remove it. Live usage can trigger a cap, but stopped, errored, or aborted turns roll back their provisional totals and end with unavailable receipts. Missing token totals stay unavailable and do not trigger the token cap; missing cost stays unknown and does not trigger the cost cap. Completed-turn totals are restored on resume, but token and cost availability is trusted for caps only when the persisted usage generation is terminal and matches the last completed iteration; interrupted or stale generations remain unavailable. `--stop-when` ends the loop after an iteration whose agent output reports the natural-language condition is met unless a commit failure needs repair first; resumed runs reuse it unless you pass a new value, or `--stop-when ""` to clear it. Recovery-marked work is preserved; otherwise failed-iteration changes are rolled back. In the interactive TUI, the final state remains visible until you press Ctrl+C to exit.
+- **Runtime caps** - `--max-iterations` stops before the next iteration begins, `--max-tokens` can abort mid-iteration once the harness reports a complete provider-reported token total, and `--max-reported-cost-usd` can abort when the harness reports a cumulative cost. Provider totals may include reasoning and cache components in addition to input and output. These caps persist for the run and are restored on resume; pass a new value to replace one or its matching `--clear-*` flag to remove it. Usage that triggers a live cap is persisted as the terminal receipt so the same cap remains enforced on resume. Missing token totals stay unavailable and do not trigger the token cap; missing cost stays unknown and does not trigger the cost cap. Completed-turn totals are restored on resume, but token and cost availability is trusted for caps only when the persisted usage generation is terminal and matches the last completed iteration; interrupted or stale generations remain unavailable. `--stop-when` ends the loop after an iteration whose agent output reports the natural-language condition is met unless a commit failure needs repair first; resumed runs reuse it unless you pass a new value, or `--stop-when ""` to clear it. Recovery-marked work is preserved; otherwise failed-iteration changes are rolled back. In the interactive TUI, the final state remains visible until you press Ctrl+C to exit.
 - **Iteration finalization** - agents are expected to finish validation, stop any background processes they started, and only then emit the final JSON result for the iteration. Workers must record exact PIDs or process handles when they start processes and stop only those owned identities. Process-name, pattern-wide, and port-wide cleanup, including `pkill`, `killall`, `taskkill`, and `Stop-Process -Name`, is forbidden. This guidance mitigates accidental cross-run cleanup; it is not a process-security boundary.
 - **Graceful interrupts** - in the interactive TUI, the first Ctrl+C requests a graceful stop and lets the current iteration finish (or ends backoff early), the second Ctrl+C force-stops immediately, and `SIGTERM` also force-stops immediately
 - **Exit summary** - after shutdown cleanup, gnhf prints a permanent stdout summary with the final branch, elapsed time, iteration and token usage, branch diff stats, notes/debug-log paths, and review commands
@@ -163,13 +163,10 @@ After installing from npm, the skill is available under the installed package di
 ### Live Branch Mode
 
 Pass `--current-branch` to run on the branch you are already on instead of creating a `gnhf/` branch.
-Pass `--push` to push the current branch after each successful iteration.
-Together, `--current-branch --push` is useful for loose projects where you want a deployed or locally watched branch to update throughout the run.
+The maintained fork never pushes user work. Publish the resulting commits separately after review.
 
 - Re-running the same prompt with `--current-branch` resumes the existing `.gnhf/runs/<runId>/` history on a clean working tree and continues iteration numbering.
-- Push failures abort the run after preserving the successful local commit.
-- gnhf never force-pushes or auto-pulls for this mode.
-- `--push` also works with the default `gnhf/` branch mode and sets `origin` as the upstream when needed.
+- gnhf never pushes, force-pushes, or auto-pulls for this mode.
 - Do not combine `--current-branch` with `--worktree`; gnhf exits with an error because those modes choose different working directories.
 
 ### Worktree Mode
@@ -185,6 +182,7 @@ Pass `--worktree` to run each agent in an isolated [git worktree](https://git-sc
 
 - Re-running the same prompt with `--worktree` resumes a preserved matching worktree when possible; otherwise gnhf creates a suffixed worktree such as `<run-slug>-1` if the original name is unavailable.
 - Worktrees are removed only when Git verifies that they are clean and have no commits. Committed, dirty, recovery-marked, or uninspectable worktrees are preserved and reported with the path and cleanup command, including during forced shutdown.
+- Before removing a clean zero-commit worktree, gnhf copies its run metadata and logs into `.gnhf/runs/` in the originating checkout.
 - Add `--preserve-worktree` to keep the worktree on every exit path, including a zero-commit run. This flag requires `--worktree`; gnhf prints and records the retained path.
 - `--worktree` must be run from a non-gnhf branch (typically `main`).
 
@@ -215,7 +213,7 @@ If you run `gnhf` on an existing `gnhf/` branch with a different prompt, gnhf as
 | `--worktree`                       | Run in a separate git worktree (enables multiple agents concurrently)                              | `false`                |
 | `--preserve-worktree`              | Keep the generated worktree after every exit path; requires `--worktree`                           | `false`                |
 | `--current-branch`                 | Run on the current branch instead of creating a `gnhf/` branch                                     | `false`                |
-| `--push`                           | Push the current branch after each successful iteration                                            | `false`                |
+| `--push`                           | Disabled; gnhf never pushes user work                                                              | `false`                |
 | `--meteor-frequency <n>`           | Set TUI meteor frequency from 0 to 5 (`0` disables meteors)                                        | `3`                    |
 | `--version`                        | Show version                                                                                       |                        |
 
@@ -346,7 +344,7 @@ Set `GNHF_TELEMETRY=0` to turn it off.
 | Cursor CLI         | `--agent cursor`                  | Install Cursor's CLI and sign in first (`cursor-agent login`).                                                                                                                      | `gnhf` invokes `cursor-agent` (falling back to the `agent` name) directly in non-interactive `--print` stream-json mode, appends the final output schema to the prompt, and defaults to `--force`, `--trust`, and `--approve-mcps` unless you override those flags. After Cursor emits a non-error result, `gnhf` shuts down any lingering Cursor process tree after a short grace period. |
 | Rovo Dev           | `--agent rovodev`                 | Install Atlassian's `acli` and authenticate it with Rovo Dev first.                                                                                                                 | `gnhf` starts a local `acli rovodev serve --disable-session-token <port>` process automatically in the repo workspace.                                                                                                                                                                                                                                                                     |
 | OpenCode           | `--agent opencode`                | Install `opencode` and configure at least one usable model provider first.                                                                                                          | `gnhf` starts a local `opencode serve --hostname 127.0.0.1 --port <port> --print-logs` process automatically, creates a per-run session, and applies a blanket allow rule so tool calls do not block on prompts.                                                                                                                                                                           |
-| ACP target         | `--agent acp:<target-or-command>` | Install and authenticate the target supported by the bundled [`acpx`](https://github.com/openclaw/acpx) registry, such as `acp:gemini`, or pass a quoted custom ACP server command. | `gnhf` runs the target through ACP with a persistent per-run session under `.gnhf/runs/<runId>/acp-sessions`. The bundled ACP runtime does not expose a complete provider-reported token total, so token receipts stay unavailable and `--max-tokens` does not enforce for ACP targets. `agentPathOverride` and `agentArgsOverride` do not apply.                                      |
+| ACP target         | `--agent acp:<target-or-command>` | Install and authenticate the target supported by the bundled [`acpx`](https://github.com/openclaw/acpx) registry, such as `acp:gemini`, or pass a quoted custom ACP server command. | `gnhf` runs the target through ACP with a persistent per-run session under `.gnhf/runs/<runId>/acp-sessions`. The bundled ACP runtime does not expose a complete provider-reported token total, so token receipts stay unavailable and `--max-tokens` does not enforce for ACP targets. `agentPathOverride` and `agentArgsOverride` do not apply.                                          |
 
 ## Development
 

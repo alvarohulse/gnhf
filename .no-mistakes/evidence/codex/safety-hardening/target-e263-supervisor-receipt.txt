@@ -18,7 +18,7 @@ CLI permanent summary:
 Published receipt:
 {
   "schemaVersion": 1,
-  "receiptId": "751a4d28-c089-4cc4-84bd-56f1c9488094",
+  "receiptId": "<receipt-id>",
   "runId": "supervisor-receipt-e-1d5b24",
   "state": "created",
   "worktreePath": "<fixture>/fixture-gnhf-worktrees/supervisor-receipt-e-1d5b24",

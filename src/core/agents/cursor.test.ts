@@ -792,6 +792,42 @@ describe("CursorAgent", () => {
     }
   });
 
+  it("rejects when lingering direct-child cleanup cannot be proven", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CursorAgent({
+      finalResultGraceMs: 25,
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+    const content = JSON.stringify({
+      success: true,
+      summary: "done",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+
+    try {
+      const promise = agent.run("test prompt", "/work/dir");
+      const rejection = expect(promise).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+      emitJson(proc, {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: content,
+      });
+
+      await vi.advanceTimersByTimeAsync(25 + 3_000 + 100);
+
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not schedule linger cleanup for error results", async () => {
     vi.useFakeTimers();
     const processKill = vi

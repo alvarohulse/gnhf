@@ -375,19 +375,20 @@ export class CursorAgent implements Agent {
         this.shutdowns.start(() =>
           shutdownCursorProcess(child, this.platform, this.detached),
         );
+      const rejectCleanupFailure = (error: unknown) => {
+        reject(
+          error instanceof Error
+            ? error
+            : new Error(`Cursor process cleanup failed: ${String(error)}`),
+        );
+      };
       const rejectAfterShutdown = (error: Error) => {
         void (async () => {
           try {
             await shutdownRun();
             reject(error);
           } catch (cleanupError) {
-            reject(
-              cleanupError instanceof Error
-                ? cleanupError
-                : new Error(
-                    `Cursor process cleanup failed: ${String(cleanupError)}`,
-                  ),
-            );
+            rejectCleanupFailure(cleanupError);
           }
         })();
       };
@@ -464,9 +465,7 @@ export class CursorAgent implements Agent {
           }
           finalResultCleanupTimer = setTimeout(() => {
             closedAfterFinalCleanup = true;
-            void this.shutdowns.start(() =>
-              shutdownCursorProcess(child, this.platform, this.detached),
-            );
+            void shutdownRun().catch(rejectCleanupFailure);
           }, this.finalResultGraceMs);
         }
       });

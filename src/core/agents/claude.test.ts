@@ -446,6 +446,47 @@ describe("ClaudeAgent", () => {
     }
   });
 
+  it("rejects when lingering direct-child cleanup cannot be proven", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const configuredAgent = new ClaudeAgent({
+      finalResultGraceMs: 25,
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+
+    try {
+      const promise = configuredAgent.run("prompt", "/cwd");
+      const rejection = expect(promise).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+      emitLine(proc, {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        usage: {
+          input_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          output_tokens: 1,
+        },
+        structured_output: {
+          success: true,
+          summary: "done",
+          key_changes_made: [],
+          key_learnings: [],
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(25 + 3_000 + 100);
+
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("restarts the final-result cleanup timer when a later turn returns structured output", async () => {
     vi.useFakeTimers();
     const processKill = vi

@@ -380,6 +380,7 @@ describe("OpenCodeAgent", () => {
           parts: [],
         }),
       )
+      .mockResolvedValueOnce(jsonResponse(true))
       .mockResolvedValueOnce(jsonResponse(true));
 
     await expect(agent.run("test prompt", "/repo")).resolves.toEqual({
@@ -398,6 +399,16 @@ describe("OpenCodeAgent", () => {
         tokensAvailable: true,
       },
     });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      "http://127.0.0.1:8765/session/session-123/abort",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      "http://127.0.0.1:8765/session/session-123",
+      expect.objectContaining({ method: "DELETE" }),
+    );
   });
 
   it("starts the server, creates a wildcard-approval session, and parses the final answer", async () => {

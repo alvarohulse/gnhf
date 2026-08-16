@@ -4,6 +4,7 @@ import {
   type SpawnOptions,
 } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { IncompleteAgentShutdownError } from "./types.js";
 
 interface SignalChildProcessOptions {
   detached: boolean;
@@ -77,7 +78,7 @@ function isSupervisorMessage(value: unknown): value is SupervisorMessage {
   );
 }
 
-export class IncompleteChildProcessShutdownError extends Error {
+export class IncompleteChildProcessShutdownError extends IncompleteAgentShutdownError {
   constructor(pid: number | undefined) {
     super(
       `Could not prove process cleanup completed${pid === undefined ? "" : ` for PID ${pid}`}`,

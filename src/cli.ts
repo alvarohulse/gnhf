@@ -47,6 +47,7 @@ import {
   type RunSchemaOptions,
   setupRun,
   resumeRun,
+  persistRunEvidence,
   peekRunMetadata,
   getLastIterationNumber,
 } from "./core/run.js";
@@ -507,12 +508,16 @@ function initializeWorktreeRun(
       }
       if (suffix === 99) {
         if (worktreeReceiptId !== undefined) {
+          const worktreeWasPreserved = existsSync(createdWorktreePath);
           writeConfiguredWorktreeReceipt({
             runId: createdRunId,
             baseCommit,
             receiptId: worktreeReceiptId,
             state: "shutdown",
-            disposition: "removed",
+            disposition: worktreeWasPreserved ? "preserved" : "removed",
+            ...(worktreeWasPreserved
+              ? { preservationReason: "uncertain" }
+              : {}),
             worktreePath: createdWorktreePath,
           });
         }
@@ -772,11 +777,7 @@ program
     "Run on the current branch instead of creating a gnhf branch",
     false,
   )
-  .option(
-    "--push",
-    "Push the current branch after each successful iteration",
-    false,
-  )
+  .option("--push", "Disabled; gnhf never pushes user work", false)
   .option(
     "--meteor-frequency <n>",
     "Meteor frequency from 0 to 5 (0 disables, 3 is default)",
@@ -932,7 +933,6 @@ program
       let worktreePreservationReason:
         | WorktreePreservationReason
         | "requested"
-        | "resumed"
         | null = null;
       let worktreePreservationNoticeEmitted = false;
       let readPendingWorkspaceRecovery = () => false;
@@ -962,10 +962,7 @@ program
         worktreeReceiptFinalized = true;
       };
       const preserveWorktree = (
-        preservationReason:
-          | WorktreePreservationReason
-          | "requested"
-          | "resumed",
+        preservationReason: WorktreePreservationReason | "requested",
       ) => {
         if (worktreePath === null || worktreePreservationNoticeEmitted) {
           return;
@@ -993,6 +990,10 @@ program
       }
       if (options.preserveWorktree && !options.worktree) {
         console.error("Cannot use --preserve-worktree without --worktree.");
+        process.exit(1);
+      }
+      if (options.push) {
+        console.error("--push is disabled; gnhf never pushes user work.");
         process.exit(1);
       }
 
@@ -1082,8 +1083,6 @@ program
 
         if (options.preserveWorktree) {
           worktreePreservationReason = "requested";
-        } else if (wt.resumed) {
-          worktreePreservationReason = "resumed";
         }
 
         if (worktreePreservationReason !== null) {
@@ -1094,8 +1093,6 @@ program
         }
 
         if (wt.resumed) {
-          // Preserved worktree is always kept on exit regardless of this
-          // invocation's commit count; previous commits are already there.
           effectiveStopWhen = runInfo.stopWhen;
           effectiveCommitMessage = runInfo.commitMessage;
           schemaOptions = buildSchemaOptions(
@@ -1108,9 +1105,13 @@ program
             `\n  gnhf: resuming preserved worktree at ${worktreePath}` +
               `\n  gnhf: continuing run ${runInfo.runId} from iteration ${startIteration}\n`,
           );
-        } else if (!options.preserveWorktree) {
+        }
+
+        if (!options.preserveWorktree) {
           worktreeCleanup = () => {
             try {
+              runInfo = persistRunEvidence(runInfo, getRepoRootDir(cwd));
+              initDebugLog(runInfo.logPath);
               removeWorktree(cwd, wt.worktreePath);
             } catch {
               preserveWorktree("uncertain");
@@ -1333,7 +1334,6 @@ program
               }
             : {}),
           stopWhen: effectiveStopWhen,
-          ...(options.push ? { push: true } : {}),
           ...(options.worktree ? { preserveWorkspaceOnForceStop: true } : {}),
         },
       );
@@ -1455,6 +1455,27 @@ program
           });
         }
 
+        if (worktreePath) {
+          const preservationReason =
+            worktreePreservationReason ??
+            getWorktreePreservationReason(
+              runInfo.baseCommit,
+              worktreePath,
+              finalState.hasPendingWorkspaceRecovery === true,
+            );
+          if (preservationReason !== null) {
+            preserveWorktree(preservationReason);
+          } else {
+            const cleanedUp = worktreeCleanup?.() === true;
+            worktreeCleanup = null;
+            if (cleanedUp) {
+              appendDebugLog("worktree:cleaned-up", {
+                worktreePath,
+              });
+            }
+          }
+        }
+
         const exitSummary = renderExitSummary({
           agentName: redactAgentSpecForLogs(config.agent),
           branchName: finalBranchName,
@@ -1518,7 +1539,6 @@ program
           tokens_available: finalState.tokensAvailable !== false,
           duration_ms: Date.now() - runStartedAt,
           prevent_sleep: config.preventSleep === true,
-          push_each_iteration: options.push === true,
           commit_message_preset: effectiveCommitMessage?.preset ?? "default",
           stop_when_set: effectiveStopWhen !== undefined,
         });
@@ -1526,27 +1546,6 @@ program
 
         if (finalState.status === "aborted") {
           console.error(`\n  gnhf: Run log: ${runInfo.logPath}\n`);
-        }
-
-        if (worktreePath) {
-          const preservationReason =
-            worktreePreservationReason ??
-            getWorktreePreservationReason(
-              runInfo.baseCommit,
-              worktreePath,
-              finalState.hasPendingWorkspaceRecovery === true,
-            );
-          if (preservationReason !== null) {
-            preserveWorktree(preservationReason);
-          } else {
-            const cleanedUp = worktreeCleanup?.() === true;
-            worktreeCleanup = null;
-            if (cleanedUp) {
-              appendDebugLog("worktree:cleaned-up", {
-                worktreePath,
-              });
-            }
-          }
         }
 
         process.stdout.write(exitSummary);

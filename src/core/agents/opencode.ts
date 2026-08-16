@@ -463,7 +463,7 @@ export class OpenCodeAgent implements Agent {
       const server = await this.ensureServer(cwd, runController.signal);
       runServer = server;
       sessionId = await this.createSession(server, cwd, runController.signal);
-      const result = await this.streamMessage(
+      const streamedResult = await this.streamMessage(
         server,
         sessionId,
         buildPrompt(prompt, this.schema),
@@ -475,11 +475,14 @@ export class OpenCodeAgent implements Agent {
       appendDebugLog("opencode:run:end", {
         sessionId,
         elapsedMs: Date.now() - runStartedAt,
-        inputTokens: result.usage.inputTokens,
-        outputTokens: result.usage.outputTokens,
+        inputTokens: streamedResult.usage.inputTokens,
+        outputTokens: streamedResult.usage.outputTokens,
       });
-      runCompleted = true;
-      return result;
+      runCompleted = streamedResult.sawSessionIdle;
+      return {
+        output: streamedResult.output,
+        usage: streamedResult.usage,
+      };
     } catch (error) {
       if (runController.signal.aborted || isAbortError(error)) {
         appendDebugLog("opencode:run:aborted", {
@@ -783,7 +786,7 @@ export class OpenCodeAgent implements Agent {
     logStream: WriteStream | null,
     onUsage?: (usage: TokenUsage) => void,
     onMessage?: (text: string) => void,
-  ): Promise<AgentResult> {
+  ): Promise<AgentResult & { sawSessionIdle: boolean }> {
     const streamAbortController = new AbortController();
     const messageAbortController = new AbortController();
     const streamSignal = AbortSignal.any([
@@ -1281,6 +1284,7 @@ export class OpenCodeAgent implements Agent {
       return {
         output: structuredOutputFromSSE,
         usage,
+        sawSessionIdle,
       };
     }
 
@@ -1315,6 +1319,7 @@ export class OpenCodeAgent implements Agent {
       return {
         output,
         usage,
+        sawSessionIdle,
       };
     } catch (error) {
       appendDebugLog("opencode:output:parse-error", {

@@ -13,6 +13,7 @@ import { appendDebugLog, serializeError } from "../debug-log.js";
 import { redactAcpTargetForLogs } from "../config.js";
 import { parseAgentJson } from "./json-extract.js";
 import {
+  IncompleteAgentShutdownError,
   PermanentAgentError,
   validateAgentOutput,
   type Agent,
@@ -285,8 +286,13 @@ export class AcpAgent implements Agent {
         }
         flushPendingMessage();
       } catch (error) {
+        await Promise.allSettled([
+          Promise.resolve().then(() =>
+            turn.cancel({ reason: "gnhf-stream-ended" }),
+          ),
+          turn.result,
+        ]);
         if (signal?.aborted || isAbortError(error)) {
-          await turn.cancel({ reason: "gnhf-aborted" }).catch(() => undefined);
           appendDebugLog("acp:turn:aborted", {
             target: redactAcpTargetForLogs(this.target),
             requestId,
@@ -377,7 +383,7 @@ export class AcpAgent implements Agent {
       await this.closing;
       return;
     }
-    if (this.closed) return;
+    if (this.closed && this.runtime === null && this.handle === null) return;
     this.closing = this.shutdown();
     try {
       await this.closing;
@@ -392,10 +398,10 @@ export class AcpAgent implements Agent {
 
     const runtime = this.runtime;
     const handle = this.handle;
-    this.runtime = null;
-    this.handle = null;
     try {
       await runtime.close({ handle, reason: "gnhf-shutdown" });
+      this.runtime = null;
+      this.handle = null;
       appendDebugLog("acp:close", {
         target: redactAcpTargetForLogs(this.target),
       });
@@ -404,6 +410,10 @@ export class AcpAgent implements Agent {
         target: redactAcpTargetForLogs(this.target),
         error: serializeAcpErrorForLog(error, this.target),
       });
+      throw new IncompleteAgentShutdownError(
+        "Could not prove ACP runtime cleanup completed",
+        { cause: redactAcpErrorForThrow(error, this.target) },
+      );
     }
   }
 

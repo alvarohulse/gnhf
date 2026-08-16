@@ -235,13 +235,9 @@ describe("gnhf e2e", () => {
     expect(debugEvents).toContain("run:complete");
   }, 30_000);
 
-  it("runs on the current branch and pushes each successful iteration", async () => {
+  it("rejects push mode without changing the current branch", async () => {
     const cwd = createRepo();
     tempDirs.push(cwd);
-    const remote = mkdtempSync(join(tmpdir(), "gnhf-e2e-remote-"));
-    tempDirs.push(remote);
-    git(["init", "--bare"], remote);
-    git(["remote", "add", "origin", remote], cwd);
 
     const logDir = mkdtempSync(join(tmpdir(), "gnhf-e2e-logs-"));
     tempDirs.push(logDir);
@@ -263,16 +259,10 @@ describe("gnhf e2e", () => {
       },
     );
 
-    expect(result.code).toBe(0);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("gnhf never pushes user work");
     expect(git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)).toBe("main");
-    expect(git(["rev-list", "--count", "HEAD"], cwd)).toBe("2");
-    expect(git(["rev-parse", "HEAD"], cwd)).toBe(
-      git(["rev-parse", "refs/heads/main"], remote),
-    );
-
-    const debugLogPath = findRunLogPath(cwd);
-    const debugEvents = readJsonLines(debugLogPath).map((entry) => entry.event);
-    expect(debugEvents).toContain("git:push:success");
+    expect(git(["rev-list", "--count", "HEAD"], cwd)).toBe("1");
   }, 30_000);
 
   it("sends failed pre-commit hook output back to the agent for repair", async () => {
@@ -829,7 +819,13 @@ describe("gnhf e2e", () => {
 
       const child = spawn(
         process.execPath,
-        [distCliPath, "slow cleanup dirty", "--agent", "opencode", "--worktree"],
+        [
+          distCliPath,
+          "slow cleanup dirty",
+          "--agent",
+          "opencode",
+          "--worktree",
+        ],
         {
           cwd,
           env: createTestEnv(mockLogPath, tempDirs),

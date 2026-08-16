@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  cpSync,
   mkdirSync,
   writeFileSync,
   appendFileSync,
@@ -9,7 +10,7 @@ import {
   renameSync,
   rmSync,
 } from "node:fs";
-import { join, dirname, isAbsolute } from "node:path";
+import { join, dirname, isAbsolute, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import {
   buildAgentOutputSchema,
@@ -139,12 +140,28 @@ function resolveRunRuntimeLimits(
   if (!isRunRuntimeLimits(runtimeLimits)) {
     throw new Error(`Invalid runtime limits: ${runtimeLimitsPath}`);
   }
-  writeFileSync(
-    runtimeLimitsPath,
-    `${JSON.stringify(runtimeLimits, null, 2)}\n`,
-    { encoding: "utf-8", mode: 0o600 },
-  );
+  writeRunRuntimeLimits(runtimeLimitsPath, runtimeLimits);
   return runtimeLimits;
+}
+
+function writeRunRuntimeLimits(
+  runtimeLimitsPath: string,
+  runtimeLimits: RunRuntimeLimits,
+): void {
+  const temporaryPath = join(
+    dirname(runtimeLimitsPath),
+    `.${RUNTIME_LIMITS_FILENAME}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(
+      temporaryPath,
+      `${JSON.stringify(runtimeLimits, null, 2)}\n`,
+      { encoding: "utf-8", flag: "wx", mode: 0o600 },
+    );
+    renameSync(temporaryPath, runtimeLimitsPath);
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
 }
 
 function readRunRuntimeLimits(runtimeLimitsPath: string): RunRuntimeLimits {
@@ -440,6 +457,43 @@ export function resumeRun(
     commitMessage,
     runtimeLimitsPath,
     runtimeLimits,
+  };
+}
+
+export function persistRunEvidence(runInfo: RunInfo, cwd: string): RunInfo {
+  const persistedRunDir = join(cwd, ".gnhf", "runs", runInfo.runId);
+  if (resolve(persistedRunDir) === resolve(runInfo.runDir)) {
+    return runInfo;
+  }
+
+  mkdirSync(dirname(persistedRunDir), { recursive: true, mode: 0o700 });
+  const temporaryPath = join(
+    dirname(persistedRunDir),
+    `.${runInfo.runId}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    cpSync(runInfo.runDir, temporaryPath, {
+      recursive: true,
+      errorOnExist: true,
+      force: false,
+    });
+    rmSync(persistedRunDir, { recursive: true, force: true });
+    renameSync(temporaryPath, persistedRunDir);
+  } finally {
+    rmSync(temporaryPath, { recursive: true, force: true });
+  }
+
+  return {
+    ...runInfo,
+    runDir: persistedRunDir,
+    promptPath: join(persistedRunDir, "prompt.md"),
+    notesPath: join(persistedRunDir, "notes.md"),
+    schemaPath: join(persistedRunDir, "output-schema.json"),
+    logPath: join(persistedRunDir, LOG_FILENAME),
+    baseCommitPath: join(persistedRunDir, "base-commit"),
+    stopWhenPath: join(persistedRunDir, STOP_WHEN_FILENAME),
+    commitMessagePath: join(persistedRunDir, COMMIT_MESSAGE_FILENAME),
+    runtimeLimitsPath: join(persistedRunDir, RUNTIME_LIMITS_FILENAME),
   };
 }
 

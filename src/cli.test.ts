@@ -65,6 +65,7 @@ interface CliMockOverrides {
   ensureCleanWorkingTree?: ReturnType<typeof vi.fn>;
   createWorktree?: ReturnType<typeof vi.fn>;
   setupRun?: ReturnType<typeof vi.fn>;
+  persistRunEvidence?: ReturnType<typeof vi.fn>;
   removeWorktree?: ReturnType<typeof vi.fn>;
   listWorktreePaths?: ReturnType<typeof vi.fn>;
   worktreeExists?: ReturnType<typeof vi.fn>;
@@ -153,6 +154,8 @@ async function runCliWithMocks(
         ),
       }),
     );
+  const persistRunEvidence =
+    overrides.persistRunEvidence ?? vi.fn((runInfo: RunInfo) => runInfo);
   const peekRunBaseCommit =
     overrides.peekRunBaseCommit ?? vi.fn(() => stubRunInfo.baseCommit);
   const peekRunMetadata = overrides.peekRunMetadata ?? vi.fn(() => stubRunInfo);
@@ -238,6 +241,7 @@ async function runCliWithMocks(
   }));
   vi.doMock("./core/run.js", () => ({
     setupRun,
+    persistRunEvidence,
     peekRunBaseCommit,
     peekRunMetadata,
     resumeRun,
@@ -335,6 +339,7 @@ async function runCliWithMocks(
     loadConfig,
     createAgent,
     setupRun,
+    persistRunEvidence,
     peekRunBaseCommit,
     peekRunMetadata,
     resumeRun,
@@ -1272,23 +1277,29 @@ describe("cli", () => {
     ).rejects.toThrow("process.exit unexpectedly called with 1");
   });
 
-  it("passes push mode to the orchestrator when --push is set", async () => {
-    const { orchestratorCtor } = await runCliWithMocks(["ship it", "--push"], {
-      agent: "claude",
-      agentPathOverride: {},
-      agentArgsOverride: {},
-      acpRegistryOverrides: {},
-      maxConsecutiveFailures: 3,
-      preventSleep: false,
-    });
+  it("rejects --push without starting an agent", async () => {
+    const createAgent = vi.fn();
+    const consoleErrorSink: unknown[][] = [];
 
-    expect(orchestratorCtor).toHaveBeenCalledTimes(1);
-    expect(orchestratorCtor.mock.calls[0]?.[6]).toEqual({
-      maxIterations: undefined,
-      maxTokens: undefined,
-      stopWhen: undefined,
-      push: true,
-    });
+    await expect(
+      runCliWithMocks(
+        ["ship it", "--push"],
+        {
+          agent: "claude",
+          agentPathOverride: {},
+          agentArgsOverride: {},
+          acpRegistryOverrides: {},
+          maxConsecutiveFailures: 3,
+          preventSleep: false,
+        },
+        { consoleErrorSink, createAgent },
+      ),
+    ).rejects.toThrow("process.exit unexpectedly called with 1");
+
+    expect(createAgent).not.toHaveBeenCalled();
+    expect(consoleErrorSink.flat().join("\n")).toContain(
+      "gnhf never pushes user work",
+    );
   });
 
   it("passes meteor frequency to the renderer", async () => {
@@ -1571,9 +1582,15 @@ describe("cli", () => {
 
   it("publishes a terminal receipt after removing a clean worktree", async () => {
     const removeWorktree = vi.fn();
+    const persistRunEvidence = vi.fn((runInfo: RunInfo) => ({
+      ...runInfo,
+      runDir: `/repo/.gnhf/runs/${runInfo.runId}`,
+      notesPath: `/repo/.gnhf/runs/${runInfo.runId}/notes.md`,
+      logPath: `/repo/.gnhf/runs/${runInfo.runId}/gnhf.log`,
+    }));
     const writeConfiguredWorktreeReceipt = vi.fn(() => "receipt-1");
 
-    await runCliWithMocks(
+    const { stdoutWriteCalls } = await runCliWithMocks(
       ["ship it", "--worktree"],
       {
         agent: "claude",
@@ -1585,6 +1602,7 @@ describe("cli", () => {
       },
       {
         removeWorktree,
+        persistRunEvidence,
         setupRun: vi.fn((runId: string) => ({
           ...stubRunInfo,
           runId,
@@ -1595,6 +1613,13 @@ describe("cli", () => {
     );
 
     expect(removeWorktree).toHaveBeenCalledTimes(1);
+    expect(persistRunEvidence).toHaveBeenCalledTimes(1);
+    expect(persistRunEvidence.mock.invocationCallOrder[0]).toBeLessThan(
+      removeWorktree.mock.invocationCallOrder[0]!,
+    );
+    expect(stdoutWriteCalls.flat().join("")).toContain(
+      "/repo/.gnhf/runs/ship-it-",
+    );
     expect(writeConfiguredWorktreeReceipt).toHaveBeenLastCalledWith({
       runId: expect.stringMatching(/^ship-it-[0-9a-f]+$/),
       baseCommit: "a".repeat(40),
@@ -3490,6 +3515,54 @@ describe("cli", () => {
     expect(listWorktreePaths).toHaveBeenCalledTimes(1);
   });
 
+  it("records an occupied final collision path as preserved", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "gnhf-final-collision-"));
+    const repoRoot = join(tempDir, "repo");
+    const hash = createHash("sha256")
+      .update("ship it")
+      .digest("hex")
+      .slice(0, 6);
+    const finalRunId = `ship-it-${hash}-99`;
+    const finalWorktreePath = join(tempDir, "repo-gnhf-worktrees", finalRunId);
+    mkdirSync(finalWorktreePath, { recursive: true });
+    const writeConfiguredWorktreeReceipt = vi.fn(() => "receipt-1");
+
+    try {
+      await expect(
+        runCliWithMocks(
+          ["ship it", "--worktree"],
+          {
+            agent: "claude",
+            agentPathOverride: {},
+            agentArgsOverride: {},
+            acpRegistryOverrides: {},
+            maxConsecutiveFailures: 3,
+            preventSleep: false,
+          },
+          {
+            createWorktree: vi.fn(() => {
+              throw new Error("fatal: already exists");
+            }),
+            getRepoRootDir: vi.fn(() => repoRoot),
+            writeConfiguredWorktreeReceipt,
+          },
+        ),
+      ).rejects.toThrow("process.exit unexpectedly called with 1");
+
+      expect(writeConfiguredWorktreeReceipt).toHaveBeenLastCalledWith({
+        runId: finalRunId,
+        baseCommit: "abc123",
+        receiptId: "receipt-1",
+        state: "shutdown",
+        disposition: "preserved",
+        preservationReason: "uncertain",
+        worktreePath: finalWorktreePath,
+      });
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("records and reports a worktree when run metadata setup fails", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "gnhf-setup-failure-"));
     const repoRoot = join(tempDir, "repo");
@@ -3785,7 +3858,10 @@ describe("cli", () => {
       ...stubRunInfo,
       runId: suffixedRunId,
       runDir: join(suffixedWorktreePath, ".gnhf", "runs", suffixedRunId),
+      baseCommit: "a".repeat(40),
     }));
+    const removeWorktree = vi.fn();
+    const persistRunEvidence = vi.fn((runInfo: RunInfo) => runInfo);
 
     try {
       const { orchestratorCtor } = await runCliWithMocks(
@@ -3805,6 +3881,8 @@ describe("cli", () => {
             cwd === suffixedWorktreePath ? suffixedBranch : "main",
           ),
           listWorktreePaths: vi.fn(() => new Set([suffixedWorktreePath])),
+          persistRunEvidence,
+          removeWorktree,
           resumeRun,
         },
       );
@@ -3816,6 +3894,11 @@ describe("cli", () => {
       );
       expect(createWorktree).not.toHaveBeenCalled();
       expect(orchestratorCtor.mock.calls[0]?.[4]).toBe(suffixedWorktreePath);
+      expect(persistRunEvidence).toHaveBeenCalledTimes(1);
+      expect(removeWorktree).toHaveBeenCalledWith(
+        expect.any(String),
+        suffixedWorktreePath,
+      );
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

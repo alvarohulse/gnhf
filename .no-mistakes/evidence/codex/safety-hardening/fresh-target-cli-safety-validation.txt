@@ -16,7 +16,7 @@ CLI permanent summary:
   gnhf: worktree preserved at .../repo-gnhf-worktrees/live-receipt-check-258f20
 
 Published receipt:
-{"schemaVersion":1,"receiptId":"3afa3ce8-ec43-4853-8d88-9c8659d32066","runId":"live-receipt-check-258f20","state":"created","worktreePath":".../repo-gnhf-worktrees/live-receipt-check-258f20","baseCommit":"66c9b552415c3e3a0bf5d0688c4aa7d69fb87558"}
+{"schemaVersion":1,"receiptId": "<receipt-id>","runId":"live-receipt-check-258f20","state":"created","worktreePath":".../repo-gnhf-worktrees/live-receipt-check-258f20","baseCommit":"66c9b552415c3e3a0bf5d0688c4aa7d69fb87558"}
 Receipt mode: 600
 Original branch: main
 Preserved branch: gnhf/live-receipt-check-258f20
@@ -39,7 +39,7 @@ CLI permanent summary:
   gnhf: worktree preserved at .../repo-gnhf-worktrees/slow-cleanup-dirty-l-2c4d35
 
 Published receipt:
-{"schemaVersion":1,"receiptId":"4aa8d095-87fe-443c-bb67-38944cdfee7e","runId":"slow-cleanup-dirty-l-2c4d35","state":"created","worktreePath":".../repo-gnhf-worktrees/slow-cleanup-dirty-l-2c4d35","baseCommit":"66c9b552415c3e3a0bf5d0688c4aa7d69fb87558"}
+{"schemaVersion":1,"receiptId": "<receipt-id>","runId":"slow-cleanup-dirty-l-2c4d35","state":"created","worktreePath":".../repo-gnhf-worktrees/slow-cleanup-dirty-l-2c4d35","baseCommit":"66c9b552415c3e3a0bf5d0688c4aa7d69fb87558"}
 Preserved Git status: M README.md
 Preserved marker: - mock change 1786864493030
 Managed opencode server alive after shutdown: false

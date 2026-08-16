@@ -13,8 +13,8 @@ Exit code: 130
   branch diff     0 commits     +0           -0
   files           0 added       0 updated    0 deleted
 
-  notes           /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-forced-shutdown.9H4CYA/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1/.gnhf/runs/slow-cleanup-dirty-e-8a8aa1/notes.md
-  debug log       /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-forced-shutdown.9H4CYA/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1/.gnhf/runs/slow-cleanup-dirty-e-8a8aa1/gnhf.log
+  notes           <fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1/.gnhf/runs/slow-cleanup-dirty-e-8a8aa1/notes.md
+  debug log       <fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1/.gnhf/runs/slow-cleanup-dirty-e-8a8aa1/gnhf.log
 
   next steps      git log --oneline 9e79686de8ab..HEAD
                   git diff --stat 9e79686de8ab..HEAD
@@ -24,16 +24,16 @@ Exit code: 130
   to review?      https://github.com/kunchenguid/no-mistakes
 --- CLI stderr ---
 
-  gnhf: worktree preserved at /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-forced-shutdown.9H4CYA/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1
-  gnhf: merge the branch and remove with: git worktree remove "/home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-forced-shutdown.9H4CYA/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1"
+  gnhf: worktree preserved at <fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1
+  gnhf: merge the branch and remove with: git worktree remove "<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1"
 
 --- Published worktree receipt ---
 {
   "schemaVersion": 1,
-  "receiptId": "715a7edd-5bde-4d57-9421-92547a0cb980",
+  "receiptId": "<receipt-id>",
   "runId": "slow-cleanup-dirty-e-8a8aa1",
   "state": "created",
-  "worktreePath": "/home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-forced-shutdown.9H4CYA/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1",
+  "worktreePath": "<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1",
   "baseCommit": "9e79686de8abb9e80ad882a485aac22721b5cf0d"
 }
 --- Preserved Git state ---
@@ -45,12 +45,12 @@ preserved status:
 preserved README marker:
 - mock change 1786861000297
 --- Process ownership check ---
-managed opencode server pid 2369491 alive after shutdown: no
-unrelated sibling pid 2369458 alive after shutdown: yes
+managed opencode server pid <pid> alive after shutdown: no
+unrelated sibling pid <pid> alive after shutdown: yes
 --- Relevant lifecycle events ---
-{"timestamp":"2026-08-16T06:16:40.319Z","pid":2369459,"event":"signal:SIGINT"}
-{"timestamp":"2026-08-16T06:16:40.372Z","pid":2369459,"event":"signal:SIGINT"}
-{"timestamp":"2026-08-16T06:16:40.393Z","pid":2369459,"event":"run:complete","signal":"SIGINT","status":"stopped","iterations":1,"successCount":0,"failCount":0,"totalInputTokens":null,"totalOutputTokens":null,"tokensAvailable":false,"reportedCostUsd":null,"commitCount":0,"worktreePath":"/home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-forced-shutdown.9H4CYA/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1"}
-{"timestamp":"2026-08-16T06:16:40.398Z","pid":2369459,"event":"worktree:preserved","worktreePath":"/home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-forced-shutdown.9H4CYA/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1","reason":"dirty"}
-{"timestamp":"2026-08-16T06:16:40.297Z","pid":2369491,"event":"workspace:changed","sessionId":"session-1","marker":"- mock change 1786861000297"}
-{"timestamp":"2026-08-16T06:16:40.375Z","pid":2369491,"event":"server:shutdown","reason":"SIGTERM"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"signal:SIGINT"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"signal:SIGINT"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"run:complete","signal":"SIGINT","status":"stopped","iterations":1,"successCount":0,"failCount":0,"totalInputTokens":null,"totalOutputTokens":null,"tokensAvailable":false,"reportedCostUsd":null,"commitCount":0,"worktreePath":"<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"worktree:preserved","worktreePath":"<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1","reason":"dirty"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"workspace:changed","sessionId":"session-1","marker":"- mock change 1786861000297"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"server:shutdown","reason":"SIGTERM"}

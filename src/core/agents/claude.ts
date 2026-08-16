@@ -378,19 +378,20 @@ export class ClaudeAgent implements Agent {
         this.shutdowns.start(() =>
           shutdownClaudeProcess(child, this.platform, this.detached),
         );
+      const rejectCleanupFailure = (error: unknown) => {
+        reject(
+          error instanceof Error
+            ? error
+            : new Error(`Claude process cleanup failed: ${String(error)}`),
+        );
+      };
       const rejectAfterShutdown = (error: Error) => {
         void (async () => {
           try {
             await shutdownRun();
             reject(error);
           } catch (cleanupError) {
-            reject(
-              cleanupError instanceof Error
-                ? cleanupError
-                : new Error(
-                    `Claude process cleanup failed: ${String(cleanupError)}`,
-                  ),
-            );
+            rejectCleanupFailure(cleanupError);
           }
         })();
       };
@@ -558,9 +559,7 @@ export class ClaudeAgent implements Agent {
             }
             finalResultCleanupTimer = setTimeout(() => {
               closedAfterFinalCleanup = true;
-              void this.shutdowns.start(() =>
-                shutdownClaudeProcess(child, this.platform, this.detached),
-              );
+              void shutdownRun().catch(rejectCleanupFailure);
             }, this.finalResultGraceMs);
           } else if (
             !finalStructuredResultEvent &&
