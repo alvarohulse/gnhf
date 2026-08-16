@@ -57,6 +57,15 @@ describe("getWorktreePreservationReason", () => {
     );
   });
 
+  it("preserves a clean worktree after forced shutdown", () => {
+    const cwd = createRepo();
+    const baseCommit = git(cwd, ["rev-parse", "HEAD"]);
+
+    expect(getWorktreePreservationReason(baseCommit, cwd, false, true)).toBe(
+      "forced-shutdown",
+    );
+  });
+
   it("preserves when Git cannot inspect the run base", () => {
     const cwd = createRepo();
 

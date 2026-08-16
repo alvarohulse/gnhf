@@ -716,6 +716,57 @@ describe("persistRunEvidence", () => {
       logPath: join(persistedRunDir, "gnhf.log"),
     });
   });
+
+  it("refuses removal when another run has local evidence", () => {
+    const runDir = "/worktree/.gnhf/runs/run-abc";
+    mockReaddirSync.mockImplementation(
+      (path) =>
+        (path === dirname(runDir)
+          ? ["run-abc", "other-run"]
+          : []) as unknown as ReturnType<typeof readdirSync>,
+    );
+
+    expect(() => persistRunEvidence(createRunInfo(runDir), "/repo")).toThrow(
+      "Additional run evidence remains in worktree",
+    );
+    expect(mockCpSync).not.toHaveBeenCalled();
+  });
+
+  it("refuses removal when setup-failure evidence remains", () => {
+    const runDir = "/worktree/.gnhf/runs/run-abc";
+    const setupFailuresDir = join(dirname(dirname(runDir)), "setup-failures");
+    mockExistsSync.mockImplementation((path) => path === setupFailuresDir);
+    mockReaddirSync.mockImplementation(
+      (path) =>
+        (path === setupFailuresDir
+          ? ["other-run.json"]
+          : []) as unknown as ReturnType<typeof readdirSync>,
+    );
+
+    expect(() => persistRunEvidence(createRunInfo(runDir), "/repo")).toThrow(
+      "Setup failure evidence remains in worktree",
+    );
+    expect(mockCpSync).not.toHaveBeenCalled();
+  });
+
+  function createRunInfo(runDir: string) {
+    return {
+      runId: "run-abc",
+      runDir,
+      promptPath: join(runDir, "prompt.md"),
+      notesPath: join(runDir, "notes.md"),
+      schemaPath: join(runDir, "output-schema.json"),
+      logPath: join(runDir, "gnhf.log"),
+      baseCommit: "abc123",
+      baseCommitPath: join(runDir, "base-commit"),
+      stopWhenPath: join(runDir, "stop-when"),
+      stopWhen: undefined,
+      commitMessagePath: join(runDir, "commit-message"),
+      commitMessage: undefined,
+      runtimeLimitsPath: join(runDir, "runtime-limits.json"),
+      runtimeLimits: {},
+    };
+  }
 });
 
 describe("peekRunMetadata", () => {
