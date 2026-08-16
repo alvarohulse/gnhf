@@ -678,6 +678,6 @@ export class ClaudeAgent implements Agent {
         shutdownClaudeProcess(activeChild, this.platform, this.detached),
       );
     }
-    await this.shutdowns.waitForAll();
+    await this.shutdowns.finalize();
   }
 }

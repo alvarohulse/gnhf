@@ -549,6 +549,6 @@ export class CursorAgent implements Agent {
         shutdownCursorProcess(activeChild, this.platform, this.detached),
       );
     }
-    await this.shutdowns.waitForAll();
+    await this.shutdowns.finalize();
   }
 }

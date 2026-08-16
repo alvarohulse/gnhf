@@ -338,6 +338,6 @@ export class CopilotAgent implements Agent {
         shutdownCopilotProcess(activeChild, this.platform, this.detached),
       );
     }
-    await this.shutdowns.waitForAll();
+    await this.shutdowns.finalize();
   }
 }

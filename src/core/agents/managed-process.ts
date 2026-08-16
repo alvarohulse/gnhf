@@ -5,7 +5,10 @@ import {
 } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { appendDebugLog, serializeError } from "../debug-log.js";
-import { IncompleteAgentShutdownError } from "./types.js";
+import {
+  IncompleteAgentShutdownError,
+  UnverifiedAgentCleanupError,
+} from "./types.js";
 
 interface SignalChildProcessOptions {
   detached: boolean;
@@ -151,6 +154,13 @@ export function spawnManagedChildProcess(
   const startManagedShutdown = (
     unverifiedReason?: "target-close" | "target-error",
   ) => {
+    if (unverifiedReason !== undefined) {
+      shutdownTracker?.recordUnverifiedCleanup(
+        new UnverifiedAgentCleanupError(
+          `Could not verify descendant process cleanup${managed.pid === undefined ? "" : ` for PID ${managed.pid}`} after ${unverifiedReason}`,
+        ),
+      );
+    }
     const startShutdown = () =>
       platform === "win32"
         ? shutdownWindowsProcessTree(managed as unknown as ChildProcess, {
@@ -239,6 +249,7 @@ export function spawnManagedChildProcess(
 export class ChildProcessShutdownTracker {
   private pending = new Set<Promise<void>>();
   private failure: unknown = null;
+  private unverifiedCleanup: UnverifiedAgentCleanupError | null = null;
 
   start(startShutdown: () => Promise<void>): Promise<void> {
     let shutdown: Promise<void>;
@@ -272,6 +283,17 @@ export class ChildProcessShutdownTracker {
   acknowledgeFailure(error: unknown): void {
     if (this.failure === error) {
       this.failure = null;
+    }
+  }
+
+  recordUnverifiedCleanup(error: UnverifiedAgentCleanupError): void {
+    this.unverifiedCleanup ??= error;
+  }
+
+  async finalize(): Promise<void> {
+    await this.waitForAll();
+    if (this.unverifiedCleanup !== null) {
+      throw this.unverifiedCleanup;
     }
   }
 

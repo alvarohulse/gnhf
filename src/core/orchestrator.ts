@@ -5,6 +5,7 @@ import {
   hasCompleteTokenUsage,
   IncompleteAgentShutdownError,
   PermanentAgentError,
+  UnverifiedAgentCleanupError,
   type Agent,
   type AgentOutput,
   type TokenUsage,
@@ -1241,6 +1242,10 @@ ${recovery.detail}
             error: serializeError(err),
           });
           if (err instanceof IncompleteAgentShutdownError) {
+            if (err instanceof UnverifiedAgentCleanupError) {
+              this.preserveWorkspaceAfterUnsafeShutdown(err, false);
+              return;
+            }
             this.preserveWorkspaceAfterUnsafeShutdown(err);
             throw err;
           }
@@ -1252,6 +1257,7 @@ ${recovery.detail}
 
   private preserveWorkspaceAfterUnsafeShutdown(
     error: IncompleteAgentShutdownError,
+    surfaceAsAgentError = true,
   ): void {
     this.unsafeShutdownDetected = true;
     if (this.pendingWorkspaceRecovery === null) {
@@ -1262,7 +1268,9 @@ ${recovery.detail}
       writeWorkspaceRecovery(this.runInfo, this.pendingWorkspaceRecovery);
     }
     this.activeWorkspaceRecoveryMarker = false;
-    this.state.lastAgentError = error.message;
+    if (surfaceAsAgentError) {
+      this.state.lastAgentError = error.message;
+    }
   }
 
   private emitStopped(): void {

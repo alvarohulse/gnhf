@@ -536,7 +536,7 @@ export class OpenCodeAgent implements Agent {
 
   async close(): Promise<void> {
     await this.shutdownServer();
-    await this.shutdowns.waitForAll();
+    await this.shutdowns.finalize();
   }
 
   private async ensureServer(

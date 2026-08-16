@@ -510,6 +510,6 @@ export class PiAgent implements Agent {
         shutdownPiProcess(activeChild, this.platform, this.detached),
       );
     }
-    await this.shutdowns.waitForAll();
+    await this.shutdowns.finalize();
   }
 }

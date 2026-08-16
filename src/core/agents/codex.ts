@@ -265,6 +265,6 @@ export class CodexAgent implements Agent {
         shutdownCodexProcess(activeChild, this.platform, this.detached),
       );
     }
-    await this.shutdowns.waitForAll();
+    await this.shutdowns.finalize();
   }
 }

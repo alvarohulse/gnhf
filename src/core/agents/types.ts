@@ -199,6 +199,13 @@ export class IncompleteAgentShutdownError extends Error {
   }
 }
 
+export class UnverifiedAgentCleanupError extends IncompleteAgentShutdownError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "UnverifiedAgentCleanupError";
+  }
+}
+
 export type OnUsage = (usage: TokenUsage) => void;
 
 export type OnMessage = (text: string) => void;
