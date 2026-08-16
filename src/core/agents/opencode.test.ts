@@ -1563,7 +1563,19 @@ describe("OpenCodeAgent", () => {
     vi.useFakeTimers();
     const proc = createMockProcess();
     Object.defineProperty(proc, "pid", { value: 5678 });
-    const killProcess = vi.fn(() => true as const);
+    let groupPresent = true;
+    const killProcess = vi.fn(
+      (_pid: number, signal: number | NodeJS.Signals) => {
+        if (signal !== 0 || groupPresent) {
+          return true as const;
+        }
+        const error = new Error(
+          "process group is absent",
+        ) as NodeJS.ErrnoException;
+        error.code = "ESRCH";
+        throw error;
+      },
+    );
     mockSpawn.mockReturnValue(proc);
     const detachedAgent = new OpenCodeAgent({
       fetch: fetchMock as typeof fetch,
@@ -1587,6 +1599,9 @@ describe("OpenCodeAgent", () => {
     await rejection;
     expect(killProcess).toHaveBeenCalledWith(-5678, 0);
     expect(killProcess).not.toHaveBeenCalledWith(-5678, "SIGKILL");
+    groupPresent = false;
+    await expect(detachedAgent.close()).resolves.toBeUndefined();
+    expect(detachedAgent["server"]).toBeNull();
     vi.useRealTimers();
   });
 

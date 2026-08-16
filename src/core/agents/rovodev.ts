@@ -850,8 +850,21 @@ export class RovoDevAgent implements Agent {
       return;
     }
 
-    if (this.server.closed) {
-      await this.shutdowns.waitForAll();
+    const server = this.server;
+    if (server.closed) {
+      try {
+        await this.shutdowns.finalizeOwnedProcessGroup(
+          server.child,
+          server.detached,
+          () => this.shutdownServerProcess(server),
+        );
+      } catch (error) {
+        this.shutdowns.acknowledgeFailure(error);
+        throw error;
+      }
+      if (this.server === server) {
+        this.server = null;
+      }
       return;
     }
 
@@ -860,7 +873,6 @@ export class RovoDevAgent implements Agent {
       return;
     }
 
-    const server = this.server;
     const shutdownStartedAt = Date.now();
     appendDebugLog("rovodev:shutdown", {
       cwd: server.cwd,

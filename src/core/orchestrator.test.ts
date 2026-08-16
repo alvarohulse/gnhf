@@ -582,6 +582,71 @@ describe("Orchestrator stop limits", () => {
     });
   });
 
+  it("persists monotonic live usage lower bounds after provider failure", async () => {
+    const agent: Agent = {
+      name: "opencode",
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.({
+          inputTokens: 4,
+          outputTokens: 2,
+          cacheReadTokens: 3,
+          cacheCreationTokens: 1,
+          totalTokens: 12,
+          reportedCostUsd: 0.4,
+          tokensAvailable: true,
+        });
+        options?.onUsage?.({
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: false,
+        });
+        throw new Error("provider overloaded");
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      { ...config, maxConsecutiveFailures: 1 },
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+    );
+
+    await orchestrator.start();
+
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(runInfo, {
+      generation: 1,
+      phase: "in-progress",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    expect(mockWriteRunUsageState).toHaveBeenLastCalledWith(runInfo, {
+      generation: 1,
+      phase: "terminal",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      tokensUnavailable: true,
+      reportedCostUnavailable: true,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      reportedCostUsd: null,
+      tokensAvailable: false,
+    });
+  });
+
   it("aborts after completing the configured number of iterations", async () => {
     const agent: Agent = {
       name: "claude",
@@ -1871,7 +1936,7 @@ describe("Orchestrator stop limits", () => {
     await startPromise;
   });
 
-  it("does not promote a late successful result or live usage after forced stop", async () => {
+  it("does not promote a late successful result after forced stop", async () => {
     vi.useFakeTimers();
 
     let resolveRun!: (result: AgentResult) => void;
@@ -1925,10 +1990,49 @@ describe("Orchestrator stop limits", () => {
       reportedCostUsd: null,
       status: "stopped",
       tokensAvailable: false,
-      totalInputTokens: 0,
-      totalOutputTokens: 0,
+      totalInputTokens: 9,
+      totalOutputTokens: 5,
     });
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves the workspace when forced stop reveals incomplete cleanup", async () => {
+    const cleanupError = new IncompleteChildProcessShutdownError(1234);
+    const agent: Agent = {
+      name: "opencode",
+      run: vi.fn(
+        (_prompt, _cwd, options) =>
+          new Promise<AgentResult>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              reject(cleanupError);
+            });
+          }),
+      ),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+    );
+    const startPromise = orchestrator.start();
+
+    await vi.waitFor(() => {
+      expect(agent.run).toHaveBeenCalledTimes(1);
+    });
+    orchestrator.stop();
+    await startPromise;
+
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      hasPendingWorkspaceRecovery: true,
+      lastAgentError: cleanupError.message,
+    });
   });
 
   it("resets pending commit failure state after a default force stop", async () => {
@@ -2341,6 +2445,48 @@ describe("Orchestrator backoff behavior", () => {
       status: "aborted",
       hasPendingWorkspaceRecovery: true,
       lastAgentError: cleanupError.message,
+    });
+  });
+
+  it("prioritizes incomplete cleanup over a pending runtime cap", async () => {
+    const cleanupError = new IncompleteChildProcessShutdownError(1234);
+    const agent: Agent = {
+      name: "opencode",
+      run: vi.fn(
+        (_prompt, _cwd, options) =>
+          new Promise<AgentResult>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              reject(cleanupError);
+            });
+            options?.onUsage?.({
+              inputTokens: 11,
+              outputTokens: 0,
+              cacheReadTokens: 0,
+              cacheCreationTokens: 0,
+              tokensAvailable: true,
+            });
+          }),
+      ),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxTokens: 10 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(abort).toHaveBeenCalledWith(cleanupError.message);
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
     });
   });
 
