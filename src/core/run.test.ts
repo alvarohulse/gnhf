@@ -42,6 +42,7 @@ import {
   resumeRun,
   peekRunMetadata,
   persistRunEvidence,
+  readWorkspaceRecovery,
   readRunUsageState,
   toStringArray,
   writeRunUsageState,
@@ -823,6 +824,41 @@ describe("peekRunMetadata", () => {
       "Run directory not found",
     );
     expect(mockWriteFileSync).not.toHaveBeenCalled();
+  });
+});
+
+describe("workspace recovery", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockExistsSync.mockReturnValue(true);
+  });
+
+  it("restores persisted cleanup uncertainty", () => {
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({
+        kind: "interrupted",
+        detail: "descendant cleanup was not verified",
+        cleanupUncertain: true,
+      }),
+    );
+
+    expect(readWorkspaceRecovery({ runDir: "/run" })).toEqual({
+      kind: "interrupted",
+      detail: "descendant cleanup was not verified",
+      cleanupUncertain: true,
+    });
+  });
+
+  it("treats legacy recovery markers as cleanup-uncertain", () => {
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ kind: "interrupted", detail: "legacy recovery" }),
+    );
+
+    expect(readWorkspaceRecovery({ runDir: "/run" })).toEqual({
+      kind: "interrupted",
+      detail: "legacy recovery",
+      cleanupUncertain: true,
+    });
   });
 });
 

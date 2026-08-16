@@ -2304,6 +2304,7 @@ describe("Orchestrator stop limits", () => {
     expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
       kind: "interrupted",
       detail: cleanupError.message,
+      cleanupUncertain: true,
     });
     expect(orchestrator.getState()).toMatchObject({
       hasPendingWorkspaceRecovery: true,
@@ -2359,6 +2360,7 @@ describe("Orchestrator stop limits", () => {
     expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
       kind: "commit-failure",
       detail: expect.stringContaining("hook failed"),
+      cleanupUncertain: false,
     });
   });
 
@@ -2410,6 +2412,7 @@ describe("Orchestrator stop limits", () => {
     expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
       kind: "commit-failure",
       detail: expect.stringContaining("hook failed"),
+      cleanupUncertain: false,
     });
   });
 
@@ -2417,6 +2420,7 @@ describe("Orchestrator stop limits", () => {
     mockReadWorkspaceRecovery.mockReturnValueOnce({
       kind: "interrupted",
       detail: "previous invocation stopped",
+      cleanupUncertain: false,
     });
     const agent: Agent = {
       name: "claude",
@@ -2440,6 +2444,33 @@ describe("Orchestrator stop limits", () => {
       expect.any(Object),
     );
     expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockClearWorkspaceRecovery).not.toHaveBeenCalled();
+    expect(orchestrator.getState().hasPendingWorkspaceRecovery).toBe(true);
+  });
+
+  it("retains cleanup uncertainty after a successful resumed iteration", async () => {
+    mockReadWorkspaceRecovery.mockReturnValueOnce({
+      kind: "interrupted",
+      detail: "descendant cleanup was not verified",
+      cleanupUncertain: true,
+    });
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn().mockResolvedValueOnce(createSuccessResult()),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
     expect(mockClearWorkspaceRecovery).not.toHaveBeenCalled();
     expect(orchestrator.getState().hasPendingWorkspaceRecovery).toBe(true);
   });
@@ -2720,6 +2751,7 @@ describe("Orchestrator backoff behavior", () => {
     expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
       kind: "interrupted",
       detail: cleanupError.message,
+      cleanupUncertain: true,
     });
     expect(orchestrator.getState()).toMatchObject({
       status: "aborted",
@@ -2753,6 +2785,7 @@ describe("Orchestrator backoff behavior", () => {
     expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
       kind: "interrupted",
       detail: cleanupError.message,
+      cleanupUncertain: true,
     });
     expect(orchestrator.getState()).toMatchObject({
       successCount: 1,
@@ -2795,6 +2828,7 @@ describe("Orchestrator backoff behavior", () => {
     expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
       kind: "interrupted",
       detail: cleanupError.message,
+      cleanupUncertain: true,
     });
     expect(orchestrator.getState()).toMatchObject({
       failCount: 1,
@@ -2849,6 +2883,7 @@ describe("Orchestrator backoff behavior", () => {
     expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
       kind: "interrupted",
       detail: cleanupError.message,
+      cleanupUncertain: true,
     });
   });
 
@@ -2878,6 +2913,7 @@ describe("Orchestrator backoff behavior", () => {
     expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
       kind: "interrupted",
       detail: cleanupError.message,
+      cleanupUncertain: true,
     });
     expect(orchestrator.getState()).toMatchObject({
       failCount: 1,
@@ -2926,6 +2962,7 @@ describe("Orchestrator backoff behavior", () => {
     expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
       kind: "interrupted",
       detail: cleanupError.message,
+      cleanupUncertain: true,
     });
   });
 
