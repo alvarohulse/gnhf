@@ -1,0 +1,193 @@
+Target: a82508eae77a2844be1234d14bac5227f6f61c65
+
+Built CLI: dist/cli.mjs
+
+Environment: disposable in-worktree Git repositories and local agent fixtures; telemetry disabled; no install, deployment, network agent, push, or canary
+
+=== Forced dirty shutdown preserves work and exact process ownership ===
+Command: gnhf "slow cleanup dirty current validation" --agent opencode --prevent-sleep off --worktree, then two SIGINT signals
+Exit code: 130
+
+CLI permanent summary:
+  ╭──────────────────────────────────────────────────────────────╮
+  │ ✦ gnhf wrapped                                               │
+  │   opencode worked for 0s on gnhf/slow-cleanup-dirty-c-917094 │
+  ╰──────────────────────────────────────────────────────────────╯
+  
+    iterations      1 total       0 good       0 failed
+    tokens          unavailable                
+    branch diff     0 commits     +0           -0
+    files           0 added       0 updated    0 deleted
+  
+    notes           <fixture>/forced-shutdown/repo-gnhf-worktrees/slow-cleanup-dirty-c-917094/.gnhf/runs/slow-cleanup-dirty-c-917094/notes.md
+    debug log       <fixture>/forced-shutdown/repo-gnhf-worktrees/slow-cleanup-dirty-c-917094/.gnhf/runs/slow-cleanup-dirty-c-917094/gnhf.log
+  
+    next steps      git log --oneline 000bda43c601..HEAD
+                    git diff --stat 000bda43c601..HEAD
+                    gh pr create
+  
+    too much        git push no-mistakes:
+    to review?      https://github.com/kunchenguid/no-mistakes
+CLI stderr:
+  gnhf: worktree preserved at <fixture>/forced-shutdown/repo-gnhf-worktrees/slow-cleanup-dirty-c-917094
+    gnhf: merge the branch and remove with: git worktree remove "<fixture>/forced-shutdown/repo-gnhf-worktrees/slow-cleanup-dirty-c-917094"
+
+Terminal worktree receipt:
+{
+  "schemaVersion": 1,
+  "receiptId": "<receipt-id>",
+  "runId": "slow-cleanup-dirty-c-917094",
+  "state": "shutdown",
+  "worktreePath": "<fixture>/forced-shutdown/repo-gnhf-worktrees/slow-cleanup-dirty-c-917094",
+  "baseCommit": "000bda43c601d77aa4be5b17bd508b0a5c391df6",
+  "disposition": "preserved",
+  "preservationReason": "pending-recovery"
+}
+Receipt mode: 600
+Original branch: main
+Original commit count: 1
+Preserved status: M README.md
+Preserved marker: - mock change <marker>
+Managed OpenCode process alive after shutdown: false
+Unrelated sibling alive after shutdown: true
+Lifecycle receipts:
+{"event":"signal:SIGINT"}
+{"event":"signal:SIGINT"}
+{"event":"worktree:preserved","worktreePath":"<fixture>/forced-shutdown/repo-gnhf-worktrees/slow-cleanup-dirty-c-917094","reason":"pending-recovery"}
+{"event":"run:complete","signal":"SIGINT","status":"stopped","iterations":1,"successCount":0,"failCount":0,"totalInputTokens":null,"totalOutputTokens":null,"tokensAvailable":false,"reportedCostUsd":null,"commitCount":0,"worktreePath":"<fixture>/forced-shutdown/repo-gnhf-worktrees/slow-cleanup-dirty-c-917094"}
+
+=== Persisted token lower bound stops resume before agent launch ===
+Initial command: gnhf "persisted token lower bound evidence" --agent cursor --current-branch --prevent-sleep off --max-iterations 1 --max-tokens 100
+Resume command: gnhf "persisted token lower bound evidence" --agent cursor --current-branch --prevent-sleep off --clear-max-iterations --max-tokens 19
+Initial exit code: 0
+Resume exit code: 0
+
+Initial CLI summary:
+  ╭────────────────────────────────────────────────────────────╮
+  │ × gnhf stopped                                             │
+  │   cursor ran for 0s before: max iterations reached (1)     │
+  ╰────────────────────────────────────────────────────────────╯
+  
+    iterations      1 total       1 good       0 failed
+    tokens          12 in         8 out        
+    branch diff     1 commit      +1           -0
+    files           1 added       0 updated    0 deleted
+  
+    notes           <fixture>/tokens-resume/repo/.gnhf/runs/persisted-token-lowe-2003a0/notes.md
+    debug log       <fixture>/tokens-resume/repo/.gnhf/runs/persisted-token-lowe-2003a0/gnhf.log
+  
+    next steps      git log --oneline e7340c06bef4..HEAD
+                    git diff --stat e7340c06bef4..HEAD
+                    gh pr create
+  
+    too much        git push no-mistakes:
+    to review?      https://github.com/kunchenguid/no-mistakes
+Resume CLI summary:
+  ╭────────────────────────────────────────────────────────────╮
+  │ × gnhf stopped                                             │
+  │   cursor ran for 0s before: max tokens reached (20/19)     │
+  ╰────────────────────────────────────────────────────────────╯
+  
+    iterations      1 total       0 good       0 failed
+    tokens          12 in         8 out        
+    branch diff     1 commit      +1           -0
+    files           1 added       0 updated    0 deleted
+  
+    notes           <fixture>/tokens-resume/repo/.gnhf/runs/persisted-token-lowe-2003a0/notes.md
+    debug log       <fixture>/tokens-resume/repo/.gnhf/runs/persisted-token-lowe-2003a0/gnhf.log
+  
+    next steps      git log --oneline e7340c06bef4..HEAD
+                    git diff --stat e7340c06bef4..HEAD
+                    gh pr create
+  
+    too much        git push no-mistakes:
+    to review?      https://github.com/kunchenguid/no-mistakes
+Cursor invocations before resume: 1
+Cursor invocations after resume: 1
+Fixture commit count: 2
+Working tree status: clean
+Persisted runtime limits:
+{
+  "maxTokens": 19
+}
+Persisted usage receipt:
+{
+  "generation": 1,
+  "phase": "terminal",
+  "totalInputTokens": 12,
+  "totalOutputTokens": 8,
+  "totalTokens": 20,
+  "reportedCostUsd": null,
+  "tokensUnavailable": false,
+  "reportedCostUnavailable": true,
+  "tokensEstimated": false,
+  "hasAuthoritativeTokenReceipt": true
+}
+
+=== Persisted harness-reported cost lower bound stops resume before agent launch ===
+Initial command: gnhf "persisted cost lower bound evidence" --agent cursor --current-branch --prevent-sleep off --max-iterations 1 --max-reported-cost-usd 1
+Resume command: gnhf "persisted cost lower bound evidence" --agent cursor --current-branch --prevent-sleep off --clear-max-iterations --max-reported-cost-usd 0.3
+Initial exit code: 0
+Resume exit code: 0
+
+Initial CLI summary:
+  ╭────────────────────────────────────────────────────────────╮
+  │ × gnhf stopped                                             │
+  │   cursor ran for 0s before: max iterations reached (1)     │
+  ╰────────────────────────────────────────────────────────────╯
+  
+    iterations      1 total       1 good       0 failed
+    tokens          7 in          4 out        
+    branch diff     1 commit      +1           -0
+    files           1 added       0 updated    0 deleted
+  
+    notes           <fixture>/cost-resume/repo/.gnhf/runs/persisted-cost-lower-57b88c/notes.md
+    debug log       <fixture>/cost-resume/repo/.gnhf/runs/persisted-cost-lower-57b88c/gnhf.log
+  
+    next steps      git log --oneline e7340c06bef4..HEAD
+                    git diff --stat e7340c06bef4..HEAD
+                    gh pr create
+  
+    too much        git push no-mistakes:
+    to review?      https://github.com/kunchenguid/no-mistakes
+Resume CLI summary:
+  ╭─────────────────────────────────────────────────────────────────────╮
+  │ × gnhf stopped                                                      │
+  │   cursor ran for 0s before: max reported cost reached ($0.40/$0.30) │
+  ╰─────────────────────────────────────────────────────────────────────╯
+  
+    iterations      1 total       0 good       0 failed
+    tokens          7 in          4 out        
+    branch diff     1 commit      +1           -0
+    files           1 added       0 updated    0 deleted
+  
+    notes           <fixture>/cost-resume/repo/.gnhf/runs/persisted-cost-lower-57b88c/notes.md
+    debug log       <fixture>/cost-resume/repo/.gnhf/runs/persisted-cost-lower-57b88c/gnhf.log
+  
+    next steps      git log --oneline e7340c06bef4..HEAD
+                    git diff --stat e7340c06bef4..HEAD
+                    gh pr create
+  
+    too much        git push no-mistakes:
+    to review?      https://github.com/kunchenguid/no-mistakes
+Cursor invocations before resume: 1
+Cursor invocations after resume: 1
+Fixture commit count: 2
+Working tree status: clean
+Persisted runtime limits:
+{
+  "maxReportedCostUsd": 0.3
+}
+Persisted usage receipt:
+{
+  "generation": 1,
+  "phase": "terminal",
+  "totalInputTokens": 7,
+  "totalOutputTokens": 4,
+  "totalTokens": 14,
+  "reportedCostUsd": 0.4,
+  "tokensUnavailable": false,
+  "reportedCostUnavailable": false,
+  "tokensEstimated": false,
+  "hasAuthoritativeTokenReceipt": true
+}

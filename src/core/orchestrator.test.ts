@@ -8,7 +8,6 @@ vi.mock("./git.js", async (importOriginal) => {
     getBranchCommitCount: vi.fn(() => 0),
     getCurrentBranch: vi.fn(() => "gnhf/run-abc"),
     getHeadCommit: vi.fn(() => "head123"),
-    pushCurrentBranch: vi.fn(),
     resetHard: vi.fn(),
   };
 });
@@ -18,6 +17,11 @@ vi.mock("./run.js", async (importOriginal) => {
   return {
     ...actual,
     appendNotes: vi.fn(),
+    clearWorkspaceRecovery: vi.fn(),
+    readRunUsageState: vi.fn(() => null),
+    readWorkspaceRecovery: vi.fn(() => null),
+    writeRunUsageState: vi.fn(),
+    writeWorkspaceRecovery: vi.fn(),
   };
 });
 
@@ -35,27 +39,36 @@ vi.mock("../templates/iteration-prompt.js", () => ({
   buildIterationPrompt: vi.fn(() => "iteration prompt"),
 }));
 
+import { CommitFailedError, commitAll, resetHard } from "./git.js";
 import {
-  CommitFailedError,
-  commitAll,
-  pushCurrentBranch,
-  resetHard,
-} from "./git.js";
-import { appendNotes } from "./run.js";
+  appendNotes,
+  clearWorkspaceRecovery,
+  readRunUsageState,
+  readWorkspaceRecovery,
+  writeRunUsageState,
+  writeWorkspaceRecovery,
+} from "./run.js";
 import { appendDebugLog } from "./debug-log.js";
 import { Orchestrator } from "./orchestrator.js";
 import {
   PermanentAgentError,
+  UnverifiedAgentCleanupError,
   type Agent,
   type AgentResult,
+  type TokenUsage,
 } from "./agents/types.js";
+import { IncompleteChildProcessShutdownError } from "./agents/managed-process.js";
 import { CONVENTIONAL_COMMIT_MESSAGE } from "./commit-message.js";
 import type { Config } from "./config.js";
 import type { RunInfo } from "./run.js";
 
 const mockCommitAll = vi.mocked(commitAll);
-const mockPushCurrentBranch = vi.mocked(pushCurrentBranch);
 const mockAppendNotes = vi.mocked(appendNotes);
+const mockClearWorkspaceRecovery = vi.mocked(clearWorkspaceRecovery);
+const mockReadRunUsageState = vi.mocked(readRunUsageState);
+const mockReadWorkspaceRecovery = vi.mocked(readWorkspaceRecovery);
+const mockWriteRunUsageState = vi.mocked(writeRunUsageState);
+const mockWriteWorkspaceRecovery = vi.mocked(writeWorkspaceRecovery);
 const mockResetHard = vi.mocked(resetHard);
 const mockAppendDebugLog = vi.mocked(appendDebugLog);
 
@@ -81,6 +94,8 @@ const runInfo: RunInfo = {
   stopWhen: undefined,
   commitMessagePath: "/repo/.gnhf/runs/run-abc/commit-message",
   commitMessage: undefined,
+  runtimeLimitsPath: "/repo/.gnhf/runs/run-abc/runtime-limits.json",
+  runtimeLimits: {},
 };
 
 function createSuccessResult(summary = "done"): AgentResult {
@@ -96,6 +111,7 @@ function createSuccessResult(summary = "done"): AgentResult {
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      tokensAvailable: true,
     },
   };
 }
@@ -343,6 +359,464 @@ describe("Orchestrator stop limits", () => {
     expect(orchestrator.getState().status).toBe("aborted");
   });
 
+  it("restores cumulative usage before enforcing resumed caps", async () => {
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 2,
+      phase: "terminal",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      2,
+      { maxTokens: 10 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(agent.run).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith("max tokens reached (12/10)");
+    expect(orchestrator.getState()).toMatchObject({
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      reportedCostUsd: 0.4,
+      tokensAvailable: true,
+    });
+  });
+
+  it.each([
+    { generation: 2, phase: "in-progress" as const },
+    { generation: 1, phase: "terminal" as const },
+  ])(
+    "marks $phase usage generation $generation unavailable when resuming iteration 2",
+    async ({ generation, phase }) => {
+      mockReadRunUsageState.mockReturnValueOnce({
+        generation,
+        phase,
+        totalInputTokens: 4,
+        totalOutputTokens: 2,
+        totalTokens: 12,
+        reportedCostUsd: 0.4,
+        tokensUnavailable: false,
+        reportedCostUnavailable: false,
+        tokensEstimated: false,
+        hasAuthoritativeTokenReceipt: true,
+      });
+      const agent: Agent = {
+        name: "pi",
+        run: vi.fn(async () => createSuccessResult()),
+      };
+      const orchestrator = new Orchestrator(
+        config,
+        agent,
+        runInfo,
+        "ship it",
+        "/repo",
+        2,
+        { maxIterations: 3 },
+      );
+
+      expect(orchestrator.getState()).toMatchObject({
+        totalInputTokens: 4,
+        totalOutputTokens: 2,
+        reportedCostUsd: null,
+        tokensAvailable: false,
+      });
+
+      await orchestrator.start();
+
+      expect(agent.run).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("does not enforce legacy terminal cost without an authority marker", async () => {
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 2,
+      phase: "terminal",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: {
+          ...createSuccessResult().usage,
+          reportedCostUsd: 0.05,
+        },
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      2,
+      { maxIterations: 3, maxReportedCostUsd: 0.3 },
+    );
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(orchestrator.getState()).toMatchObject({
+      lastMessage: "max iterations reached (3)",
+      reportedCostUsd: null,
+    });
+  });
+
+  it("enforces a lowered token cap against an incomplete persisted lower bound", async () => {
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 2,
+      phase: "in-progress",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: 0.2,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => createSuccessResult()),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      2,
+      { maxIterations: 3, maxTokens: 10 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(agent.run).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith("max tokens reached (12/10)");
+  });
+
+  it("does not enforce a cost cap against provisional persisted cost", async () => {
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 2,
+      phase: "in-progress",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: 0.2,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: {
+          ...createSuccessResult().usage,
+          reportedCostUsd: 0.05,
+        },
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      2,
+      { maxIterations: 3, maxReportedCostUsd: 0.3 },
+    );
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
+    expect(orchestrator.getState()).toMatchObject({
+      lastMessage: "max iterations reached (3)",
+      reportedCostUsd: null,
+    });
+  });
+
+  it("enforces a cost cap against a persisted terminal lower bound", async () => {
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 2,
+      phase: "in-progress",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.25,
+      reportedCostLowerBoundUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => createSuccessResult()),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      2,
+      { maxIterations: 3, maxReportedCostUsd: 0.3 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(agent.run).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith(
+      "max reported cost reached ($0.40/$0.30)",
+    );
+  });
+
+  it("persists an in-progress usage generation before invoking the agent", async () => {
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => {
+        expect(mockWriteRunUsageState).toHaveBeenCalledWith(
+          runInfo,
+          expect.objectContaining({
+            generation: 1,
+            phase: "in-progress",
+          }),
+        );
+        return createSuccessResult();
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockWriteRunUsageState).toHaveBeenNthCalledWith(
+      1,
+      runInfo,
+      expect.objectContaining({
+        generation: 1,
+        phase: "in-progress",
+      }),
+    );
+    expect(mockWriteRunUsageState).toHaveBeenNthCalledWith(
+      2,
+      runInfo,
+      expect.objectContaining({
+        generation: 1,
+        phase: "terminal",
+      }),
+    );
+  });
+
+  it("persists cumulative authoritative usage after a completed turn", async () => {
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: {
+          inputTokens: 4,
+          outputTokens: 2,
+          cacheReadTokens: 3,
+          cacheCreationTokens: 1,
+          totalTokens: 12,
+          reportedCostUsd: 0.4,
+          tokensAvailable: true,
+        },
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(runInfo, {
+      generation: 1,
+      phase: "terminal",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+  });
+
+  it("persists token lower bounds and provisional cost after provider failure", async () => {
+    const agent: Agent = {
+      name: "opencode",
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.({
+          inputTokens: 4,
+          outputTokens: 2,
+          cacheReadTokens: 3,
+          cacheCreationTokens: 1,
+          totalTokens: 12,
+          reportedCostUsd: 0.4,
+          tokensAvailable: true,
+        });
+        options?.onUsage?.({
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: false,
+        });
+        throw new Error("provider overloaded");
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      { ...config, maxConsecutiveFailures: 1 },
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+    );
+
+    await orchestrator.start();
+
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(runInfo, {
+      generation: 1,
+      phase: "in-progress",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: null,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    expect(mockWriteRunUsageState).toHaveBeenLastCalledWith(runInfo, {
+      generation: 1,
+      phase: "terminal",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: null,
+      tokensUnavailable: true,
+      reportedCostUnavailable: true,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      reportedCostUsd: null,
+      tokensAvailable: false,
+    });
+  });
+
+  it("accepts a lower authoritative cost correction within one generation", async () => {
+    const signalAborted = vi.fn();
+    const agent: Agent = {
+      name: "opencode",
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.signal?.addEventListener("abort", signalAborted);
+        options?.onUsage?.({
+          inputTokens: 4,
+          outputTokens: 2,
+          cacheReadTokens: 3,
+          cacheCreationTokens: 1,
+          totalTokens: 12,
+          reportedCostUsd: 0.4,
+          tokensAvailable: true,
+        });
+        return {
+          ...createSuccessResult(),
+          usage: {
+            inputTokens: 4,
+            outputTokens: 2,
+            cacheReadTokens: 3,
+            cacheCreationTokens: 1,
+            totalTokens: 12,
+            reportedCostUsd: 0.25,
+            tokensAvailable: true,
+          },
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1, maxReportedCostUsd: 0.3 },
+    );
+
+    await orchestrator.start();
+
+    expect(signalAborted).not.toHaveBeenCalled();
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
+    expect(orchestrator.getState().reportedCostUsd).toBe(0.25);
+    expect(orchestrator.getState().lastMessage).toBe(
+      "max iterations reached (1)",
+    );
+    expect(mockWriteRunUsageState).toHaveBeenLastCalledWith(
+      runInfo,
+      expect.objectContaining({
+        generation: 1,
+        phase: "terminal",
+        reportedCostUsd: 0.25,
+      }),
+    );
+  });
+
   it("aborts after completing the configured number of iterations", async () => {
     const agent: Agent = {
       name: "claude",
@@ -488,9 +962,15 @@ describe("Orchestrator stop limits", () => {
     expect(orchestrator.getState().status).toBe("aborted");
   });
 
-  it("aborts when reported token usage reaches the configured cap", async () => {
+  it("persists live token usage without certifying streamed cost after a cap abort", async () => {
+    let resolveClose!: () => void;
+    const closePromise = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    const close = vi.fn(() => closePromise);
     const agent: Agent = {
       name: "claude",
+      close,
       run: vi.fn(
         (_prompt, _cwd, options) =>
           new Promise<AgentResult>((_resolve, reject) => {
@@ -499,9 +979,11 @@ describe("Orchestrator stop limits", () => {
             });
             options?.onUsage?.({
               inputTokens: 7,
-              outputTokens: 4,
+              outputTokens: 2,
               cacheReadTokens: 0,
-              cacheCreationTokens: 0,
+              cacheCreationTokens: 2,
+              reportedCostUsd: 0.4,
+              tokensAvailable: true,
             });
           }),
       ),
@@ -519,17 +1001,762 @@ describe("Orchestrator stop limits", () => {
     const abort = vi.fn();
     orchestrator.on("abort", abort);
 
-    await orchestrator.start();
+    const startPromise = orchestrator.start();
+    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+    expect(mockResetHard).not.toHaveBeenCalled();
+
+    resolveClose();
+    await startPromise;
 
     expect(agent.run).toHaveBeenCalledTimes(1);
     expect(mockAppendNotes).not.toHaveBeenCalled();
     expect(mockCommitAll).not.toHaveBeenCalled();
+    expect(mockResetHard).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
     expect(abort).toHaveBeenCalledWith("max tokens reached (11/10)");
     expect(orchestrator.getState()).toMatchObject({
       status: "aborted",
       totalInputTokens: 7,
-      totalOutputTokens: 4,
+      totalOutputTokens: 2,
+      tokensAvailable: true,
     });
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(runInfo, {
+      generation: 1,
+      phase: "terminal",
+      totalInputTokens: 7,
+      totalOutputTokens: 2,
+      totalTokens: 11,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: null,
+      tokensUnavailable: false,
+      reportedCostUnavailable: true,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 1,
+      phase: "terminal",
+      totalInputTokens: 7,
+      totalOutputTokens: 2,
+      totalTokens: 11,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: null,
+      tokensUnavailable: false,
+      reportedCostUnavailable: true,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const resumedAgent: Agent = { name: "claude", run: vi.fn() };
+    const resumed = new Orchestrator(
+      config,
+      resumedAgent,
+      runInfo,
+      "ship it",
+      "/repo",
+      1,
+      { maxTokens: 10 },
+    );
+
+    await resumed.start();
+
+    expect(resumedAgent.run).not.toHaveBeenCalled();
+    expect(resumed.getState().lastMessage).toBe("max tokens reached (11/10)");
+
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 1,
+      phase: "terminal",
+      totalInputTokens: 7,
+      totalOutputTokens: 2,
+      totalTokens: 11,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: null,
+      tokensUnavailable: false,
+      reportedCostUnavailable: true,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const costOnlyResumeAgent: Agent = {
+      name: "claude",
+      run: vi.fn(async () => createSuccessResult()),
+    };
+    const costOnlyResume = new Orchestrator(
+      config,
+      costOnlyResumeAgent,
+      runInfo,
+      "ship it",
+      "/repo",
+      1,
+      { maxIterations: 2, maxReportedCostUsd: 0.3 },
+    );
+
+    await costOnlyResume.start();
+
+    expect(costOnlyResumeAgent.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a live cap as authoritative when the agent resolves", async () => {
+    const usage: TokenUsage = {
+      inputTokens: 7,
+      outputTokens: 2,
+      cacheReadTokens: 1,
+      cacheCreationTokens: 0,
+      tokensAvailable: true,
+    };
+    const agent: Agent = {
+      name: "claude",
+      close: vi.fn(async () => undefined),
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.(usage);
+        return { ...createSuccessResult(), usage };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxTokens: 10 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockCommitAll).not.toHaveBeenCalled();
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      totalInputTokens: 7,
+      totalOutputTokens: 2,
+      tokensAvailable: true,
+      lastMessage: "max tokens reached (10/10)",
+    });
+  });
+
+  it("persists the terminal usage receipt after a live cap is crossed", async () => {
+    const agent: Agent = {
+      name: "claude",
+      close: vi.fn(async () => undefined),
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.({
+          inputTokens: 10,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: true,
+        });
+        options?.onUsage?.({
+          inputTokens: 12,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: true,
+        });
+        return {
+          ...createSuccessResult(),
+          usage: {
+            inputTokens: 14,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            tokensAvailable: true,
+          },
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxTokens: 10 },
+    );
+
+    await orchestrator.start();
+
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      totalInputTokens: 14,
+      tokensAvailable: true,
+    });
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(
+      runInfo,
+      expect.objectContaining({
+        phase: "terminal",
+        totalInputTokens: 14,
+        totalTokens: 14,
+      }),
+    );
+  });
+
+  it("keeps terminal cost authority when terminal token usage is incomplete", async () => {
+    const agent: Agent = {
+      name: "claude",
+      close: vi.fn(async () => undefined),
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.({
+          inputTokens: 10,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          reportedCostUsd: 0.4,
+          tokensAvailable: true,
+        });
+        return {
+          ...createSuccessResult(),
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            reportedCostUsd: 0.25,
+            tokensAvailable: false,
+          },
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxTokens: 10, maxReportedCostUsd: 0.3 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockCommitAll).not.toHaveBeenCalled();
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      totalInputTokens: 10,
+      reportedCostUsd: 0.25,
+      lastMessage: "max tokens reached (10/10)",
+    });
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(
+      runInfo,
+      expect.objectContaining({
+        phase: "terminal",
+        totalInputTokens: 10,
+        reportedCostUsd: 0.25,
+        reportedCostLowerBoundUsd: 0.25,
+        reportedCostUnavailable: false,
+      }),
+    );
+  });
+
+  it("uses provider-authoritative totals for live token caps", async () => {
+    const agent: Agent = {
+      name: "pi",
+      close: vi.fn(async () => undefined),
+      run: vi.fn(
+        (_prompt, _cwd, options) =>
+          new Promise<AgentResult>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              reject(new Error("request cancelled by provider"));
+            });
+            options?.onUsage?.({
+              inputTokens: 4,
+              outputTokens: 2,
+              cacheReadTokens: 3,
+              cacheCreationTokens: 1,
+              totalTokens: 12,
+              tokensAvailable: true,
+            });
+          }),
+      ),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxTokens: 10 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(abort).toHaveBeenCalledWith("max tokens reached (12/10)");
+  });
+
+  it("does not enforce a zero token cap before receiving usage", async () => {
+    const unavailableUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      tokensAvailable: false,
+    };
+    const agent: Agent = {
+      name: "acp:test",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: unavailableUsage,
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1, maxTokens: 0 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledWith("max iterations reached (1)");
+    expect(abort).not.toHaveBeenCalledWith(
+      expect.stringContaining("max tokens"),
+    );
+  });
+
+  it("does not enforce token caps without explicit usage availability", async () => {
+    const incompleteUsage = {
+      inputTokens: 7,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+    };
+    const agent: Agent = {
+      name: "cursor",
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.(incompleteUsage);
+        return {
+          ...createSuccessResult(),
+          usage: incompleteUsage,
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1, maxTokens: 1 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(abort).toHaveBeenCalledWith("max iterations reached (1)");
+    expect(abort).not.toHaveBeenCalledWith(
+      expect.stringContaining("max tokens"),
+    );
+    expect(orchestrator.getState()).toMatchObject({
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      tokensAvailable: false,
+    });
+  });
+
+  it("does not enforce token caps from estimated usage", async () => {
+    const estimatedUsage = {
+      inputTokens: 7,
+      outputTokens: 4,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      tokensAvailable: true,
+      estimated: true,
+    };
+    const agent: Agent = {
+      name: "acp:test",
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.(estimatedUsage);
+        return {
+          ...createSuccessResult(),
+          usage: estimatedUsage,
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1, maxTokens: 1 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(abort).toHaveBeenCalledWith("max iterations reached (1)");
+    expect(abort).not.toHaveBeenCalledWith(
+      expect.stringContaining("max tokens"),
+    );
+  });
+
+  it("keeps token caps disabled after an estimated terminal receipt", async () => {
+    let callCount = 0;
+    const agent: Agent = {
+      name: "test",
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        callCount++;
+        const usage: TokenUsage = {
+          inputTokens: callCount === 1 ? 4 : callCount === 2 ? 7 : 1,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: true,
+          ...(callCount === 2 ? { estimated: true } : {}),
+        };
+        options?.onUsage?.(usage);
+        return { ...createSuccessResult(), usage };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 3, maxTokens: 10 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(3);
+    expect(abort).toHaveBeenCalledWith("max iterations reached (3)");
+    expect(abort).not.toHaveBeenCalledWith(
+      expect.stringContaining("max tokens"),
+    );
+  });
+
+  it("publishes unavailable usage before the first agent usage callback", async () => {
+    let resolveRun!: (result: AgentResult) => void;
+    let reportUsage!: () => void;
+    const unavailableUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      tokensAvailable: false,
+    };
+    const agent: Agent = {
+      name: "acp:test",
+      run: vi.fn(
+        (_prompt, _cwd, options) =>
+          new Promise<AgentResult>((resolve) => {
+            resolveRun = resolve;
+            reportUsage = () => options?.onUsage?.(unavailableUsage);
+          }),
+      ),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+    const observedAvailability: Array<boolean | undefined> = [];
+    orchestrator.on("state", (state) => {
+      observedAvailability.push(state.tokensAvailable);
+    });
+
+    const startPromise = orchestrator.start();
+    await vi.waitFor(() => {
+      expect(agent.run).toHaveBeenCalledTimes(1);
+      expect(orchestrator.getState().tokensAvailable).toBe(false);
+    });
+    expect(observedAvailability[0]).toBe(false);
+
+    reportUsage();
+    resolveRun({ ...createSuccessResult(), usage: unavailableUsage });
+    await startPromise;
+  });
+
+  it("aborts when terminal harness-reported cost reaches the configured cap", async () => {
+    const signalAborted = vi.fn();
+    const usage: TokenUsage = {
+      inputTokens: 7,
+      outputTokens: 4,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      reportedCostUsd: 1.25,
+      tokensAvailable: true,
+    };
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.signal?.addEventListener("abort", signalAborted);
+        options?.onUsage?.(usage);
+        return { ...createSuccessResult(), usage };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxReportedCostUsd: 1 },
+    );
+
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(signalAborted).not.toHaveBeenCalled();
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(mockCommitAll).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith(
+      "max reported cost reached ($1.25/$1.00)",
+    );
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      reportedCostUsd: 1.25,
+    });
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(runInfo, {
+      generation: 1,
+      phase: "terminal",
+      totalInputTokens: 7,
+      totalOutputTokens: 4,
+      totalTokens: 11,
+      reportedCostUsd: 1.25,
+      reportedCostLowerBoundUsd: 1.25,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    expect(mockAppendDebugLog).toHaveBeenCalledWith("agent:run:end", {
+      iteration: 1,
+      elapsedMs: expect.any(Number),
+      outcome: "aborted",
+      success: null,
+      inputTokens: 7,
+      outputTokens: 4,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      reportedCostUsd: 1.25,
+      reportedCostAvailable: true,
+      tokensAvailable: true,
+      estimated: false,
+    });
+  });
+
+  it("clears stale live cost when a later update omits cost", async () => {
+    let reportUsage!: (usage: TokenUsage) => void;
+    let resolveRun!: (result: AgentResult) => void;
+    const signalAborted = vi.fn();
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(
+        (_prompt, _cwd, options) =>
+          new Promise<AgentResult>((resolve) => {
+            options?.signal?.addEventListener("abort", signalAborted);
+            reportUsage = (usage) => options?.onUsage?.(usage);
+            resolveRun = resolve;
+          }),
+      ),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1, maxReportedCostUsd: 1 },
+    );
+    const startPromise = orchestrator.start();
+    await vi.waitFor(() => expect(agent.run).toHaveBeenCalledTimes(1));
+
+    reportUsage({
+      ...createSuccessResult().usage,
+      reportedCostUsd: 1.25,
+    });
+    expect(orchestrator.getState().reportedCostUsd).toBe(1.25);
+
+    reportUsage(createSuccessResult().usage);
+    expect(orchestrator.getState().reportedCostUsd).toBeNull();
+
+    resolveRun(createSuccessResult());
+    await startPromise;
+
+    expect(signalAborted).not.toHaveBeenCalled();
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
+    expect(mockWriteRunUsageState).toHaveBeenLastCalledWith(
+      runInfo,
+      expect.objectContaining({
+        phase: "terminal",
+        reportedCostUsd: 1.25,
+        reportedCostLowerBoundUsd: null,
+        reportedCostUnavailable: true,
+      }),
+    );
+  });
+
+  it("continues under other limits when the harness reports no cost", async () => {
+    const agent: Agent = {
+      name: "cursor",
+      run: vi.fn(async () => createSuccessResult()),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1, maxReportedCostUsd: 0 },
+    );
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      lastMessage: "max iterations reached (1)",
+      reportedCostUsd: null,
+    });
+  });
+
+  it("keeps unavailable token totals out of iteration and run receipts", async () => {
+    const agent: Agent = {
+      name: "cursor",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: {
+          ...createSuccessResult().usage,
+          reportedCostUsd: 0.25,
+          tokensAvailable: false,
+        },
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockAppendDebugLog).toHaveBeenCalledWith("agent:run:end", {
+      iteration: 1,
+      elapsedMs: expect.any(Number),
+      outcome: "completed",
+      success: true,
+      inputTokens: null,
+      outputTokens: null,
+      cacheReadTokens: null,
+      cacheCreationTokens: null,
+      reportedCostUsd: 0.25,
+      reportedCostAvailable: true,
+      tokensAvailable: false,
+      estimated: false,
+    });
+    expect(mockAppendDebugLog).toHaveBeenCalledWith(
+      "orchestrator:end",
+      expect.objectContaining({
+        totalInputTokens: null,
+        totalOutputTokens: null,
+        tokensAvailable: false,
+        reportedCostUsd: 0.25,
+        reportedCostLowerBoundUsd: 0.25,
+        reportedCostAvailable: true,
+      }),
+    );
+  });
+
+  it("sums final harness-reported cost across iterations", async () => {
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: {
+          ...createSuccessResult().usage,
+          reportedCostUsd: 0.4,
+        },
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 2, maxReportedCostUsd: 5 },
+    );
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(2);
+    expect(orchestrator.getState().reportedCostUsd).toBeCloseTo(0.8);
+  });
+
+  it("keeps total cost unknown after an iteration reports no cost", async () => {
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    const agent: Agent = {
+      name: "cursor",
+      run: vi.fn(async () => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error("transient error");
+        }
+        return {
+          ...createSuccessResult(),
+          usage: {
+            ...createSuccessResult().usage,
+            reportedCostUsd: 0.4,
+          },
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 2, maxReportedCostUsd: 5 },
+    );
+
+    const startPromise = orchestrator.start();
+    await vi.waitFor(() => {
+      expect(agent.run).toHaveBeenCalledTimes(1);
+    });
+    await vi.waitFor(() => {
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await startPromise;
+
+    expect(orchestrator.getState().reportedCostUsd).toBeNull();
   });
 
   it("marks in-flight usage as estimated until authoritative usage arrives", async () => {
@@ -542,6 +1769,7 @@ describe("Orchestrator stop limits", () => {
           outputTokens: 2,
           cacheReadTokens: 0,
           cacheCreationTokens: 0,
+          tokensAvailable: true,
           estimated: true,
         });
         options?.onUsage?.({
@@ -549,8 +1777,18 @@ describe("Orchestrator stop limits", () => {
           outputTokens: 3,
           cacheReadTokens: 0,
           cacheCreationTokens: 0,
+          tokensAvailable: true,
         });
-        return createSuccessResult();
+        return {
+          ...createSuccessResult(),
+          usage: {
+            inputTokens: 5,
+            outputTokens: 3,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            tokensAvailable: true,
+          },
+        };
       }),
     };
     const orchestrator = new Orchestrator(
@@ -575,7 +1813,7 @@ describe("Orchestrator stop limits", () => {
     expect(orchestrator.getState().tokensEstimated).toBe(false);
   });
 
-  it("keeps usage estimated when estimated tokens are followed by an agent error", async () => {
+  it("does not promote live usage after an agent error", async () => {
     vi.useFakeTimers();
 
     let callCount = 0;
@@ -589,6 +1827,7 @@ describe("Orchestrator stop limits", () => {
             outputTokens: 2,
             cacheReadTokens: 0,
             cacheCreationTokens: 0,
+            tokensAvailable: true,
             estimated: true,
           });
           throw new Error("transient error");
@@ -598,8 +1837,18 @@ describe("Orchestrator stop limits", () => {
           outputTokens: 3,
           cacheReadTokens: 0,
           cacheCreationTokens: 0,
+          tokensAvailable: true,
         });
-        return createSuccessResult();
+        return {
+          ...createSuccessResult(),
+          usage: {
+            inputTokens: 5,
+            outputTokens: 3,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            tokensAvailable: true,
+          },
+        };
       }),
     };
     const orchestrator = new Orchestrator(
@@ -628,9 +1877,10 @@ describe("Orchestrator stop limits", () => {
     await startPromise;
 
     expect(orchestrator.getState()).toMatchObject({
-      totalInputTokens: 9,
-      totalOutputTokens: 5,
-      tokensEstimated: true,
+      totalInputTokens: 5,
+      totalOutputTokens: 3,
+      tokensAvailable: false,
+      tokensEstimated: false,
     });
   });
 
@@ -829,10 +2079,7 @@ describe("Orchestrator stop limits", () => {
     expect(stopped).not.toHaveBeenCalled();
 
     resolveClose();
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(stopped).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(stopped).toHaveBeenCalledTimes(1));
   });
 
   it("does not re-emit stopped when stop is called after the loop is done", async () => {
@@ -965,7 +2212,7 @@ describe("Orchestrator stop limits", () => {
     await startPromise;
   });
 
-  it("does not record or commit a late successful result after stop is requested", async () => {
+  it("does not promote a late successful result after forced stop", async () => {
     vi.useFakeTimers();
 
     let resolveRun!: (result: AgentResult) => void;
@@ -976,6 +2223,14 @@ describe("Orchestrator stop limits", () => {
         (_prompt, _cwd, options) =>
           new Promise<AgentResult>((resolve) => {
             resolveRun = resolve;
+            options?.onUsage?.({
+              inputTokens: 9,
+              outputTokens: 5,
+              cacheReadTokens: 0,
+              cacheCreationTokens: 0,
+              reportedCostUsd: 1.25,
+              tokensAvailable: true,
+            });
             options?.signal?.addEventListener("abort", () => {
               setTimeout(() => {
                 resolve(createSuccessResult("late success"));
@@ -1006,12 +2261,58 @@ describe("Orchestrator stop limits", () => {
     expect(resolveRun).toBeTypeOf("function");
     expect(mockAppendNotes).not.toHaveBeenCalled();
     expect(mockCommitAll).not.toHaveBeenCalled();
-    expect(orchestrator.getState().iterations).toEqual([]);
-    expect(orchestrator.getState().status).toBe("stopped");
+    expect(orchestrator.getState()).toMatchObject({
+      iterations: [],
+      reportedCostUsd: null,
+      status: "stopped",
+      tokensAvailable: false,
+      totalInputTokens: 9,
+      totalOutputTokens: 5,
+    });
     expect(close).toHaveBeenCalledTimes(1);
   });
 
-  it("clears pending commit failure state after force-stop reset", async () => {
+  it("preserves the workspace when forced stop reveals incomplete cleanup", async () => {
+    const cleanupError = new IncompleteChildProcessShutdownError(1234);
+    const agent: Agent = {
+      name: "opencode",
+      run: vi.fn(
+        (_prompt, _cwd, options) =>
+          new Promise<AgentResult>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              reject(cleanupError);
+            });
+          }),
+      ),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+    );
+    const startPromise = orchestrator.start();
+
+    await vi.waitFor(() => {
+      expect(agent.run).toHaveBeenCalledTimes(1);
+    });
+    orchestrator.stop();
+    await startPromise;
+
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+      cleanupUncertain: true,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      hasPendingWorkspaceRecovery: true,
+      lastAgentError: cleanupError.message,
+    });
+  });
+
+  it("preserves pending commit failure state after a default force stop", async () => {
     vi.useFakeTimers();
 
     let rejectRepair!: (error: Error) => void;
@@ -1054,8 +2355,124 @@ describe("Orchestrator stop limits", () => {
     rejectRepair(new Error("Agent was aborted"));
     await startPromise;
 
-    expect(mockResetHard).toHaveBeenCalled();
-    expect(orchestrator.getState().hasPendingCommitFailure).toBe(false);
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(orchestrator.getState().hasPendingCommitFailure).toBe(true);
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "commit-failure",
+      detail: expect.stringContaining("hook failed"),
+      cleanupUncertain: false,
+    });
+  });
+
+  it("preserves pending commit failure state for a worktree force stop", async () => {
+    vi.useFakeTimers();
+
+    let rejectRepair!: (error: Error) => void;
+    const agent: Agent = {
+      name: "claude",
+      run: vi
+        .fn()
+        .mockResolvedValueOnce(createSuccessResult("needs hook repair"))
+        .mockImplementationOnce(
+          (_prompt, _cwd, options) =>
+            new Promise<AgentResult>((_resolve, reject) => {
+              rejectRepair = reject;
+              options?.signal?.addEventListener("abort", () => {
+                reject(new Error("Agent was aborted"));
+              });
+            }),
+        ),
+      close: vi.fn(() => Promise.resolve()),
+    };
+    mockCommitAll.mockImplementationOnce(() => {
+      throw new CommitFailedError(new Error("hook failed"));
+    });
+
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { preserveWorkspaceOnForceStop: true },
+    );
+    const startPromise = orchestrator.start();
+
+    await vi.waitFor(() => {
+      expect(agent.run).toHaveBeenCalledTimes(2);
+    });
+    orchestrator.stop();
+    await vi.runAllTimersAsync();
+    rejectRepair(new Error("Agent was aborted"));
+    await startPromise;
+
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(orchestrator.getState().hasPendingCommitFailure).toBe(true);
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "commit-failure",
+      detail: expect.stringContaining("hook failed"),
+      cleanupUncertain: false,
+    });
+  });
+
+  it("hydrates interrupted workspace recovery before running an agent", async () => {
+    mockReadWorkspaceRecovery.mockReturnValueOnce({
+      kind: "interrupted",
+      detail: "previous invocation stopped",
+      cleanupUncertain: false,
+    });
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn().mockRejectedValueOnce(new Error("network down")),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledWith(
+      expect.stringContaining("Interrupted Workspace Recovery"),
+      "/repo",
+      expect.any(Object),
+    );
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockClearWorkspaceRecovery).not.toHaveBeenCalled();
+    expect(orchestrator.getState().hasPendingWorkspaceRecovery).toBe(true);
+  });
+
+  it("retains cleanup uncertainty after a successful resumed iteration", async () => {
+    mockReadWorkspaceRecovery.mockReturnValueOnce({
+      kind: "interrupted",
+      detail: "descendant cleanup was not verified",
+      cleanupUncertain: true,
+    });
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn().mockResolvedValueOnce(createSuccessResult()),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
+    expect(mockClearWorkspaceRecovery).not.toHaveBeenCalled();
+    expect(orchestrator.getState().hasPendingWorkspaceRecovery).toBe(true);
   });
 
   it("preserves pending commit failure state when a repair iteration errors", async () => {
@@ -1103,6 +2520,7 @@ describe("Orchestrator stop limits", () => {
                 outputTokens: 0,
                 cacheReadTokens: 0,
                 cacheCreationTokens: 0,
+                tokensAvailable: true,
               });
             }),
         ),
@@ -1313,6 +2731,241 @@ describe("Orchestrator backoff behavior", () => {
     });
   });
 
+  it("preserves the workspace when agent cleanup cannot be proven", async () => {
+    const cleanupError = new IncompleteChildProcessShutdownError(1234);
+    const agent: Agent = {
+      name: "opencode",
+      run: vi.fn(() => Promise.reject(cleanupError)),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+    );
+
+    await orchestrator.start();
+
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+      cleanupUncertain: true,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      status: "aborted",
+      hasPendingWorkspaceRecovery: true,
+      lastAgentError: cleanupError.message,
+    });
+  });
+
+  it("keeps a completed result while preserving unverified cleanup", async () => {
+    const cleanupError = new UnverifiedAgentCleanupError(
+      "descendant cleanup was not verified",
+    );
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(async () => createSuccessResult()),
+      close: vi.fn(() => Promise.reject(cleanupError)),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+      cleanupUncertain: true,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      successCount: 1,
+      hasPendingWorkspaceRecovery: true,
+      lastAgentError: null,
+    });
+  });
+
+  it("preserves a reported failure before finalizing unverified cleanup", async () => {
+    const cleanupError = new UnverifiedAgentCleanupError(
+      "descendant cleanup was not verified",
+    );
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        output: {
+          success: false,
+          summary: "could not finish",
+          key_changes_made: [],
+          key_learnings: ["provider stopped"],
+        },
+      })),
+      getUnverifiedCleanupError: vi.fn(() => cleanupError),
+      close: vi.fn(() => Promise.reject(cleanupError)),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+      cleanupUncertain: true,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      failCount: 1,
+      hasPendingWorkspaceRecovery: true,
+      lastAgentError: null,
+      iterations: [expect.objectContaining({ summary: "could not finish" })],
+    });
+  });
+
+  it("keeps later iterations in recovery after unverified cleanup", async () => {
+    const cleanupError = new UnverifiedAgentCleanupError(
+      "descendant cleanup was not verified",
+    );
+    const run = vi
+      .fn<Agent["run"]>()
+      .mockResolvedValueOnce({
+        ...createSuccessResult(),
+        output: {
+          success: false,
+          summary: "could not finish",
+          key_changes_made: [],
+          key_learnings: ["provider stopped"],
+        },
+      })
+      .mockResolvedValue(createSuccessResult());
+    const agent: Agent = {
+      name: "claude",
+      run,
+      getUnverifiedCleanupError: vi.fn(() => cleanupError),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 3 },
+    );
+
+    await orchestrator.start();
+
+    expect(run).toHaveBeenCalledTimes(3);
+    expect(run.mock.calls[1]?.[0]).toContain(
+      "## Interrupted Workspace Recovery",
+    );
+    expect(run.mock.calls[2]?.[0]).toContain(
+      "## Interrupted Workspace Recovery",
+    );
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockClearWorkspaceRecovery).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+      cleanupUncertain: true,
+    });
+  });
+
+  it("preserves a primary error before finalizing unverified cleanup", async () => {
+    const cleanupError = new UnverifiedAgentCleanupError(
+      "descendant cleanup was not verified",
+    );
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(async () => {
+        throw new Error("provider failed");
+      }),
+      getUnverifiedCleanupError: vi.fn(() => cleanupError),
+      close: vi.fn(() => Promise.reject(cleanupError)),
+    };
+    const orchestrator = new Orchestrator(
+      { ...config, maxConsecutiveFailures: 1 },
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+    );
+
+    await orchestrator.start();
+
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+      cleanupUncertain: true,
+    });
+    expect(orchestrator.getState()).toMatchObject({
+      failCount: 1,
+      hasPendingWorkspaceRecovery: true,
+      lastAgentError: "provider failed",
+      iterations: [expect.objectContaining({ summary: "provider failed" })],
+    });
+  });
+
+  it("prioritizes incomplete cleanup over a pending runtime cap", async () => {
+    const cleanupError = new IncompleteChildProcessShutdownError(1234);
+    const agent: Agent = {
+      name: "opencode",
+      run: vi.fn(
+        (_prompt, _cwd, options) =>
+          new Promise<AgentResult>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              reject(cleanupError);
+            });
+            options?.onUsage?.({
+              inputTokens: 11,
+              outputTokens: 0,
+              cacheReadTokens: 0,
+              cacheCreationTokens: 0,
+              tokensAvailable: true,
+            });
+          }),
+      ),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxTokens: 10 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(abort).toHaveBeenCalledWith(cleanupError.message);
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+      cleanupUncertain: true,
+    });
+  });
+
   it("resets the error streak after a reported failure so a later error backs off from 60s again", async () => {
     vi.useFakeTimers();
 
@@ -1480,61 +3133,5 @@ describe("Orchestrator crash resilience", () => {
     expect(mockAppendNotes).toHaveBeenCalledTimes(1);
     expect(mockCommitAll).toHaveBeenCalledTimes(1);
     expect(mockResetHard).not.toHaveBeenCalled();
-  });
-
-  it("pushes the current branch after each successful commit when requested", async () => {
-    const agent: Agent = {
-      name: "claude",
-      run: vi.fn(async () => createSuccessResult()),
-    };
-
-    const orchestrator = new Orchestrator(
-      config,
-      agent,
-      runInfo,
-      "ship it",
-      "/repo",
-      0,
-      { maxIterations: 1, push: true },
-    );
-
-    await orchestrator.start();
-
-    expect(mockCommitAll).toHaveBeenCalledTimes(1);
-    expect(mockPushCurrentBranch).toHaveBeenCalledWith("/repo");
-    expect(mockResetHard).not.toHaveBeenCalled();
-  });
-
-  it("aborts without resetting when pushing a successful commit fails", async () => {
-    mockPushCurrentBranch.mockImplementation(() => {
-      throw new Error("remote rejected push");
-    });
-    const agent: Agent = {
-      name: "claude",
-      run: vi.fn(async () => createSuccessResult()),
-    };
-
-    const orchestrator = new Orchestrator(
-      config,
-      agent,
-      runInfo,
-      "ship it",
-      "/repo",
-      0,
-      { maxIterations: 2, push: true },
-    );
-    const abort = vi.fn();
-    const iterationEnd = vi.fn();
-    orchestrator.on("abort", abort);
-    orchestrator.on("iteration:end", iterationEnd);
-
-    await orchestrator.start();
-
-    expect(mockCommitAll).toHaveBeenCalledTimes(1);
-    expect(mockPushCurrentBranch).toHaveBeenCalledWith("/repo");
-    expect(mockResetHard).not.toHaveBeenCalled();
-    expect(iterationEnd).toHaveBeenCalledTimes(1);
-    expect(abort).toHaveBeenCalledWith("push failed: remote rejected push");
-    expect(orchestrator.getState().status).toBe("aborted");
   });
 });

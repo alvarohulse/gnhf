@@ -3,6 +3,7 @@ import {
   chmodSync,
   existsSync,
   mkdtempSync,
+  realpathSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -49,7 +50,7 @@ function git(args: string[], cwd: string): string {
 }
 
 function createRepo(): string {
-  const cwd = mkdtempSync(join(tmpdir(), "gnhf-e2e-"));
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gnhf-e2e-")));
   git(["init", "-b", "main"], cwd);
   git(["config", "user.name", "gnhf tests"], cwd);
   git(["config", "user.email", "tests@example.com"], cwd);
@@ -234,13 +235,9 @@ describe("gnhf e2e", () => {
     expect(debugEvents).toContain("run:complete");
   }, 30_000);
 
-  it("runs on the current branch and pushes each successful iteration", async () => {
+  it("rejects push mode without changing the current branch", async () => {
     const cwd = createRepo();
     tempDirs.push(cwd);
-    const remote = mkdtempSync(join(tmpdir(), "gnhf-e2e-remote-"));
-    tempDirs.push(remote);
-    git(["init", "--bare"], remote);
-    git(["remote", "add", "origin", remote], cwd);
 
     const logDir = mkdtempSync(join(tmpdir(), "gnhf-e2e-logs-"));
     tempDirs.push(logDir);
@@ -262,16 +259,10 @@ describe("gnhf e2e", () => {
       },
     );
 
-    expect(result.code).toBe(0);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("gnhf never pushes user work");
     expect(git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)).toBe("main");
-    expect(git(["rev-list", "--count", "HEAD"], cwd)).toBe("2");
-    expect(git(["rev-parse", "HEAD"], cwd)).toBe(
-      git(["rev-parse", "refs/heads/main"], remote),
-    );
-
-    const debugLogPath = findRunLogPath(cwd);
-    const debugEvents = readJsonLines(debugLogPath).map((entry) => entry.event);
-    expect(debugEvents).toContain("git:push:success");
+    expect(git(["rev-list", "--count", "HEAD"], cwd)).toBe("1");
   }, 30_000);
 
   it("sends failed pre-commit hook output back to the agent for repair", async () => {
@@ -416,7 +407,7 @@ describe("gnhf e2e", () => {
       expected: "claude exited with code 1 and produced no output",
     },
   ])(
-    "surfaces the claude CLI's own failure text $label",
+    "records the claude failure outcome $label",
     async ({ mode, expected }) => {
       const cwd = createRepo();
       tempDirs.push(cwd);
@@ -439,6 +430,8 @@ describe("gnhf e2e", () => {
           env: {
             ...createTestEnv(mockLogPath, tempDirs),
             GNHF_MOCK_CLAUDE_MODE: mode,
+            // Keep the mock's streams clean when Node warns about .cmd wrappers.
+            NODE_NO_WARNINGS: "1",
           },
         },
       );
@@ -446,14 +439,26 @@ describe("gnhf e2e", () => {
       expect(result.code).toBe(0);
 
       const debugLogPath = findRunLogPath(cwd);
-      const agentRunErrorEntry = readJsonLines(debugLogPath).find(
+      const debugEntries = readJsonLines(debugLogPath);
+      const agentRunErrorEntry = debugEntries.find(
         (entry) => entry.event === "agent:run:error",
       );
       expect(agentRunErrorEntry).toBeDefined();
       const agentError = agentRunErrorEntry?.error as
-        | { message?: string }
+        | { message?: string; name?: string }
         | undefined;
-      expect(agentError?.message).toBe(expected);
+      expect(agentError).toMatchObject({ message: expected, name: "Error" });
+
+      if (process.platform === "win32") {
+        expect(debugEntries).toContainEqual(
+          expect.objectContaining({
+            event: "agent-process:cleanup-unverified",
+            trigger: "target-close",
+            mode: "best-effort",
+            descendantCleanup: "unverified",
+          }),
+        );
+      }
 
       // The morning-after trace: notes.md is what the user actually reads.
       const notes = readFileSync(
@@ -518,6 +523,53 @@ describe("gnhf e2e", () => {
     expect(secondRun.code).toBe(0);
     expect(git(["rev-list", "--count", "HEAD"], cwd)).toBe("3");
   }, 30_000);
+
+  it.skipIf(process.platform === "win32")(
+    "preserves and records a zero-commit worktree when explicitly requested",
+    async () => {
+      const cwd = createRepo();
+      tempDirs.push(cwd);
+      const logDir = mkdtempSync(join(tmpdir(), "gnhf-e2e-logs-"));
+      tempDirs.push(logDir);
+      const mockLogPath = join(logDir, "mock-opencode.jsonl");
+      const worktreeParent = `${cwd}-gnhf-worktrees`;
+      tempDirs.push(worktreeParent);
+
+      const result = await runCli(
+        cwd,
+        [
+          "preserve empty worktree",
+          "--agent",
+          "opencode",
+          "--max-iterations",
+          "0",
+          "--prevent-sleep",
+          "off",
+          "--worktree",
+          "--preserve-worktree",
+        ],
+        { env: createTestEnv(mockLogPath, tempDirs) },
+      );
+
+      expect(result.code).toBe(0);
+      const worktreeDirs = readdirSync(worktreeParent);
+      expect(worktreeDirs).toHaveLength(1);
+      const worktreePath = join(worktreeParent, worktreeDirs[0]!);
+      expect(result.stderr).toContain(`worktree preserved at ${worktreePath}`);
+
+      const debugEvents = readJsonLines(
+        join(worktreePath, ".gnhf", "runs", worktreeDirs[0]!, "gnhf.log"),
+      );
+      expect(debugEvents).toContainEqual(
+        expect.objectContaining({
+          event: "worktree:preserved",
+          worktreePath,
+          reason: "requested",
+        }),
+      );
+    },
+    30_000,
+  );
 
   it.skipIf(process.platform === "win32")(
     "runs one iteration in --worktree mode and preserves the worktree with commits",
@@ -705,7 +757,7 @@ describe("gnhf e2e", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "cleans up the worktree when no changes are made in --worktree mode",
+    "preserves an interrupted worktree when no changes are made",
     async () => {
       const cwd = createRepo();
       tempDirs.push(cwd);
@@ -720,8 +772,7 @@ describe("gnhf e2e", () => {
       // server: when it detects "slow cleanup" in the prompt text, the message
       // handler deliberately never sends a response (it only listens for the
       // request to close). This simulates a long-running agent that hasn't
-      // produced any commits. We then send SIGINT to trigger graceful shutdown,
-      // which should cause gnhf to clean up the worktree (0 commits = auto-remove).
+      // produced any commits. We then force shutdown with two SIGINTs.
       const child = spawn(
         process.execPath,
         [distCliPath, "slow cleanup", "--agent", "opencode", "--worktree"],
@@ -762,11 +813,73 @@ describe("gnhf e2e", () => {
       // Original repo should still be on main
       expect(git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)).toBe("main");
 
-      // Worktree should have been cleaned up (no commits were made)
-      if (existsSync(worktreeParent)) {
-        const remaining = readdirSync(worktreeParent);
-        expect(remaining.length).toBe(0);
-      }
+      expect(existsSync(worktreeParent)).toBe(true);
+      expect(readdirSync(worktreeParent)).toHaveLength(1);
+      expect(sigintResult.stderr).toContain("worktree preserved at");
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "preserves dirty work after a forced worktree shutdown",
+    async () => {
+      const cwd = createRepo();
+      tempDirs.push(cwd);
+      const logDir = mkdtempSync(join(tmpdir(), "gnhf-e2e-logs-"));
+      tempDirs.push(logDir);
+      const mockLogPath = join(logDir, "mock-opencode.jsonl");
+      const worktreeParent = `${cwd}-gnhf-worktrees`;
+      tempDirs.push(worktreeParent);
+
+      const child = spawn(
+        process.execPath,
+        [
+          distCliPath,
+          "slow cleanup dirty",
+          "--agent",
+          "opencode",
+          "--worktree",
+        ],
+        {
+          cwd,
+          env: createTestEnv(mockLogPath, tempDirs),
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+      child.stdin.end();
+
+      const exitPromise = new Promise<RunResult>((resolveResult, reject) => {
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => {
+          stdout += chunk.toString();
+        });
+        child.stderr.on("data", (chunk) => {
+          stderr += chunk.toString();
+        });
+        child.on("error", reject);
+        child.on("close", (code, signal) => {
+          resolveResult({ code, signal, stdout, stderr });
+        });
+      });
+
+      await waitForLogEvent(mockLogPath, "workspace:changed");
+      child.kill("SIGINT");
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+      child.kill("SIGINT");
+
+      const result = await exitPromise;
+      expect(result.code).toBe(130);
+      const worktreeDirs = readdirSync(worktreeParent);
+      expect(worktreeDirs).toHaveLength(1);
+      const worktreePath = join(worktreeParent, worktreeDirs[0]!);
+      expect(readFileSync(join(worktreePath, "README.md"), "utf-8")).toContain(
+        "mock change",
+      );
+      expect(result.stderr).toContain(`worktree preserved at ${worktreePath}`);
+      expect(git(["status", "--porcelain"], worktreePath)).not.toBe("");
+      expect(git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)).toBe("main");
+      expect(git(["rev-list", "--count", "HEAD"], cwd)).toBe("1");
     },
     30_000,
   );

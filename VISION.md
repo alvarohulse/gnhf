@@ -9,15 +9,14 @@ It owns exactly one thing: the unattended loop that turns agent iterations into 
 Work that was made is never silently destroyed.
 Every successful iteration is its own commit, so a night's work can be reviewed, cherry-picked, or reverted one change at a time.
 A failed commit preserves the workspace and asks the next iteration to repair it instead of hard-resetting it away.
-A forced shutdown still keeps the final agent output, successful recordings, and any worktree that holds commits.
-A push failure aborts the run only after the local commit is safe.
+A forced shutdown still keeps the final agent output and successful recordings, and preserves any generated worktree unless Git proves removal safe.
 A change that can lose user work in an edge case is a bug of the highest class and gets fixed at the root.
 
 ## The user holds the leash
 
 An unattended loop earns trust through explicit limits, live control, and staying alive until morning.
-Iteration caps, token caps, and natural-language stop conditions bound every run, and stop conditions survive resume.
-The first interrupt is graceful and lets the iteration finish; the second is immediate.
+Iteration caps and natural-language stop conditions bound every run; token caps require complete provider-reported token totals, cost caps require final reported cost rather than estimates, and stop conditions survive resume.
+The first interrupt is graceful and lets the iteration finish; the second cancels it and waits for owned shutdown to settle.
 Steering a live run and reviewing a finished run's commits are user control, not scope creep.
 The run defends itself against whatever would end the night early: machine sleep, a closed terminal, transient agent failures.
 Anything that can silently hang an unattended run, such as an interactive credential prompt, is refused until it works unattended.
@@ -38,11 +37,11 @@ More operating systems and more install channels are welcome, and a shipped plat
 
 ## Nothing identifiable leaves the machine
 
-Prompts, notes, run metadata, and logs live under `.gnhf/runs/` and stay local, so the branch only contains intentional work.
+Prompts, notes, run metadata, and logs live under `.gnhf/` and stay local, so the branch only contains intentional work.
 Telemetry is anonymous, never carrying prompts, paths, or branch names, and a single env var turns it off.
 Richer diagnostics are welcome when they are opt-in, stay anonymous, and change nothing for anyone who does not enable them.
 Raw agent commands are redacted from logs, errors, and telemetry so local paths and secrets are never written out.
-Publishing is always an explicit user choice, such as `--push`.
+Publishing is always a separate user action; gnhf never pushes user work.
 
 ## Delight is part of the contract
 

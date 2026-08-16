@@ -93,6 +93,17 @@ describe("renderStats", () => {
     const plain = stripAnsi(renderStats("01:23:45", 12400, 8200, 12, false));
     expect(plain).not.toContain("~");
   });
+
+  it("does not render unavailable token totals as exact", () => {
+    const plain = stripAnsi(
+      renderStats("01:23:45", 12400, 8200, 12, false, false),
+    );
+
+    expect(plain).toContain("? in");
+    expect(plain).toContain("? out");
+    expect(plain).not.toContain("12K in");
+    expect(plain).not.toContain("8K out");
+  });
 });
 
 describe("renderAgentMessage", () => {
@@ -277,6 +288,7 @@ describe("buildFrame", () => {
       currentIteration: 1,
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      reportedCostUsd: null,
       tokensEstimated: false,
       commitCount: 0,
       iterations: [],
@@ -310,6 +322,7 @@ describe("buildFrame", () => {
       currentIteration: 1,
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      reportedCostUsd: null,
       tokensEstimated: false,
       commitCount: 0,
       iterations: [],
@@ -354,6 +367,7 @@ describe("buildFrame", () => {
       currentIteration: 1,
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      reportedCostUsd: null,
       tokensEstimated: false,
       commitCount: 0,
       iterations: [],
@@ -392,6 +406,7 @@ describe("buildFrame", () => {
       currentIteration: 61,
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      reportedCostUsd: null,
       tokensEstimated: false,
       commitCount: 0,
       iterations: Array.from({ length: 61 }, (_, index) =>
@@ -443,6 +458,7 @@ describe("buildFrame", () => {
       currentIteration: 1,
       totalInputTokens: 500,
       totalOutputTokens: 300,
+      reportedCostUsd: null,
       tokensEstimated: false,
       commitCount: 0,
       iterations: [],
@@ -482,6 +498,7 @@ describe("buildFrame", () => {
       currentIteration: 660,
       totalInputTokens: 1200,
       totalOutputTokens: 800,
+      reportedCostUsd: null,
       tokensEstimated: false,
       commitCount: 7,
       iterations: Array.from({ length: 660 }, (_, index) =>
@@ -522,6 +539,7 @@ describe("buildFrame", () => {
       currentIteration: 1,
       totalInputTokens: 100,
       totalOutputTokens: 50,
+      reportedCostUsd: null,
       tokensEstimated: false,
       commitCount: 1,
       iterations: [createIteration()],
@@ -572,6 +590,7 @@ describe("buildFrame", () => {
       currentIteration: 1,
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      reportedCostUsd: null,
       tokensEstimated: false,
       commitCount: 0,
       iterations: [],
@@ -625,6 +644,7 @@ describe("buildFrame", () => {
       currentIteration: 1,
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      reportedCostUsd: null,
       tokensEstimated: false,
       commitCount: 0,
       iterations: [],
@@ -681,6 +701,7 @@ describe("buildContentCells adaptive height", () => {
     currentIteration: 1,
     totalInputTokens: 100,
     totalOutputTokens: 50,
+    reportedCostUsd: null,
     tokensEstimated: false,
     commitCount: 1,
     iterations: [createIteration()],
@@ -953,6 +974,7 @@ describe("Renderer ctrl+c", () => {
       currentIteration: 1,
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      reportedCostUsd: null,
       tokensEstimated: false,
       commitCount: 0,
       iterations: [],
@@ -988,6 +1010,7 @@ describe("Renderer meteors", () => {
       currentIteration: 1,
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      reportedCostUsd: null,
       tokensEstimated: false,
       commitCount: 0,
       iterations: [],
@@ -1153,6 +1176,7 @@ describe("Renderer terminal title", () => {
     currentIteration: 1,
     totalInputTokens: 12_400,
     totalOutputTokens: 8_200,
+    reportedCostUsd: null,
     tokensEstimated: false,
     commitCount: 12,
     iterations: [createIteration()],

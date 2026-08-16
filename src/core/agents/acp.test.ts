@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,11 @@ import {
   resetDebugLogForTests,
   serializeError,
 } from "../debug-log.js";
-import { PermanentAgentError, type AgentOutputSchema } from "./types.js";
+import {
+  IncompleteAgentShutdownError,
+  PermanentAgentError,
+  type AgentOutputSchema,
+} from "./types.js";
 import type {
   AcpRuntimeEnsureInput,
   AcpRuntimeEvent,
@@ -42,11 +46,15 @@ const STUB_HANDLE: AcpRuntimeHandle = {
   runtimeSessionName: "stub",
 };
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 interface FakeTurn {
   events: AcpRuntimeEvent[];
   startError?: unknown;
   eventError?: unknown;
-  result: AcpRuntimeTurnResult;
+  result: AcpRuntimeTurnResult | Promise<AcpRuntimeTurnResult>;
   cancel?: () => Promise<void>;
 }
 
@@ -114,6 +122,7 @@ function createFakeRuntime(turns: FakeTurn[]) {
         cancel: vi.fn(async () => {
           cancelled = true;
           calls.cancelCalls += 1;
+          await turn.cancel?.();
         }),
         closeStream: vi.fn(async () => {}),
       };
@@ -223,6 +232,102 @@ describe("AcpAgent", () => {
       resetDebugLogForTests();
       rmSync(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it("cancels and settles a turn before propagating a stream error", async () => {
+    let resolveResult!: (result: AcpRuntimeTurnResult) => void;
+    const turnResult = new Promise<AcpRuntimeTurnResult>((resolve) => {
+      resolveResult = resolve;
+    });
+    const { runtime, calls } = createFakeRuntime([
+      {
+        events: [],
+        eventError: new Error("stream failed"),
+        result: turnResult,
+      },
+    ]);
+    const agent = makeAgent(runtime);
+    const runPromise = agent.run("p", "/w");
+    let settled = false;
+    void runPromise.catch(() => {
+      settled = true;
+    });
+
+    await vi.waitFor(() => expect(calls.cancelCalls).toBe(1));
+    expect(settled).toBe(false);
+
+    resolveResult({ status: "cancelled" });
+    await expect(runPromise).rejects.toThrow("stream failed");
+  });
+
+  it("reuses the runtime after a retryable stream error settles cleanly", async () => {
+    const { runtime } = createFakeRuntime([
+      {
+        events: [],
+        eventError: new Error("stream failed"),
+        result: { status: "cancelled" },
+      },
+      {
+        events: [textDelta(JSON.stringify(VALID_OUTPUT))],
+        result: { status: "completed" },
+      },
+    ]);
+    const agent = makeAgent(runtime);
+
+    await expect(agent.run("first", "/w")).rejects.toThrow("stream failed");
+    await expect(agent.run("second", "/w")).resolves.toMatchObject({
+      output: VALID_OUTPUT,
+    });
+
+    expect(runtime.close).not.toHaveBeenCalled();
+  });
+
+  it("fails closed and closes the runtime when turn cancellation hangs", async () => {
+    vi.useFakeTimers();
+    const neverCancel = new Promise<void>(() => {});
+    const { runtime, calls } = createFakeRuntime([
+      {
+        events: [],
+        eventError: new Error("stream failed"),
+        result: { status: "cancelled" },
+        cancel: () => neverCancel,
+      },
+    ]);
+    const agent = makeAgent(runtime);
+    const runPromise = agent.run("p", "/w");
+    const rejection = expect(runPromise).rejects.toBeInstanceOf(
+      IncompleteAgentShutdownError,
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.cancelCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    await rejection;
+    expect(runtime.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed and closes the runtime when turn settlement hangs", async () => {
+    vi.useFakeTimers();
+    const neverSettles = new Promise<AcpRuntimeTurnResult>(() => {});
+    const { runtime } = createFakeRuntime([
+      {
+        events: [],
+        eventError: new Error("stream failed"),
+        result: neverSettles,
+      },
+    ]);
+    const agent = makeAgent(runtime);
+    const runPromise = agent.run("p", "/w");
+    const rejection = expect(runPromise).rejects.toBeInstanceOf(
+      IncompleteAgentShutdownError,
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    await rejection;
+    expect(runtime.close).toHaveBeenCalledTimes(1);
   });
 
   it("redacts raw command targets when ACP startup throws before streaming", async () => {
@@ -398,7 +503,7 @@ describe("AcpAgent", () => {
     expect(messages).not.toContain("usage updated: 100/1000");
   });
 
-  it("reports input-token usage from usage_update status events", async () => {
+  it("keeps ACP usage unavailable despite status events", async () => {
     const onUsage = vi.fn();
     const { runtime } = createFakeRuntime([
       {
@@ -426,21 +531,17 @@ describe("AcpAgent", () => {
 
     const result = await agent.run("p", "/w", { onUsage });
 
-    expect(result.usage.inputTokens).toBe(120);
-    const reported = onUsage.mock.calls.map(
-      (args) => (args[0] as { inputTokens: number }).inputTokens,
-    );
-    // Once usage_update arrives, the reported `used` delta takes over and
-    // overrides the prompt-length estimate that fires at iteration start.
-    expect(reported).toContain(50);
-    expect(reported).toContain(120);
-    expect(reported[reported.length - 1]).toBe(120);
+    expect(result.usage).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      tokensAvailable: false,
+    });
+    expect(onUsage).not.toHaveBeenCalled();
   });
 
-  it("reports per-iteration deltas of `used` across iterations", async () => {
-    // ACP sessions are persistent, so `used` is cumulative across the run.
-    // Each iteration should report only the additional context tokens it
-    // consumed, not the whole conversation context.
+  it("keeps ACP usage unavailable across persistent turns", async () => {
     const { runtime } = createFakeRuntime([
       {
         events: [
@@ -474,8 +575,10 @@ describe("AcpAgent", () => {
     const first = await agent.run("p", "/w");
     const second = await agent.run("p", "/w");
 
-    expect(first.usage.inputTokens).toBe(100);
-    expect(second.usage.inputTokens).toBe(150); // 250 - 100
+    expect(first.usage.tokensAvailable).toBe(false);
+    expect(first.usage.inputTokens).toBe(0);
+    expect(second.usage.tokensAvailable).toBe(false);
+    expect(second.usage.inputTokens).toBe(0);
   });
 
   it("validates the parsed output against the schema", async () => {
@@ -676,35 +779,18 @@ describe("AcpAgent", () => {
     expect(result.output).toEqual(VALID_OUTPUT);
   });
 
-  it("estimates non-zero output tokens from streamed text_delta chunks", async () => {
-    const json = JSON.stringify(VALID_OUTPUT);
+  it("keeps ACP usage unavailable across text, thought, and tool events", async () => {
     const onUsage = vi.fn();
-    const { runtime } = createFakeRuntime([
-      {
-        events: [textDelta(json)],
-        result: { status: "completed" },
-      },
-    ]);
-    const agent = makeAgent(runtime);
-
-    const result = await agent.run("p", "/w", { onUsage });
-    // ACP only reports a cumulative `used` context value (not split
-    // input/output), so we estimate output tokens from streamed bytes.
-    expect(result.usage.outputTokens).toBeGreaterThan(0);
-  });
-
-  it("counts thought-stream text toward output tokens so reasoning agents don't sit at 0", async () => {
-    // Regression: agents that stream reasoning before answering (Gemini,
-    // GPT-5 reasoning models, etc.) used to leave the renderer at 0 output
-    // tokens for the entire thinking phase because only `output` stream
-    // chars were counted. Reasoning is real generated text that consumes
-    // output tokens, so it must count too.
-    const onUsage = vi.fn();
-    const longReasoning = "thinking ".repeat(200);
     const { runtime } = createFakeRuntime([
       {
         events: [
-          textDelta(longReasoning, "thought"),
+          textDelta("thinking", "thought"),
+          {
+            type: "tool_call",
+            text: "read foo",
+            tag: "tool_call",
+            toolCallId: "1",
+          },
           textDelta(JSON.stringify(VALID_OUTPUT)),
         ],
         result: { status: "completed" },
@@ -714,121 +800,14 @@ describe("AcpAgent", () => {
 
     const result = await agent.run("p", "/w", { onUsage });
 
-    const reportedOutputs = onUsage.mock.calls.map(
-      (args) => (args[0] as { outputTokens: number }).outputTokens,
-    );
-    // The renderer should have seen the output token count rise during the
-    // thinking phase, before the final JSON arrived.
-    const reasoningPhaseMax = Math.max(
-      0,
-      ...reportedOutputs.slice(0, reportedOutputs.length - 1),
-    );
-    expect(reasoningPhaseMax).toBeGreaterThan(0);
-    expect(result.usage.outputTokens).toBeGreaterThan(reasoningPhaseMax);
-  });
-
-  it("falls back to a prompt-length input-token estimate when no usage_update events are emitted", async () => {
-    const json = JSON.stringify(VALID_OUTPUT);
-    const { runtime } = createFakeRuntime([
-      {
-        events: [textDelta(json)],
-        result: { status: "completed" },
-      },
-    ]);
-    const agent = makeAgent(runtime);
-
-    const result = await agent.run("p", "/w");
-    // Many ACP adapters never emit usage_update; without an estimate the
-    // renderer would be stuck at 0 input tokens forever.
-    expect(result.usage.inputTokens).toBeGreaterThan(0);
-  });
-
-  it("marks usage as estimated when no usage_update events arrive", async () => {
-    const { runtime } = createFakeRuntime([
-      {
-        events: [textDelta(JSON.stringify(VALID_OUTPUT))],
-        result: { status: "completed" },
-      },
-    ]);
-    const agent = makeAgent(runtime);
-
-    const result = await agent.run("p", "/w");
-    // Without authoritative `used` from the adapter, both numbers are
-    // heuristics - the renderer should know to flag them as estimated.
-    expect(result.usage.estimated).toBe(true);
-  });
-
-  it("does not mark usage as estimated once usage_update has been received", async () => {
-    const { runtime } = createFakeRuntime([
-      {
-        events: [
-          {
-            type: "status",
-            text: "u",
-            tag: "usage_update",
-            used: 100,
-            size: 1000,
-          },
-          textDelta(JSON.stringify(VALID_OUTPUT)),
-        ],
-        result: { status: "completed" },
-      },
-    ]);
-    const agent = makeAgent(runtime);
-
-    const result = await agent.run("p", "/w");
-    expect(result.usage.estimated).toBeFalsy();
-  });
-
-  it("includes a per-tool-call cost in the input estimate when no usage_update fires", async () => {
-    // Adapters that don't emit usage_update leave us with no view into
-    // tool-result token cost, but each tool call typically dumps a chunk of
-    // input back into the model on the next round (file contents, command
-    // output). Counting tool calls in the heuristic gets us closer to reality
-    // than counting only the literal initial prompt.
-    const onUsage = vi.fn();
-    const { runtime: noToolRuntime } = createFakeRuntime([
-      {
-        events: [textDelta(JSON.stringify(VALID_OUTPUT))],
-        result: { status: "completed" },
-      },
-    ]);
-    const baseline = await makeAgent(noToolRuntime).run("p", "/w");
-
-    const { runtime } = createFakeRuntime([
-      {
-        events: [
-          {
-            type: "tool_call",
-            text: "read foo",
-            tag: "tool_call",
-            toolCallId: "1",
-          },
-          {
-            type: "tool_call",
-            text: "read foo",
-            tag: "tool_call_update",
-            toolCallId: "1",
-          },
-          {
-            type: "tool_call",
-            text: "edit foo",
-            tag: "tool_call",
-            toolCallId: "2",
-          },
-          textDelta(JSON.stringify(VALID_OUTPUT)),
-        ],
-        result: { status: "completed" },
-      },
-    ]);
-    const result = await makeAgent(runtime).run("p", "/w", { onUsage });
-
-    // Two distinct tool calls (the third event is a tool_call_update on an
-    // existing call and must not be double-counted).
-    expect(result.usage.inputTokens).toBeGreaterThan(
-      baseline.usage.inputTokens,
-    );
-    expect(result.usage.estimated).toBe(true);
+    expect(result.usage).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      tokensAvailable: false,
+    });
+    expect(onUsage).not.toHaveBeenCalled();
   });
 
   it("reuses the same session across multiple iterations", async () => {
@@ -869,6 +848,50 @@ describe("AcpAgent", () => {
 
     expect(calls.closeInputs).toHaveLength(1);
     expect(calls.closeInputs[0]!.handle).toBe(STUB_HANDLE);
+  });
+
+  it("surfaces incomplete runtime cleanup and retains it for retry", async () => {
+    const { runtime, calls } = createFakeRuntime([
+      {
+        events: [textDelta(JSON.stringify(VALID_OUTPUT))],
+        result: { status: "completed" },
+      },
+    ]);
+    runtime.close.mockRejectedValueOnce(new Error("runtime still active"));
+    const agent = makeAgent(runtime);
+
+    await agent.run("p", "/w");
+    await expect(agent.close()).rejects.toBeInstanceOf(
+      IncompleteAgentShutdownError,
+    );
+    await agent.close();
+
+    expect(runtime.close).toHaveBeenCalledTimes(2);
+    expect(calls.closeInputs).toHaveLength(1);
+  });
+
+  it("bounds hanging runtime cleanup and retains it for retry", async () => {
+    vi.useFakeTimers();
+    const { runtime } = createFakeRuntime([
+      {
+        events: [textDelta(JSON.stringify(VALID_OUTPUT))],
+        result: { status: "completed" },
+      },
+    ]);
+    runtime.close.mockImplementationOnce(() => new Promise<void>(() => {}));
+    const agent = makeAgent(runtime);
+    await agent.run("p", "/w");
+
+    const closePromise = agent.close();
+    const rejection = expect(closePromise).rejects.toBeInstanceOf(
+      IncompleteAgentShutdownError,
+    );
+    await vi.advanceTimersByTimeAsync(3_000);
+    await rejection;
+
+    runtime.close.mockResolvedValueOnce(undefined);
+    await agent.close();
+    expect(runtime.close).toHaveBeenCalledTimes(2);
   });
 
   it("close() is a no-op when no session was opened", async () => {

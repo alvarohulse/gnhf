@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "<receipt-id>",
+  "runId": "<run-id>",
+  "state": "created",
+  "worktreePath": "<fixture>/repo-gnhf-worktrees/<run-id>",
+  "baseCommit": "53a86c3a26ac0f1c6716099b582a383268c5378f"
+}

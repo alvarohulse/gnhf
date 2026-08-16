@@ -1,17 +1,25 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import type {
-  Agent,
-  AgentResult,
-  AgentOutput,
-  TokenUsage,
-  AgentRunOptions,
+import {
+  isValidTokenCount,
+  type Agent,
+  type AgentResult,
+  type AgentOutput,
+  type TokenUsage,
+  type AgentRunOptions,
 } from "./types.js";
 import {
   parseJSONLStream,
   setupAbortHandler,
   setupChildProcessHandlers,
 } from "./stream-utils.js";
+import {
+  ChildProcessShutdownTracker,
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+  shutdownWindowsProcessTree,
+  spawnManagedChildProcess,
+} from "./managed-process.js";
 
 interface CodexItemCompleted {
   type: "item.completed";
@@ -33,6 +41,7 @@ interface CodexAgentDeps {
   bin?: string;
   extraArgs?: string[];
   platform?: NodeJS.Platform;
+  supervisedProcessGroup?: boolean;
 }
 
 function shouldUseWindowsShell(
@@ -66,22 +75,16 @@ function shouldUseWindowsShell(
   }
 }
 
-function terminateCodexProcess(
+async function shutdownCodexProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
-): void {
-  if (platform === "win32" && child.pid) {
-    try {
-      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: the process may have already exited.
-    }
-    return;
+  detached: boolean,
+): Promise<void> {
+  if (platform === "win32") {
+    return shutdownWindowsProcessTree(child);
   }
 
-  child.kill("SIGTERM");
+  await shutdownChildProcess(child, { detached });
 }
 
 function buildCodexArgs(
@@ -120,16 +123,23 @@ function buildCodexArgs(
 export class CodexAgent implements Agent {
   name = "codex";
 
+  private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
+  private detached: boolean;
   private extraArgs?: string[];
   private platform: NodeJS.Platform;
   private schemaPath: string;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(schemaPath: string, binOrDeps: string | CodexAgentDeps = {}) {
     const deps = typeof binOrDeps === "string" ? { bin: binOrDeps } : binOrDeps;
     this.bin = deps.bin ?? "codex";
     this.extraArgs = deps.extraArgs;
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.schemaPath = schemaPath;
   }
 
@@ -143,22 +153,36 @@ export class CodexAgent implements Agent {
     return new Promise((resolve, reject) => {
       const logStream = logPath ? createWriteStream(logPath) : null;
 
-      const child = spawn(
+      const child = spawnManagedChildProcess(
+        spawn,
         this.bin,
         buildCodexArgs(prompt, this.schemaPath, this.extraArgs),
         {
           cwd,
+          detached: this.detached,
           shell: shouldUseWindowsShell(this.bin, this.platform),
           stdio: ["ignore", "pipe", "pipe"],
           env: process.env,
         },
+        this.shutdowns,
+        this.platform,
       );
+      this.activeChild = child;
+      child.on("close", () => {
+        if (this.activeChild === child) {
+          this.activeChild = null;
+        }
+      });
+      const finalizeRun = () =>
+        this.shutdowns.finalizeOwnedProcessGroup(child, this.detached, () =>
+          shutdownCodexProcess(child, this.platform, this.detached),
+        );
+      const shutdownRun = () =>
+        this.shutdowns.start(() =>
+          shutdownCodexProcess(child, this.platform, this.detached),
+        );
 
-      if (
-        setupAbortHandler(signal, child, reject, () =>
-          terminateCodexProcess(child, this.platform),
-        )
-      ) {
+      if (setupAbortHandler(signal, child, reject, shutdownRun)) {
         return;
       }
 
@@ -168,7 +192,10 @@ export class CodexAgent implements Agent {
         outputTokens: 0,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       };
+      let incompleteUsageObserved = false;
+      let usageEventCount = 0;
 
       parseJSONLStream<CodexEvent>(child.stdout!, logStream, (event) => {
         if (
@@ -182,30 +209,66 @@ export class CodexAgent implements Agent {
 
         if (event.type === "turn.completed" && "usage" in event) {
           const u = (event as CodexTurnCompleted).usage;
-          cumulative.inputTokens += u.input_tokens ?? 0;
-          cumulative.outputTokens += u.output_tokens ?? 0;
-          cumulative.cacheReadTokens += u.cached_input_tokens ?? 0;
+          usageEventCount += 1;
+          const eventTokensAvailable =
+            isValidTokenCount(u.input_tokens) &&
+            isValidTokenCount(u.output_tokens);
+          incompleteUsageObserved ||= !eventTokensAvailable;
+          cumulative.inputTokens += isValidTokenCount(u.input_tokens)
+            ? u.input_tokens
+            : 0;
+          cumulative.outputTokens += isValidTokenCount(u.output_tokens)
+            ? u.output_tokens
+            : 0;
+          cumulative.cacheReadTokens += isValidTokenCount(u.cached_input_tokens)
+            ? u.cached_input_tokens
+            : 0;
+          cumulative.totalTokens =
+            cumulative.inputTokens + cumulative.outputTokens;
+          cumulative.tokensAvailable =
+            usageEventCount > 0 && !incompleteUsageObserved;
           onUsage?.({ ...cumulative });
         }
       });
 
-      setupChildProcessHandlers(child, "codex", logStream, reject, () => {
-        if (!lastAgentMessage) {
-          reject(new Error("codex returned no agent message"));
-          return;
-        }
+      setupChildProcessHandlers(
+        child,
+        "codex",
+        logStream,
+        reject,
+        () => {
+          if (!lastAgentMessage) {
+            reject(new Error("codex returned no agent message"));
+            return;
+          }
 
-        try {
-          const output = JSON.parse(lastAgentMessage) as AgentOutput;
-          resolve({ output, usage: cumulative });
-        } catch (err) {
-          reject(
-            new Error(
-              `Failed to parse codex output: ${err instanceof Error ? err.message : err}`,
-            ),
-          );
-        }
-      });
+          try {
+            const output = JSON.parse(lastAgentMessage) as AgentOutput;
+            resolve({ output, usage: cumulative });
+          } catch (err) {
+            reject(
+              new Error(
+                `Failed to parse codex output: ${err instanceof Error ? err.message : err}`,
+              ),
+            );
+          }
+        },
+        { finalize: finalizeRun, shutdown: shutdownRun },
+      );
     });
+  }
+
+  async close(): Promise<void> {
+    const activeChild = this.activeChild;
+    if (activeChild !== null) {
+      this.shutdowns.start(() =>
+        shutdownCodexProcess(activeChild, this.platform, this.detached),
+      );
+    }
+    await this.shutdowns.finalize();
+  }
+
+  getUnverifiedCleanupError() {
+    return this.shutdowns.getUnverifiedCleanupError();
   }
 }

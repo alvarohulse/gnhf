@@ -1,14 +1,26 @@
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import {
+  getTokenUsageTotal,
+  hasCompleteTokenUsage,
+  IncompleteAgentShutdownError,
   PermanentAgentError,
+  UnverifiedAgentCleanupError,
   type Agent,
   type AgentOutput,
   type TokenUsage,
 } from "./agents/types.js";
 import { redactAgentSpecForLogs, type Config } from "./config.js";
-import type { RunInfo } from "./run.js";
-import { appendNotes, toStringArray } from "./run.js";
+import type { RunInfo, WorkspaceRecovery } from "./run.js";
+import {
+  appendNotes,
+  clearWorkspaceRecovery,
+  readRunUsageState,
+  readWorkspaceRecovery,
+  toStringArray,
+  writeRunUsageState,
+  writeWorkspaceRecovery,
+} from "./run.js";
 import { appendDebugLog, serializeError } from "./debug-log.js";
 import {
   CommitFailedError,
@@ -16,7 +28,6 @@ import {
   getBranchCommitCount,
   getCurrentBranch,
   getHeadCommit,
-  pushCurrentBranch,
   resetHard,
 } from "./git.js";
 import {
@@ -46,9 +57,9 @@ export interface OrchestratorState {
   currentIteration: number;
   totalInputTokens: number;
   totalOutputTokens: number;
-  // Sticky flag: true when at least one iteration's usage was reported as
-  // estimated (e.g. an ACP adapter that doesn't emit usage_update). Once set,
-  // it stays set for the rest of the run so totals are presented honestly.
+  reportedCostUsd: number | null;
+  tokensAvailable?: boolean;
+  // Sticky diagnostic flag for completed iterations that returned estimates.
   tokensEstimated: boolean;
   commitCount: number;
   iterations: IterationRecord[];
@@ -61,6 +72,7 @@ export interface OrchestratorState {
   lastMessage: string | null;
   lastAgentError?: string | null;
   hasPendingCommitFailure?: boolean;
+  hasPendingWorkspaceRecovery?: boolean;
 }
 
 export interface OrchestratorEvents {
@@ -74,8 +86,9 @@ export interface OrchestratorEvents {
 export interface RunLimits {
   maxIterations?: number;
   maxTokens?: number;
+  maxReportedCostUsd?: number;
   stopWhen?: string;
-  push?: boolean;
+  preserveWorkspaceOnForceStop?: boolean;
 }
 
 const STOP_CLOSE_AGENT_GRACE_MS = 250;
@@ -90,6 +103,22 @@ type RunIterationResult =
   | { type: "stopped" }
   | { type: "aborted"; reason: string };
 
+type AgentRunOutcome = "aborted" | "completed" | "error" | "stopped";
+
+type AppendAgentRunReceiptParams = {
+  iteration: number;
+  startedAt: number;
+  outcome: AgentRunOutcome;
+  success: boolean | null;
+  usage: TokenUsage | null;
+};
+
+type PersistedTokenLowerBounds = {
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalTokens: number;
+};
+
 export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private config: Config;
   private agent: Agent;
@@ -102,20 +131,31 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private activeIterationPromise: Promise<RunIterationResult> | null = null;
   private activeAbortController: AbortController | null = null;
   private pendingAbortReason: string | null = null;
-  private pendingCommitFailure: string | null = null;
+  private pendingWorkspaceRecovery: WorkspaceRecovery | null = null;
+  private activeWorkspaceRecoveryMarker = false;
+  private closePromise: Promise<void> | null = null;
+  private activeIterationTokensAvailable: boolean | null = null;
   private activeIterationTokensEstimated = false;
+  private hasAuthoritativeTokenReceipt = false;
+  private totalTokens = 0;
+  private tokensUnavailable = false;
+  private reportedCostUnavailable = false;
+  private persistedReportedCostUsd: number | null = null;
+  private reportedCostLowerBoundUsd: number | null = null;
+  private unsafeShutdownDetected = false;
   private loopDone = false;
   private stoppedEventEmitted = false;
 
   private state: Omit<
     OrchestratorState,
-    "interruptHint" | "hasPendingCommitFailure"
+    "interruptHint" | "hasPendingCommitFailure" | "hasPendingWorkspaceRecovery"
   > = {
     status: "running",
     gracefulStopRequested: false,
     currentIteration: 0,
     totalInputTokens: 0,
     totalOutputTokens: 0,
+    reportedCostUsd: null,
     tokensEstimated: false,
     commitCount: 0,
     iterations: [],
@@ -150,6 +190,41 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       this.runInfo.baseCommit,
       this.cwd,
     );
+    this.pendingWorkspaceRecovery = readWorkspaceRecovery(this.runInfo);
+    this.unsafeShutdownDetected =
+      this.pendingWorkspaceRecovery?.cleanupUncertain === true;
+    const usageState = readRunUsageState(this.runInfo);
+    if (usageState !== null) {
+      const usageGenerationComplete =
+        usageState.phase === "terminal" &&
+        usageState.generation === startIteration;
+      const hasReportedCostAuthority =
+        usageState.reportedCostLowerBoundUsd !== undefined;
+      this.state.totalInputTokens = usageState.totalInputTokens;
+      this.state.totalOutputTokens = usageState.totalOutputTokens;
+      this.totalTokens = usageState.totalTokens;
+      this.persistedReportedCostUsd = usageState.reportedCostUsd;
+      this.reportedCostLowerBoundUsd =
+        usageState.reportedCostLowerBoundUsd ?? null;
+      this.state.reportedCostUsd =
+        usageGenerationComplete &&
+        hasReportedCostAuthority &&
+        !usageState.reportedCostUnavailable
+          ? usageState.reportedCostUsd
+          : null;
+      this.tokensUnavailable =
+        usageState.tokensUnavailable || !usageGenerationComplete;
+      this.reportedCostUnavailable =
+        usageState.reportedCostUnavailable ||
+        !usageGenerationComplete ||
+        !hasReportedCostAuthority;
+      this.state.tokensEstimated = usageState.tokensEstimated;
+      this.hasAuthoritativeTokenReceipt =
+        usageState.hasAuthoritativeTokenReceipt;
+    } else if (startIteration > 0) {
+      this.tokensUnavailable = true;
+      this.reportedCostUnavailable = true;
+    }
   }
 
   getState(): OrchestratorState {
@@ -157,8 +232,16 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       ...this.state,
       tokensEstimated:
         this.state.tokensEstimated || this.activeIterationTokensEstimated,
+      tokensAvailable:
+        !this.tokensUnavailable &&
+        this.activeIterationTokensAvailable !== false,
       interruptHint: getInterruptHint(this.state),
-      hasPendingCommitFailure: this.pendingCommitFailure !== null,
+      hasPendingCommitFailure:
+        this.pendingWorkspaceRecovery?.kind === "commit-failure",
+      hasPendingWorkspaceRecovery:
+        this.pendingWorkspaceRecovery !== null ||
+        this.activeWorkspaceRecoveryMarker ||
+        this.unsafeShutdownDetected,
     };
   }
 
@@ -233,8 +316,13 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       } else {
         await this.closeAgent();
       }
-      resetHard(this.cwd);
-      this.pendingCommitFailure = null;
+      if (
+        this.limits.preserveWorkspaceOnForceStop !== true &&
+        !this.unsafeShutdownDetected &&
+        this.pendingWorkspaceRecovery === null
+      ) {
+        this.resetWorkspace();
+      }
       this.state.status = "stopped";
       this.emit("state", this.getState());
       this.emitStopped();
@@ -244,6 +332,9 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   async start(): Promise<void> {
     this.state.startTime = new Date();
     this.state.status = "running";
+    if (this.state.currentIteration === 0) {
+      this.activeIterationTokensAvailable = false;
+    }
     // Preserve a pre-start graceful-stop request. ctrl+c can land after the
     // renderer starts listening but before the orchestrator loop begins.
     this.emit("state", this.getState());
@@ -254,7 +345,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       startIteration: this.state.currentIteration,
       maxIterations: this.limits.maxIterations,
       maxTokens: this.limits.maxTokens,
-      push: this.limits.push === true,
+      maxReportedCostUsd: this.limits.maxReportedCostUsd,
       maxConsecutiveFailures: this.config.maxConsecutiveFailures,
       baseCommit: this.runInfo.baseCommit,
       initialCommitCount: this.state.commitCount,
@@ -273,6 +364,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
         this.state.currentIteration++;
         this.state.status = "running";
+        this.activeIterationTokensAvailable = false;
+        this.activeIterationTokensEstimated = false;
         this.emit("iteration:start", this.state.currentIteration);
         this.emit("state", this.getState());
 
@@ -283,16 +376,25 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           stopWhen: this.limits.stopWhen,
           commitMessage: this.config.commitMessage,
         });
-        const iterationPrompt = this.pendingCommitFailure
-          ? this.buildCommitRepairPrompt(baseIterationPrompt)
+        const iterationPrompt = this.pendingWorkspaceRecovery
+          ? this.buildWorkspaceRecoveryPrompt(
+              baseIterationPrompt,
+              this.pendingWorkspaceRecovery,
+            )
           : baseIterationPrompt;
 
         appendDebugLog("iteration:start", {
           iteration: this.state.currentIteration,
           promptLength: iterationPrompt.length,
           consecutiveFailures: this.state.consecutiveFailures,
-          totalInputTokens: this.state.totalInputTokens,
-          totalOutputTokens: this.state.totalOutputTokens,
+          totalInputTokens: this.tokensUnavailable
+            ? null
+            : this.state.totalInputTokens,
+          totalOutputTokens: this.tokensUnavailable
+            ? null
+            : this.state.totalOutputTokens,
+          tokensAvailable: !this.tokensUnavailable,
+          reportedCostUsd: this.state.reportedCostUsd,
           git: this.snapshotGitState(),
         });
 
@@ -332,8 +434,13 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           keyChanges: record.keyChanges.length,
           keyLearnings: record.keyLearnings.length,
           consecutiveFailures: this.state.consecutiveFailures,
-          totalInputTokens: this.state.totalInputTokens,
-          totalOutputTokens: this.state.totalOutputTokens,
+          totalInputTokens: this.tokensUnavailable
+            ? null
+            : this.state.totalInputTokens,
+          totalOutputTokens: this.tokensUnavailable
+            ? null
+            : this.state.totalOutputTokens,
+          tokensAvailable: !this.tokensUnavailable,
           tokensEstimated: this.state.tokensEstimated,
           commitCount: this.state.commitCount,
         });
@@ -419,8 +526,17 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         iterations: this.state.currentIteration,
         successCount: this.state.successCount,
         failCount: this.state.failCount,
-        totalInputTokens: this.state.totalInputTokens,
-        totalOutputTokens: this.state.totalOutputTokens,
+        totalInputTokens: this.tokensUnavailable
+          ? null
+          : this.state.totalInputTokens,
+        totalOutputTokens: this.tokensUnavailable
+          ? null
+          : this.state.totalOutputTokens,
+        tokensAvailable: !this.tokensUnavailable,
+        reportedCostUsd: this.state.reportedCostUsd,
+        reportedCostLowerBoundUsd: this.reportedCostLowerBoundUsd,
+        reportedCostAvailable:
+          !this.reportedCostUnavailable && this.state.reportedCostUsd !== null,
         commitCount: this.state.commitCount,
       });
     }
@@ -429,25 +545,82 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private async runIteration(prompt: string): Promise<RunIterationResult> {
     const baseInputTokens = this.state.totalInputTokens;
     const baseOutputTokens = this.state.totalOutputTokens;
+    const baseTotalTokens = this.totalTokens;
+    const baseReportedCostUsd = this.state.reportedCostUsd;
+    const baseReportedCostLowerBoundUsd = this.reportedCostLowerBoundUsd;
+    let inputTokenLowerBound = baseInputTokens;
+    let outputTokenLowerBound = baseOutputTokens;
+    let totalTokenLowerBound = baseTotalTokens;
+    let agentRunReceiptWritten = false;
+    let pendingAbortUsage: TokenUsage | null = null;
+
+    if (
+      this.limits.preserveWorkspaceOnForceStop === true &&
+      this.pendingWorkspaceRecovery === null
+    ) {
+      writeWorkspaceRecovery(this.runInfo, {
+        kind: "interrupted",
+        detail:
+          "The previous invocation stopped before the active iteration completed.",
+        cleanupUncertain: false,
+      });
+      this.activeWorkspaceRecoveryMarker = true;
+    }
 
     this.activeAbortController = new AbortController();
     this.pendingAbortReason = null;
-    this.activeIterationTokensEstimated = false;
 
     const onUsage = (usage: TokenUsage) => {
-      this.state.totalInputTokens = baseInputTokens + usage.inputTokens;
-      this.state.totalOutputTokens = baseOutputTokens + usage.outputTokens;
+      const tokensAvailable = hasCompleteTokenUsage(usage);
+      const tokensAuthoritative = tokensAvailable && usage.estimated !== true;
+      this.activeIterationTokensAvailable = tokensAvailable;
+      if (tokensAuthoritative) {
+        updateTokenLowerBounds(usage);
+        this.hasAuthoritativeTokenReceipt = true;
+        applyTokenLowerBounds(this);
+      } else if (tokensAvailable) {
+        this.state.totalInputTokens = baseInputTokens + usage.inputTokens;
+        this.state.totalOutputTokens = baseOutputTokens + usage.outputTokens;
+        this.totalTokens = baseTotalTokens + getTokenUsageTotal(usage);
+      } else {
+        this.state.totalInputTokens = inputTokenLowerBound;
+        this.state.totalOutputTokens = outputTokenLowerBound;
+        this.totalTokens = totalTokenLowerBound;
+      }
+      if (
+        usage.reportedCostUsd !== undefined &&
+        !this.reportedCostUnavailable
+      ) {
+        this.persistedReportedCostUsd =
+          (baseReportedCostUsd ?? 0) + usage.reportedCostUsd;
+        this.state.reportedCostUsd = this.persistedReportedCostUsd;
+      } else {
+        this.state.reportedCostUsd = baseReportedCostUsd;
+      }
       this.activeIterationTokensEstimated = usage.estimated === true;
+      this.writeUsageState(this.state.currentIteration, "in-progress", {
+        totalInputTokens: inputTokenLowerBound,
+        totalOutputTokens: outputTokenLowerBound,
+        totalTokens: totalTokenLowerBound,
+      });
       this.emit("state", this.getState());
 
-      const reason = this.getTokenAbortReason();
-      if (
-        reason &&
-        this.activeAbortController &&
-        !this.activeAbortController.signal.aborted
-      ) {
-        this.pendingAbortReason = reason;
-        this.activeAbortController.abort();
+      const tokenAbortReason = tokensAuthoritative
+        ? this.getTokenAbortReason(true)
+        : null;
+      if (this.pendingAbortReason !== null) {
+        if (isAuthoritativeTokenUsage(usage)) {
+          pendingAbortUsage = { ...usage };
+        }
+      } else if (tokenAbortReason !== null) {
+        this.pendingAbortReason = tokenAbortReason;
+        pendingAbortUsage = { ...usage };
+        if (
+          this.activeAbortController &&
+          !this.activeAbortController.signal.aborted
+        ) {
+          this.activeAbortController.abort();
+        }
       }
     };
 
@@ -462,6 +635,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     );
 
     const agentStartedAt = Date.now();
+    this.writeUsageState(this.state.currentIteration, "in-progress");
     appendDebugLog("agent:run:start", {
       iteration: this.state.currentIteration,
       agent: redactAgentSpecForLogs(this.agent.name),
@@ -475,38 +649,65 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         signal: this.activeAbortController.signal,
         logPath,
       });
+      this.observeUnverifiedAgentCleanup();
 
-      this.activeIterationTokensEstimated = false;
-      if (result.usage.estimated) this.state.tokensEstimated = true;
-
-      appendDebugLog("agent:run:end", {
-        iteration: this.state.currentIteration,
-        elapsedMs: Date.now() - agentStartedAt,
-        success: result.output.success,
-        inputTokens: result.usage.inputTokens,
-        outputTokens: result.usage.outputTokens,
-        cacheReadTokens: result.usage.cacheReadTokens,
-        cacheCreationTokens: result.usage.cacheCreationTokens,
-        estimated: result.usage.estimated ?? false,
-      });
+      if (this.pendingAbortReason !== null && pendingAbortUsage !== null) {
+        const terminalTokensCanCorrectAbort = isAuthoritativeTokenUsage(
+          result.usage,
+        );
+        const abortUsage = combineTokenUsageWithTerminalCost(
+          terminalTokensCanCorrectAbort ? result.usage : pendingAbortUsage,
+          result.usage,
+        );
+        if (terminalTokensCanCorrectAbort) {
+          applyTerminalUsage(this, abortUsage);
+          this.pendingAbortReason = this.getTokenAbortReason(true);
+        }
+        if (this.pendingAbortReason !== null) {
+          return await settleRuntimeLimitAbort(this, abortUsage);
+        }
+      }
 
       if (this.stopRequested) {
+        restoreLiveUsage(this);
+        this.reportedCostUnavailable = true;
+        this.state.reportedCostUsd = null;
+        this.appendAgentRunReceipt({
+          iteration: this.state.currentIteration,
+          startedAt: agentStartedAt,
+          outcome: "stopped",
+          success: null,
+          usage: null,
+        });
+        agentRunReceiptWritten = true;
         return { type: "stopped" };
       }
+
+      applyTerminalUsage(this, result.usage);
+
+      const reportedCostAbortReason = this.getReportedCostAbortReason();
+      if (reportedCostAbortReason !== null) {
+        this.pendingAbortReason = reportedCostAbortReason;
+        return await settleRuntimeLimitAbort(this, result.usage);
+      }
+
+      this.appendAgentRunReceipt({
+        iteration: this.state.currentIteration,
+        startedAt: agentStartedAt,
+        outcome: "completed",
+        success: result.output.success,
+        usage: result.usage,
+      });
+      agentRunReceiptWritten = true;
 
       const shouldFullyStop = result.output.should_fully_stop === true;
 
       if (result.output.success) {
         const record = this.recordSuccess(result.output);
-        const abortReason =
-          record.success && this.limits.push === true
-            ? this.pushAfterSuccess()
-            : undefined;
         return {
           type: "completed",
           record,
           shouldFullyStop: record.success ? shouldFullyStop : false,
-          ...(abortReason === undefined ? {} : { abortReason }),
         };
       }
       return {
@@ -520,26 +721,53 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         shouldFullyStop,
       };
     } catch (err) {
+      this.observeUnverifiedAgentCleanup();
       const elapsedMs = Date.now() - agentStartedAt;
-      if (this.activeIterationTokensEstimated) {
-        this.state.tokensEstimated = true;
-        this.activeIterationTokensEstimated = false;
-      }
-
-      if (
-        this.pendingAbortReason &&
-        err instanceof Error &&
-        err.message === "Agent was aborted"
-      ) {
-        appendDebugLog("agent:run:aborted", {
+      if (err instanceof IncompleteAgentShutdownError) {
+        this.preserveWorkspaceAfterUnsafeShutdown(err);
+        if (!agentRunReceiptWritten) {
+          restoreLiveUsage(this);
+          this.reportedCostUnavailable = true;
+          this.state.reportedCostUsd = null;
+          this.appendAgentRunReceipt({
+            iteration: this.state.currentIteration,
+            startedAt: agentStartedAt,
+            outcome: "aborted",
+            success: null,
+            usage: null,
+          });
+          agentRunReceiptWritten = true;
+        }
+        appendDebugLog("agent:run:error", {
           iteration: this.state.currentIteration,
           elapsedMs,
-          reason: this.pendingAbortReason,
+          error: serializeError(err),
         });
-        if (this.pendingCommitFailure === null) {
-          resetHard(this.cwd);
-        }
-        return { type: "aborted", reason: this.pendingAbortReason };
+        return { type: "aborted", reason: err.message };
+      }
+      if (this.pendingAbortReason !== null && pendingAbortUsage !== null) {
+        return await settleRuntimeLimitAbort(
+          this,
+          combineTokenUsageWithTerminalCost(pendingAbortUsage),
+        );
+      }
+      if (!agentRunReceiptWritten) {
+        restoreLiveUsage(this);
+        this.reportedCostUnavailable = true;
+        this.state.reportedCostUsd = null;
+        const outcome: AgentRunOutcome =
+          this.pendingAbortReason !== null || err instanceof PermanentAgentError
+            ? "aborted"
+            : this.stopRequested
+              ? "stopped"
+              : "error";
+        this.appendAgentRunReceipt({
+          iteration: this.state.currentIteration,
+          startedAt: agentStartedAt,
+          outcome,
+          success: null,
+          usage: null,
+        });
       }
 
       if (this.stopRequested) {
@@ -561,8 +789,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       });
 
       if (err instanceof PermanentAgentError) {
-        if (this.pendingCommitFailure === null) {
-          resetHard(this.cwd);
+        if (this.pendingWorkspaceRecovery === null) {
+          this.resetWorkspace();
         }
         this.state.lastAgentError = err.detail;
         return { type: "aborted", reason: err.message };
@@ -576,8 +804,180 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       };
     } finally {
       this.activeAbortController = null;
+      this.activeIterationTokensAvailable = null;
+      this.activeIterationTokensEstimated = false;
       this.pendingAbortReason = null;
     }
+
+    function restoreLiveUsage(orchestrator: Orchestrator): void {
+      applyTokenLowerBounds(orchestrator);
+      orchestrator.state.reportedCostUsd = baseReportedCostUsd;
+      orchestrator.activeIterationTokensAvailable = false;
+      orchestrator.activeIterationTokensEstimated = false;
+    }
+
+    function applyTerminalUsage(
+      orchestrator: Orchestrator,
+      usage: TokenUsage,
+    ): void {
+      orchestrator.activeIterationTokensAvailable =
+        hasCompleteTokenUsage(usage);
+      orchestrator.activeIterationTokensEstimated = false;
+      if (hasCompleteTokenUsage(usage)) {
+        updateTokenLowerBounds(usage);
+        orchestrator.hasAuthoritativeTokenReceipt ||= usage.estimated !== true;
+        applyTokenLowerBounds(orchestrator);
+      } else {
+        applyTokenLowerBounds(orchestrator);
+      }
+      if (usage.estimated === true) {
+        orchestrator.state.tokensEstimated = true;
+      }
+      if (usage.reportedCostUsd === undefined) {
+        orchestrator.reportedCostUnavailable = true;
+        orchestrator.state.reportedCostUsd = null;
+      } else if (orchestrator.reportedCostUnavailable) {
+        orchestrator.reportedCostLowerBoundUsd =
+          (baseReportedCostLowerBoundUsd ?? 0) + usage.reportedCostUsd;
+        orchestrator.state.reportedCostUsd = null;
+      } else {
+        orchestrator.persistedReportedCostUsd =
+          (baseReportedCostUsd ?? 0) + usage.reportedCostUsd;
+        orchestrator.reportedCostLowerBoundUsd =
+          orchestrator.persistedReportedCostUsd;
+        orchestrator.state.reportedCostUsd =
+          orchestrator.persistedReportedCostUsd;
+      }
+    }
+
+    function updateTokenLowerBounds(usage: TokenUsage): void {
+      inputTokenLowerBound = Math.max(
+        inputTokenLowerBound,
+        baseInputTokens + usage.inputTokens,
+      );
+      outputTokenLowerBound = Math.max(
+        outputTokenLowerBound,
+        baseOutputTokens + usage.outputTokens,
+      );
+      totalTokenLowerBound = Math.max(
+        totalTokenLowerBound,
+        baseTotalTokens + getTokenUsageTotal(usage),
+      );
+    }
+
+    function applyTokenLowerBounds(orchestrator: Orchestrator): void {
+      orchestrator.state.totalInputTokens = inputTokenLowerBound;
+      orchestrator.state.totalOutputTokens = outputTokenLowerBound;
+      orchestrator.totalTokens = totalTokenLowerBound;
+    }
+
+    function isAuthoritativeTokenUsage(usage: TokenUsage): boolean {
+      return hasCompleteTokenUsage(usage) && usage.estimated !== true;
+    }
+
+    function combineTokenUsageWithTerminalCost(
+      tokenUsage: TokenUsage,
+      terminalUsage?: TokenUsage,
+    ): TokenUsage {
+      const usage: TokenUsage = { ...tokenUsage };
+      delete usage.reportedCostUsd;
+      if (terminalUsage?.reportedCostUsd !== undefined) {
+        usage.reportedCostUsd = terminalUsage.reportedCostUsd;
+      }
+      return usage;
+    }
+
+    async function settleRuntimeLimitAbort(
+      orchestrator: Orchestrator,
+      usage: TokenUsage,
+    ): Promise<RunIterationResult> {
+      const reason = orchestrator.pendingAbortReason;
+      if (reason === null) {
+        throw new Error("Runtime limit abort reason is missing");
+      }
+      applyTerminalUsage(orchestrator, usage);
+      orchestrator.appendAgentRunReceipt({
+        iteration: orchestrator.state.currentIteration,
+        startedAt: agentStartedAt,
+        outcome: "aborted",
+        success: null,
+        usage,
+      });
+      agentRunReceiptWritten = true;
+      appendDebugLog("agent:run:aborted", {
+        iteration: orchestrator.state.currentIteration,
+        elapsedMs: Date.now() - agentStartedAt,
+        reason,
+      });
+      try {
+        await orchestrator.closeAgent();
+      } catch (error) {
+        if (error instanceof IncompleteAgentShutdownError) {
+          return { type: "aborted", reason: error.message };
+        }
+        throw error;
+      }
+      if (orchestrator.pendingWorkspaceRecovery === null) {
+        orchestrator.resetWorkspace();
+      }
+      return { type: "aborted", reason };
+    }
+  }
+
+  private appendAgentRunReceipt({
+    iteration,
+    startedAt,
+    outcome,
+    success,
+    usage,
+  }: AppendAgentRunReceiptParams): void {
+    const tokensAvailable = usage !== null && hasCompleteTokenUsage(usage);
+    if (!tokensAvailable) {
+      this.tokensUnavailable = true;
+    }
+    this.writeUsageState(iteration, "terminal");
+    appendDebugLog("agent:run:end", {
+      iteration,
+      elapsedMs: Date.now() - startedAt,
+      outcome,
+      success,
+      inputTokens: tokensAvailable ? usage.inputTokens : null,
+      outputTokens: tokensAvailable ? usage.outputTokens : null,
+      cacheReadTokens: tokensAvailable ? usage.cacheReadTokens : null,
+      cacheCreationTokens: tokensAvailable ? usage.cacheCreationTokens : null,
+      reportedCostUsd: usage?.reportedCostUsd ?? null,
+      reportedCostAvailable: usage?.reportedCostUsd !== undefined,
+      tokensAvailable,
+      estimated: usage?.estimated ?? false,
+    });
+  }
+
+  private writeUsageState(
+    generation: number,
+    phase: "in-progress" | "terminal",
+    tokenLowerBounds?: PersistedTokenLowerBounds,
+  ): void {
+    const persistedTokens =
+      tokenLowerBounds === undefined
+        ? {
+            totalInputTokens: this.state.totalInputTokens,
+            totalOutputTokens: this.state.totalOutputTokens,
+            totalTokens: this.totalTokens,
+          }
+        : tokenLowerBounds;
+    writeRunUsageState(this.runInfo, {
+      generation,
+      phase,
+      totalInputTokens: persistedTokens.totalInputTokens,
+      totalOutputTokens: persistedTokens.totalOutputTokens,
+      totalTokens: persistedTokens.totalTokens,
+      reportedCostUsd: this.persistedReportedCostUsd,
+      reportedCostLowerBoundUsd: this.reportedCostLowerBoundUsd,
+      tokensUnavailable: this.tokensUnavailable,
+      reportedCostUnavailable: this.reportedCostUnavailable,
+      tokensEstimated: this.state.tokensEstimated,
+      hasAuthoritativeTokenReceipt: this.hasAuthoritativeTokenReceipt,
+    });
   }
 
   private recordSuccess(output: AgentOutput): IterationRecord {
@@ -597,7 +997,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       throw error;
     }
 
-    this.pendingCommitFailure = null;
+    this.clearWorkspaceRecovery();
     appendNotes(
       this.runInfo.notesPath,
       this.state.currentIteration,
@@ -623,7 +1023,20 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     };
   }
 
-  private buildCommitRepairPrompt(basePrompt: string): string {
+  private buildWorkspaceRecoveryPrompt(
+    basePrompt: string,
+    recovery: WorkspaceRecovery,
+  ): string {
+    if (recovery.kind === "interrupted") {
+      return `${basePrompt}
+
+## Interrupted Workspace Recovery
+
+The previous invocation stopped while an iteration was active, so the workspace may contain incomplete changes.
+Do not start unrelated work.
+Inspect and finish or repair the existing changes, validate them, then report success.`;
+    }
+
     return `${basePrompt}
 
 ## Previous Commit Failure
@@ -635,12 +1048,18 @@ Inspect and fix the existing uncommitted changes so the commit can pass, then re
 Git commit output:
 
 \`\`\`
-${this.pendingCommitFailure}
+${recovery.detail}
 \`\`\``;
   }
 
   private recordCommitFailure(error: CommitFailedError): IterationRecord {
-    this.pendingCommitFailure = error.detail;
+    this.pendingWorkspaceRecovery = {
+      kind: "commit-failure",
+      detail: error.detail,
+      cleanupUncertain: this.unsafeShutdownDetected,
+    };
+    this.activeWorkspaceRecoveryMarker = false;
+    writeWorkspaceRecovery(this.runInfo, this.pendingWorkspaceRecovery);
     const summary = "git commit failed; asking agent to repair the workspace";
     appendNotes(
       this.runInfo.notesPath,
@@ -663,30 +1082,13 @@ ${this.pendingCommitFailure}
     };
   }
 
-  private pushAfterSuccess(): string | undefined {
-    try {
-      pushCurrentBranch(this.cwd);
-      appendDebugLog("git:push:success", {
-        iteration: this.state.currentIteration,
-      });
-      return undefined;
-    } catch (err) {
-      appendDebugLog("git:push:error", {
-        iteration: this.state.currentIteration,
-        error: serializeError(err),
-      });
-      const message = err instanceof Error ? err.message : String(err);
-      return `push failed: ${message}`;
-    }
-  }
-
   private recordFailure(
     notesSummary: string,
     recordSummary: string,
     learnings: string[],
     kind: "reported" | "error",
   ): IterationRecord {
-    const hadPendingCommitFailure = this.pendingCommitFailure !== null;
+    const hadPendingWorkspaceRecovery = this.pendingWorkspaceRecovery !== null;
     appendNotes(
       this.runInfo.notesPath,
       this.state.currentIteration,
@@ -694,8 +1096,8 @@ ${this.pendingCommitFailure}
       [],
       toStringArray(learnings),
     );
-    if (!hadPendingCommitFailure) {
-      resetHard(this.cwd);
+    if (!hadPendingWorkspaceRecovery) {
+      this.resetWorkspace();
     }
     this.state.failCount++;
     this.state.consecutiveFailures++;
@@ -736,6 +1138,30 @@ ${this.pendingCommitFailure}
     });
   }
 
+  private clearWorkspaceRecovery(): void {
+    if (this.unsafeShutdownDetected) {
+      return;
+    }
+    clearWorkspaceRecovery(this.runInfo);
+    this.pendingWorkspaceRecovery = null;
+    this.activeWorkspaceRecoveryMarker = false;
+  }
+
+  private resetWorkspace(): void {
+    if (this.unsafeShutdownDetected) {
+      return;
+    }
+    resetHard(this.cwd);
+    this.clearWorkspaceRecovery();
+  }
+
+  private observeUnverifiedAgentCleanup(): void {
+    const error = this.agent.getUnverifiedCleanupError?.();
+    if (error !== undefined && error !== null) {
+      this.preserveWorkspaceAfterUnsafeShutdown(error, false);
+    }
+  }
+
   private getPreIterationAbortReason(): string | null {
     if (
       this.limits.maxIterations !== undefined &&
@@ -744,7 +1170,7 @@ ${this.pendingCommitFailure}
       return `max iterations reached (${this.limits.maxIterations})`;
     }
 
-    return this.getTokenAbortReason();
+    return this.getTokenAbortReason() ?? this.getReportedCostAbortReason();
   }
 
   private getPostIterationAbortReason(): string | null {
@@ -755,17 +1181,38 @@ ${this.pendingCommitFailure}
       return `max iterations reached (${this.limits.maxIterations})`;
     }
 
-    return this.getTokenAbortReason();
+    return this.getTokenAbortReason() ?? this.getReportedCostAbortReason();
   }
 
-  private getTokenAbortReason(): string | null {
-    if (this.limits.maxTokens === undefined) return null;
+  private getTokenAbortReason(
+    hasAuthoritativeReceipt = this.hasAuthoritativeTokenReceipt,
+  ): string | null {
+    if (
+      this.limits.maxTokens === undefined ||
+      this.state.tokensEstimated ||
+      !hasAuthoritativeReceipt
+    ) {
+      return null;
+    }
 
-    const totalTokens =
-      this.state.totalInputTokens + this.state.totalOutputTokens;
-    if (totalTokens < this.limits.maxTokens) return null;
+    if (this.totalTokens < this.limits.maxTokens) return null;
 
-    return `max tokens reached (${totalTokens}/${this.limits.maxTokens})`;
+    return `max tokens reached (${this.totalTokens}/${this.limits.maxTokens})`;
+  }
+
+  private getReportedCostAbortReason(): string | null {
+    const reportedCostUsd = this.reportedCostUnavailable
+      ? this.reportedCostLowerBoundUsd
+      : this.state.reportedCostUsd;
+    if (
+      this.limits.maxReportedCostUsd === undefined ||
+      reportedCostUsd === null ||
+      reportedCostUsd < this.limits.maxReportedCostUsd
+    ) {
+      return null;
+    }
+
+    return `max reported cost reached ($${reportedCostUsd.toFixed(2)}/$${this.limits.maxReportedCostUsd.toFixed(2)})`;
   }
 
   private finishGracefulStop(): void {
@@ -806,13 +1253,45 @@ ${this.pendingCommitFailure}
   }
 
   private async closeAgent(): Promise<void> {
-    try {
-      await this.agent.close?.();
-    } catch (err) {
-      appendDebugLog("agent:close:error", {
-        error: serializeError(err),
-      });
-      // Best-effort cleanup only.
+    if (this.closePromise === null) {
+      this.closePromise = (async () => {
+        try {
+          await this.agent.close?.();
+        } catch (err) {
+          appendDebugLog("agent:close:error", {
+            error: serializeError(err),
+          });
+          if (err instanceof IncompleteAgentShutdownError) {
+            if (err instanceof UnverifiedAgentCleanupError) {
+              this.preserveWorkspaceAfterUnsafeShutdown(err, false);
+              return;
+            }
+            this.preserveWorkspaceAfterUnsafeShutdown(err);
+            throw err;
+          }
+        }
+      })();
+    }
+    await this.closePromise;
+  }
+
+  private preserveWorkspaceAfterUnsafeShutdown(
+    error: IncompleteAgentShutdownError,
+    surfaceAsAgentError = true,
+  ): void {
+    this.unsafeShutdownDetected = true;
+    this.pendingWorkspaceRecovery =
+      this.pendingWorkspaceRecovery?.kind === "commit-failure"
+        ? { ...this.pendingWorkspaceRecovery, cleanupUncertain: true }
+        : {
+            kind: "interrupted",
+            detail: error.message,
+            cleanupUncertain: true,
+          };
+    writeWorkspaceRecovery(this.runInfo, this.pendingWorkspaceRecovery);
+    this.activeWorkspaceRecoveryMarker = false;
+    if (surfaceAsAgentError) {
+      this.state.lastAgentError = error.message;
     }
   }
 

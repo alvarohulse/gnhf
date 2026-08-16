@@ -6,6 +6,19 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
+vi.mock("./managed-process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./managed-process.js")>();
+  return {
+    ...actual,
+    spawnManagedChildProcess: (
+      spawnProcess: typeof import("node:child_process").spawn,
+      command: string,
+      args: string[],
+      options: import("node:child_process").SpawnOptions,
+    ) => spawnProcess(command, args, options),
+  };
+});
+
 import { execFileSync, spawn } from "node:child_process";
 import { CodexAgent } from "./codex.js";
 
@@ -13,6 +26,8 @@ const mockSpawn = vi.mocked(spawn);
 
 function createMockProcess() {
   const proc = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    signalCode: null,
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     stdin: null,
@@ -49,6 +64,7 @@ describe("CodexAgent", () => {
       ],
       {
         cwd: "/work/dir",
+        detached: false,
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
         env: process.env,
@@ -80,6 +96,7 @@ describe("CodexAgent", () => {
       ],
       {
         cwd: "/work/dir",
+        detached: false,
         shell: true,
         stdio: ["ignore", "pipe", "pipe"],
         env: process.env,
@@ -114,6 +131,7 @@ describe("CodexAgent", () => {
       ],
       {
         cwd: "/work/dir",
+        detached: false,
         shell: true,
         stdio: ["ignore", "pipe", "pipe"],
         env: process.env,
@@ -156,6 +174,167 @@ describe("CodexAgent", () => {
     );
   });
 
+  it("creates an owned process group for unsupervised Unix runs", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CodexAgent("/tmp/schema.json", {
+      platform: "linux",
+      supervisedProcessGroup: false,
+    });
+
+    agent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "codex",
+      expect.any(Array),
+      expect.objectContaining({ detached: true }),
+    );
+  });
+
+  it("stays inside an external supervisor process group", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CodexAgent("/tmp/schema.json", {
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+
+    agent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "codex",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
+    );
+  });
+
+  it("uses the provider total without double counting cached input", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const onUsage = vi.fn();
+    const agent = new CodexAgent("/tmp/schema.json", {
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+    const promise = agent.run("test prompt", "/work/dir", { onUsage });
+
+    proc.stdout.emit(
+      "data",
+      Buffer.from(
+        `${JSON.stringify({
+          type: "turn.completed",
+          usage: {
+            input_tokens: 24_763,
+            cached_input_tokens: 24_448,
+            output_tokens: 122,
+          },
+        })}\n${JSON.stringify({
+          type: "item.completed",
+          item: {
+            type: "agent_message",
+            text: JSON.stringify({
+              success: true,
+              summary: "done",
+              key_changes_made: [],
+              key_learnings: [],
+            }),
+          },
+        })}\n`,
+      ),
+    );
+    proc.emit("close", 0);
+
+    const result = await promise;
+
+    expect(onUsage).toHaveBeenCalledWith({
+      inputTokens: 24_763,
+      outputTokens: 122,
+      cacheReadTokens: 24_448,
+      cacheCreationTokens: 0,
+      totalTokens: 24_885,
+      tokensAvailable: true,
+    });
+    expect(result.usage.totalTokens).toBe(24_885);
+  });
+
+  it("surfaces ownership loss when the group leader closes during abort", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 4321 });
+    mockSpawn.mockReturnValue(proc);
+    const processKill = vi
+      .spyOn(process, "kill")
+      .mockImplementation(() => true);
+    const controller = new AbortController();
+    const agent = new CodexAgent("/tmp/schema.json", { platform: "linux" });
+
+    try {
+      const runPromise = agent.run("test prompt", "/work/dir", {
+        signal: controller.signal,
+      });
+      const rejection = expect(runPromise).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+      controller.abort();
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
+
+      proc.emit("close", null);
+      await vi.advanceTimersByTimeAsync(100);
+      await rejection;
+      expect(processKill).not.toHaveBeenCalledWith(-4321, "SIGKILL");
+      await expect(agent.close()).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects a successful result when group cleanup cannot be proven", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 4321 });
+    mockSpawn.mockReturnValue(proc);
+    const processKill = vi
+      .spyOn(process, "kill")
+      .mockImplementation(() => true);
+    const agent = new CodexAgent("/tmp/schema.json", { platform: "linux" });
+
+    try {
+      const runPromise = agent.run("test prompt", "/work/dir");
+      const rejection = expect(runPromise).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+      proc.stdout.emit(
+        "data",
+        Buffer.from(
+          `${JSON.stringify({
+            type: "item.completed",
+            item: {
+              type: "agent_message",
+              text: JSON.stringify({
+                success: true,
+                summary: "done",
+                key_changes_made: [],
+                key_learnings: [],
+              }),
+            },
+          })}\n`,
+        ),
+      );
+      proc.emit("close", 0);
+
+      await vi.advanceTimersByTimeAsync(100);
+      await rejection;
+      expect(processKill).not.toHaveBeenCalledWith(-4321, "SIGTERM");
+      expect(processKill).not.toHaveBeenCalledWith(-4321, "SIGKILL");
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("suppresses the default dangerous flag when the user sets sandbox mode with = syntax", () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
@@ -194,12 +373,13 @@ describe("CodexAgent", () => {
       signal: controller.signal,
     });
     controller.abort();
+    proc.emit("close", null, null);
 
     await expect(promise).rejects.toThrow("Agent was aborted");
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
       "taskkill",
       ["/T", "/F", "/PID", "6789"],
-      { stdio: "ignore" },
+      { stdio: "ignore", timeout: 3_000 },
     );
     expect(proc.kill).not.toHaveBeenCalled();
   });

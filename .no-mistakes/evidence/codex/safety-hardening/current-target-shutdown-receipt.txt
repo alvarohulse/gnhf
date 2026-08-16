@@ -1,0 +1,36 @@
+Target: c3aec605ac16ba89062f5fa6877191175f506d73
+Built CLI: dist/cli.mjs
+Environment: disposable in-worktree Git repository; telemetry disabled; no install, deployment, canary, or network agent
+
+Scenario: stop before the first iteration, preserve the requested worktree, keep unavailable usage unavailable, and atomically finalize the supervisor receipt.
+Command: gnhf "current target receipt evidence" --agent opencode --max-iterations 0 --prevent-sleep off --worktree --preserve-worktree
+Environment: GNHF_WORKTREE_RECEIPT_PATH=<fixture>/receipts/worktree.json, GNHF_TELEMETRY=0
+Exit code: 0
+
+CLI permanent summary:
+  gnhf stopped
+  opencode ran for 0s before: max iterations reached (0)
+  iterations      0 total       0 good       0 failed
+  tokens          unavailable
+  branch diff     0 commits     +0           -0
+  files           0 added       0 updated    0 deleted
+  gnhf: worktree preserved at <fixture>/fixture-gnhf-worktrees/current-target-recei-61a0eb
+
+Final supervisor receipt:
+{
+  "schemaVersion": 1,
+  "receiptId": "<receipt-id>",
+  "runId": "current-target-recei-61a0eb",
+  "state": "shutdown",
+  "worktreePath": "<fixture>/fixture-gnhf-worktrees/current-target-recei-61a0eb",
+  "baseCommit": "b92acd73595a16841e18040af625a59d953c8f1c",
+  "disposition": "preserved",
+  "preservationReason": "requested"
+}
+Receipt mode: 600
+Preserved branch: gnhf/current-target-recei-61a0eb
+Preserved Git status: clean
+
+Lifecycle receipts:
+{"event":"run:complete","signal":null,"status":"aborted","iterations":0,"successCount":0,"failCount":0,"totalInputTokens":null,"totalOutputTokens":null,"tokensAvailable":false,"reportedCostUsd":null,"commitCount":0,"worktreePath":"<fixture>/fixture-gnhf-worktrees/current-target-recei-61a0eb"}
+{"event":"worktree:preserved","worktreePath":"<fixture>/fixture-gnhf-worktrees/current-target-recei-61a0eb","reason":"requested"}

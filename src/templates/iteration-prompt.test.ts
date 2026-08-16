@@ -52,6 +52,22 @@ describe("buildIterationPrompt", () => {
     expect(result).toContain("stopped any background processes");
   });
 
+  it("limits process cleanup to exact identities owned by the worker", () => {
+    const result = buildIterationPrompt({
+      n: 1,
+      runId: "run-1",
+      prompt: "test",
+    });
+
+    expect(result).toContain("record its exact PID or process handle");
+    expect(result).toContain("only those exact owned process identities");
+    expect(result).toContain("pkill");
+    expect(result).toContain("killall");
+    expect(result).toContain("taskkill");
+    expect(result).toContain("Stop-Process -Name");
+    expect(result).toContain("not a process-security boundary");
+  });
+
   it("produces a prompt identical to the default when stopWhen is not set", () => {
     const baseline = buildIterationPrompt({
       n: 1,

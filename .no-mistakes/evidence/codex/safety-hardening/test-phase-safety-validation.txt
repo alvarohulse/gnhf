@@ -1,0 +1,123 @@
+Target: ed9174bb2d9de27579cce0e5f43f6406997ced6e
+Built CLI: dist/cli.mjs
+Environment: disposable in-worktree Git repositories and local agent/inhibitor fixtures; telemetry disabled; no install, deployment, network agent, push, or canary
+
+=== Forced shutdown preserves dirty work and exact process ownership ===
+Command: gnhf "slow cleanup dirty gate evidence" --agent opencode --prevent-sleep off --worktree, then two SIGINT signals
+Environment: GNHF_SUPERVISED_PROCESS_GROUP=1, GNHF_WORKTREE_RECEIPT_PATH=<fixture>/receipts/worktree.json
+Exit code: 130
+
+CLI permanent summary:
+  gnhf wrapped
+  opencode worked for 0s on gnhf/slow-cleanup-dirty-g-a156d3
+  iterations      1 total       0 good       0 failed
+  tokens          unavailable
+  branch diff     0 commits     +0           -0
+  gnhf: worktree preserved at <fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-g-a156d3
+
+Terminal worktree receipt:
+{
+  "schemaVersion": 1,
+  "receiptId": "<receipt-id>",
+  "runId": "slow-cleanup-dirty-g-a156d3",
+  "state": "shutdown",
+  "worktreePath": "<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-g-a156d3",
+  "baseCommit": "2564fd33813d13ed80431bd93c1a01535363e868",
+  "disposition": "preserved",
+  "preservationReason": "pending-recovery"
+}
+
+Original HEAD unchanged: yes
+Original status: clean
+Preserved status: M README.md
+Preserved marker: - mock change 1786882370063
+Managed agent alive after shutdown: no
+Unrelated sibling alive after shutdown: yes
+Turn cleanup order:
+  workspace:changed
+  session:abort
+  session:delete
+  server:shutdown (SIGTERM)
+
+=== Linux inhibitor re-exec retains default clean-worktree cleanup and evidence ===
+Command: gnhf "clean cleanup receipt" --agent opencode --max-iterations 0 --prevent-sleep on --worktree
+Exit code: 0
+
+Inhibitor invocation:
+  systemd-inhibit --what=idle:sleep --mode=block --who=gnhf --why="Prevent sleep while gnhf is running" <node> <checkout>/dist/cli.mjs "clean cleanup receipt" --agent opencode --max-iterations 0 --prevent-sleep on --worktree
+
+CLI permanent summary:
+  gnhf stopped
+  opencode ran for 0s before: max iterations reached (0)
+  iterations      0 total       0 good       0 failed
+  tokens          unavailable
+  branch diff     0 commits     +0           -0
+
+Terminal worktree receipt:
+{
+  "schemaVersion": 1,
+  "receiptId": "<receipt-id>",
+  "runId": "clean-cleanup-receip-1bd999",
+  "state": "shutdown",
+  "worktreePath": "<fixture>/repo-gnhf-worktrees/clean-cleanup-receip-1bd999",
+  "baseCommit": "40e330f7494bc697b015d40065806aadf0332d20",
+  "disposition": "removed"
+}
+
+Worktree exists after shutdown: no
+Originating checkout status: clean
+Copied run evidence:
+  base-commit
+  commit-message
+  gnhf.log
+  notes.md
+  output-schema.json
+  prompt.md
+  runtime-limits.json
+
+=== Persisted complete token receipts enforce the cap across resume ===
+First command: gnhf "resume exact cursor usage" --agent cursor --current-branch --prevent-sleep off --max-iterations 1 --max-tokens 21
+First exit code: 0
+First summary:
+  cursor ran for 0s before: max iterations reached (1)
+  iterations      1 total       1 good       0 failed
+  tokens          12 in         8 out
+  branch diff     1 commit      +1           -0
+
+Resume command: gnhf "resume exact cursor usage" --agent cursor --current-branch --prevent-sleep off --clear-max-iterations
+Resume exit code: 0
+Resume summary:
+  cursor ran for 3s before: max tokens reached (40/21)
+  iterations      2 total       0 good       0 failed
+  tokens          24 in         16 out
+  branch diff     1 commit      +1           -0
+
+Persisted runtime limits:
+{
+  "maxTokens": 21
+}
+
+Terminal usage receipt:
+{
+  "generation": 2,
+  "phase": "terminal",
+  "totalInputTokens": 24,
+  "totalOutputTokens": 16,
+  "totalTokens": 40,
+  "reportedCostUsd": null,
+  "tokensUnavailable": false,
+  "reportedCostUnavailable": true,
+  "tokensEstimated": false,
+  "hasAuthoritativeTokenReceipt": true
+}
+
+Fixture commit count: 2 (initial commit plus the first completed iteration)
+Working tree status after cap abort: clean
+Cursor invocations: 2
+
+=== Push remains forbidden ===
+Command: gnhf "must never push" --agent opencode --current-branch --push --prevent-sleep off
+Exit code: 1
+CLI output: --push is disabled; gnhf never pushes user work.
+HEAD unchanged: yes
+Working tree status: clean

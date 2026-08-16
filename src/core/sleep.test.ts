@@ -159,6 +159,40 @@ describe("startSleepPrevention", () => {
     expect(result).toEqual({ type: "reexeced", exitCode: 0 });
   });
 
+  it("keeps the Linux inhibitor inside an external supervisor group", async () => {
+    const child = createChildProcess();
+    let handleSigTerm: (() => void) | undefined;
+    const processOn = vi.fn((event: string, listener: () => void) => {
+      if (event === "SIGTERM") handleSigTerm = listener;
+      return process;
+    });
+    mockSpawn.mockImplementation(() => {
+      queueMicrotask(() => {
+        child.emit("spawn");
+        handleSigTerm?.();
+        child.emit("exit", null, "SIGTERM");
+      });
+      return child as never;
+    });
+
+    const result = await startSleepPrevention(["ship it"], {
+      env: { GNHF_SUPERVISED_PROCESS_GROUP: "1" },
+      platform: "linux",
+      processArgv1: "/dist/cli.mjs",
+      processExecPath: "/node",
+      processOn,
+      processOff: vi.fn(() => process),
+    });
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "systemd-inhibit",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
+    );
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(result).toEqual({ type: "reexeced", exitCode: 143 });
+  });
+
   it("preserves process.execArgv when re-execing under systemd-inhibit on Linux", async () => {
     const child = createChildProcess();
     mockSpawn.mockImplementation(() => {
@@ -505,11 +539,18 @@ describe("startSleepPrevention", () => {
     vi.useFakeTimers();
 
     const child = createChildProcess();
+    let processGroupPresent = true;
     const killProcess: typeof process.kill = vi.fn(
       (pid: number, signal?: string | number) => {
-        if (pid === -1234 && signal === "SIGTERM") {
+        if (pid === -1234 && signal === "SIGKILL") {
+          processGroupPresent = false;
           queueMicrotask(() => {
             child.emit("close", 0, null);
+          });
+        }
+        if (pid === -1234 && signal === 0 && !processGroupPresent) {
+          throw Object.assign(new Error("process group exited"), {
+            code: "ESRCH",
           });
         }
         return true as const;
@@ -531,12 +572,16 @@ describe("startSleepPrevention", () => {
     });
 
     await vi.advanceTimersByTimeAsync(5_000);
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGTERM");
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGKILL");
+    await vi.advanceTimersByTimeAsync(100);
 
     await expect(resultPromise).resolves.toEqual({
       type: "skipped",
       reason: "unavailable",
     });
-    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGTERM");
   });
 
   it("starts a PowerShell helper on Windows", async () => {

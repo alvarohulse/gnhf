@@ -14,6 +14,7 @@ import {
   getBranchCommitCount,
   getBranchDiffStats,
   getCurrentBranch,
+  hasWorkingTreeChanges,
   pushCurrentBranch,
   resetHard,
   getRepoRootDir,
@@ -98,6 +99,43 @@ describe("git utilities", () => {
           stdio: "pipe",
         }),
       );
+    });
+  });
+
+  describe("hasWorkingTreeChanges", () => {
+    it("checks untracked and ignored files", () => {
+      hasWorkingTreeChanges("/repo");
+
+      expect(argsOfCall(0)).toEqual([
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+      ]);
+      expect(argsOfCall(1)).toEqual([
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+      ]);
+    });
+
+    it("preserves ignored user files", () => {
+      mockExecFileSync
+        .mockReturnValueOnce("")
+        .mockReturnValueOnce("build/result.txt\0");
+
+      expect(hasWorkingTreeChanges("/repo")).toBe(true);
+    });
+
+    it("ignores only gnhf-owned runtime metadata", () => {
+      mockExecFileSync
+        .mockReturnValueOnce("")
+        .mockReturnValueOnce(
+          ".gnhf/runs/run-1/usage.json\0.gnhf/setup-failures/run-1.json\0",
+        );
+
+      expect(hasWorkingTreeChanges("/repo")).toBe(false);
     });
   });
 
@@ -233,6 +271,22 @@ describe("git utilities", () => {
         "msg",
       ]);
       expect(mockExecFileSync).toHaveBeenCalledTimes(3);
+    });
+
+    it("throws CommitFailedError when staging fails so generated changes are preserved", () => {
+      mockExecFileSync.mockImplementation((_cmd, args) => {
+        const argv = args as string[];
+        if (argv[0] === "add") {
+          throw Object.assign(new Error("Command failed"), {
+            stderr: "unable to index file",
+          });
+        }
+        return "";
+      });
+
+      expect(() => commitAll("msg", "/repo")).toThrow(CommitFailedError);
+      expect(mockExecFileSync).toHaveBeenCalledTimes(1);
+      expect(argsOfCall(0)).toEqual(["add", "-A"]);
     });
 
     it("does not retry with --no-verify when the first commit succeeds", () => {
@@ -453,12 +507,13 @@ describe("git utilities", () => {
   });
 
   describe("removeWorktree", () => {
-    it("passes the worktree path as its own argv entry", () => {
+    it("forces Git to check untracked files before removal", () => {
       removeWorktree("/repo", "/tmp/wt");
       expect(argsOfCall(0)).toEqual([
+        "-c",
+        "status.showUntrackedFiles=all",
         "worktree",
         "remove",
-        "--force",
         "/tmp/wt",
       ]);
     });

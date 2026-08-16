@@ -6,6 +6,23 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
+vi.mock("./managed-process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./managed-process.js")>();
+  return {
+    ...actual,
+    spawnManagedChildProcess: actualSpawn,
+  };
+
+  function actualSpawn(
+    spawnProcess: typeof import("node:child_process").spawn,
+    command: string,
+    args: string[],
+    options: import("node:child_process").SpawnOptions,
+  ) {
+    return spawnProcess(command, args, options);
+  }
+});
+
 import { execFileSync, spawn } from "node:child_process";
 import { ClaudeAgent } from "./claude.js";
 import { PermanentAgentError, buildAgentOutputSchema } from "./types.js";
@@ -18,6 +35,8 @@ const STOP_SCHEMA = buildAgentOutputSchema({
 
 function createMockProcess() {
   const proc = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    signalCode: null,
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     stdin: null,
@@ -35,7 +54,7 @@ describe("ClaudeAgent", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    agent = new ClaudeAgent();
+    agent = new ClaudeAgent({ platform: "linux" });
   });
 
   it("has name 'claude'", () => {
@@ -95,6 +114,23 @@ describe("ClaudeAgent", () => {
         "--dangerously-skip-permissions",
       ],
       expect.any(Object),
+    );
+  });
+
+  it("stays inside an external supervisor process group", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const supervisedAgent = new ClaudeAgent({
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+
+    supervisedAgent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "claude",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
     );
   });
 
@@ -236,21 +272,61 @@ describe("ClaudeAgent", () => {
       signal: controller.signal,
     });
     controller.abort();
+    proc.emit("close", null, null);
 
     await expect(promise).rejects.toThrow("Agent was aborted");
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
       "taskkill",
       ["/T", "/F", "/PID", "5678"],
-      { stdio: "ignore" },
+      { stdio: "ignore", timeout: 3_000 },
     );
     expect(proc.kill).not.toHaveBeenCalled();
+  });
+
+  it("surfaces ownership loss when the group leader closes during abort", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 4321 });
+    mockSpawn.mockReturnValue(proc);
+    const processKill = vi
+      .spyOn(process, "kill")
+      .mockImplementation(() => true);
+    const controller = new AbortController();
+    const unixAgent = new ClaudeAgent({ platform: "linux" });
+
+    try {
+      const runPromise = unixAgent.run("test prompt", "/work/dir", {
+        signal: controller.signal,
+      });
+      const rejection = expect(runPromise).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+      controller.abort();
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
+      proc.emit("close", null);
+
+      await vi.advanceTimersByTimeAsync(100);
+      await rejection;
+      expect(processKill).not.toHaveBeenCalledWith(-4321, "SIGKILL");
+      await expect(unixAgent.close()).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("terminates the process group after a final structured output if Claude stays alive", async () => {
     vi.useFakeTimers();
     const processKill = vi
       .spyOn(process, "kill")
-      .mockImplementation(() => true);
+      .mockImplementation((_pid, signal) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+        }
+        return true;
+      });
     try {
       const proc = createMockProcess();
       Object.defineProperty(proc, "pid", { value: 4321 });
@@ -261,6 +337,10 @@ describe("ClaudeAgent", () => {
       });
 
       const promise = configuredAgent.run("prompt", "/cwd");
+      let resolved = false;
+      void promise.then(() => {
+        resolved = true;
+      });
 
       emitLine(proc, {
         type: "result",
@@ -287,6 +367,9 @@ describe("ClaudeAgent", () => {
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
 
       proc.emit("close", null);
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "done" },
       });
@@ -296,14 +379,66 @@ describe("ClaudeAgent", () => {
     }
   });
 
+  it("starts Windows tree cleanup before a successful target can exit", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 5678 });
+    mockSpawn.mockReturnValue(proc);
+    const windowsAgent = new ClaudeAgent({
+      finalResultGraceMs: 25,
+      platform: "win32",
+    });
+
+    try {
+      const promise = windowsAgent.run("prompt", "/cwd");
+      emitLine(proc, {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        usage: {
+          input_tokens: 7,
+          cache_read_input_tokens: 8,
+          cache_creation_input_tokens: 9,
+          output_tokens: 10,
+        },
+        structured_output: {
+          success: true,
+          summary: "done",
+          key_changes_made: [],
+          key_learnings: [],
+        },
+      });
+
+      expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
+        "taskkill",
+        ["/T", "/F", "/PID", "5678"],
+        { stdio: "ignore", timeout: 3_000 },
+      );
+
+      proc.emit("close", null);
+      await expect(promise).resolves.toMatchObject({
+        output: { success: true, summary: "done" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("force kills Claude if it ignores the final-result shutdown signal", async () => {
     vi.useFakeTimers();
+    let groupPresent = true;
     const processKill = vi
       .spyOn(process, "kill")
       .mockImplementation((pid, signal) => {
         if (pid === -4321 && signal === "SIGKILL") {
+          groupPresent = false;
           queueMicrotask(() => {
             proc.emit("close", null);
+          });
+        }
+        if (pid === -4321 && signal === 0 && !groupPresent) {
+          throw Object.assign(new Error("process group exited"), {
+            code: "ESRCH",
           });
         }
         return true;
@@ -346,6 +481,7 @@ describe("ClaudeAgent", () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
 
+      await vi.advanceTimersByTimeAsync(100);
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "done" },
       });
@@ -355,11 +491,57 @@ describe("ClaudeAgent", () => {
     }
   });
 
+  it("rejects when lingering direct-child cleanup cannot be proven", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const configuredAgent = new ClaudeAgent({
+      finalResultGraceMs: 25,
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+
+    try {
+      const promise = configuredAgent.run("prompt", "/cwd");
+      const rejection = expect(promise).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+      emitLine(proc, {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        usage: {
+          input_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          output_tokens: 1,
+        },
+        structured_output: {
+          success: true,
+          summary: "done",
+          key_changes_made: [],
+          key_learnings: [],
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(25 + 3_000 + 100);
+
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("restarts the final-result cleanup timer when a later turn returns structured output", async () => {
     vi.useFakeTimers();
     const processKill = vi
       .spyOn(process, "kill")
-      .mockImplementation(() => true);
+      .mockImplementation((_pid, signal) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+        }
+        return true;
+      });
     try {
       const proc = createMockProcess();
       Object.defineProperty(proc, "pid", { value: 4321 });
@@ -422,6 +604,7 @@ describe("ClaudeAgent", () => {
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
 
       proc.emit("close", null);
+      await vi.advanceTimersByTimeAsync(3_100);
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "second turn" },
       });
@@ -435,7 +618,12 @@ describe("ClaudeAgent", () => {
     vi.useFakeTimers();
     const processKill = vi
       .spyOn(process, "kill")
-      .mockImplementation(() => true);
+      .mockImplementation((_pid, signal) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+        }
+        return true;
+      });
     try {
       const proc = createMockProcess();
       Object.defineProperty(proc, "pid", { value: 4321 });
@@ -471,6 +659,7 @@ describe("ClaudeAgent", () => {
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
 
       proc.emit("close", null);
+      await vi.advanceTimersByTimeAsync(3_100);
       await promise;
     } finally {
       processKill.mockRestore();
@@ -500,6 +689,7 @@ describe("ClaudeAgent", () => {
       type: "result",
       subtype: "success",
       is_error: false,
+      total_cost_usd: 0.42,
       usage: {
         input_tokens: 100,
         cache_read_input_tokens: 50,
@@ -528,6 +718,9 @@ describe("ClaudeAgent", () => {
       outputTokens: 200,
       cacheReadTokens: 50,
       cacheCreationTokens: 10,
+      totalTokens: 360,
+      reportedCostUsd: 0.42,
+      tokensAvailable: true,
     });
   });
 
@@ -555,6 +748,8 @@ describe("ClaudeAgent", () => {
       outputTokens: 100,
       cacheReadTokens: 20,
       cacheCreationTokens: 5,
+      totalTokens: 175,
+      tokensAvailable: true,
     });
 
     emitLine(proc, {
@@ -649,24 +844,32 @@ describe("ClaudeAgent", () => {
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(2, {
       inputTokens: 16,
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(3, {
       inputTokens: 37,
       outputTokens: 11,
       cacheReadTokens: 30,
       cacheCreationTokens: 4,
+      totalTokens: 52,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(4, {
       inputTokens: 37,
       outputTokens: 20,
       cacheReadTokens: 30,
       cacheCreationTokens: 4,
+      totalTokens: 61,
+      tokensAvailable: true,
     });
   });
 
@@ -738,24 +941,32 @@ describe("ClaudeAgent", () => {
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(2, {
       inputTokens: 16,
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(3, {
       inputTokens: 37,
       outputTokens: 11,
       cacheReadTokens: 30,
       cacheCreationTokens: 4,
+      totalTokens: 52,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(4, {
       inputTokens: 37,
       outputTokens: 20,
       cacheReadTokens: 30,
       cacheCreationTokens: 4,
+      totalTokens: 61,
+      tokensAvailable: true,
     });
   });
 
@@ -817,18 +1028,24 @@ describe("ClaudeAgent", () => {
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(2, {
       inputTokens: 16,
       outputTokens: 10,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 29,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(3, {
       inputTokens: 16,
       outputTokens: 10,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 29,
+      tokensAvailable: true,
     });
   });
 
@@ -900,24 +1117,32 @@ describe("ClaudeAgent", () => {
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(2, {
       inputTokens: 16,
       outputTokens: 8,
       cacheReadTokens: 10,
       cacheCreationTokens: 3,
+      totalTokens: 27,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(3, {
       inputTokens: 48,
       outputTokens: 24,
       cacheReadTokens: 30,
       cacheCreationTokens: 9,
+      totalTokens: 81,
+      tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(4, {
       inputTokens: 48,
       outputTokens: 24,
       cacheReadTokens: 30,
       cacheCreationTokens: 9,
+      totalTokens: 81,
+      tokensAvailable: true,
     });
   });
 
@@ -1127,10 +1352,12 @@ describe("ClaudeAgent", () => {
   it("rejects when process fails to spawn", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
+    const unixAgent = new ClaudeAgent({ platform: "linux" });
 
-    const promise = agent.run("prompt", "/cwd");
+    const promise = unixAgent.run("prompt", "/cwd");
 
     proc.emit("error", new Error("ENOENT"));
+    proc.emit("close", null, null);
 
     await expect(promise).rejects.toThrow("Failed to spawn claude: ENOENT");
   });
@@ -1150,18 +1377,20 @@ describe("ClaudeAgent", () => {
   it("rejects when response has is_error flag", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
+    const onUsage = vi.fn();
 
-    const promise = agent.run("prompt", "/cwd");
+    const promise = agent.run("prompt", "/cwd", { onUsage });
 
     emitLine(proc, {
       type: "result",
       subtype: "error",
       is_error: true,
+      total_cost_usd: 0.42,
       usage: {
-        input_tokens: 0,
-        cache_read_input_tokens: 0,
-        cache_creation_input_tokens: 0,
-        output_tokens: 0,
+        input_tokens: 10,
+        cache_read_input_tokens: 4,
+        cache_creation_input_tokens: 2,
+        output_tokens: 3,
       },
       structured_output: null,
     });
@@ -1169,6 +1398,15 @@ describe("ClaudeAgent", () => {
     proc.emit("close", 0);
 
     await expect(promise).rejects.toThrow("claude reported error");
+    expect(onUsage).toHaveBeenCalledWith({
+      inputTokens: 14,
+      outputTokens: 3,
+      cacheReadTokens: 4,
+      cacheCreationTokens: 2,
+      totalTokens: 19,
+      reportedCostUsd: 0.42,
+      tokensAvailable: true,
+    });
   });
 
   it("rejects when structured_output is null", async () => {
@@ -1351,6 +1589,39 @@ describe("ClaudeAgent", () => {
       outputTokens: 47,
       cacheReadTokens: 24,
       cacheCreationTokens: 6,
+      totalTokens: 90,
+      tokensAvailable: true,
+    });
+  });
+
+  it("marks usage unavailable when the latest result omits usage", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    const promise = agent.run("prompt", "/cwd");
+
+    emitLine(proc, {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      usage: { input_tokens: 10, output_tokens: 4 },
+      structured_output: {
+        success: true,
+        summary: "done",
+        key_changes_made: [],
+        key_learnings: [],
+      },
+    });
+    emitLine(proc, {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      structured_output: null,
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: { tokensAvailable: false },
     });
   });
 
@@ -1405,6 +1676,8 @@ describe("ClaudeAgent", () => {
       outputTokens: 42,
       cacheReadTokens: 21,
       cacheCreationTokens: 5,
+      totalTokens: 79,
+      tokensAvailable: true,
     });
   });
 });

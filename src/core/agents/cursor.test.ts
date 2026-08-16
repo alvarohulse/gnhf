@@ -9,6 +9,19 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
+vi.mock("./managed-process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./managed-process.js")>();
+  return {
+    ...actual,
+    spawnManagedChildProcess: (
+      spawnProcess: typeof import("node:child_process").spawn,
+      command: string,
+      args: string[],
+      options: import("node:child_process").SpawnOptions,
+    ) => spawnProcess(command, args, options),
+  };
+});
+
 import { execFileSync, spawn } from "node:child_process";
 import { CursorAgent } from "./cursor.js";
 import { buildAgentOutputSchema, PermanentAgentError } from "./types.js";
@@ -21,6 +34,8 @@ function createMockProcess() {
     end: vi.fn(),
   });
   const proc = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    signalCode: null,
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     stdin,
@@ -31,6 +46,10 @@ function createMockProcess() {
 
 function emitJson(proc: ReturnType<typeof createMockProcess>, event: unknown) {
   proc.stdout.emit("data", Buffer.from(`${JSON.stringify(event)}\n`));
+}
+
+function createAgent(): CursorAgent {
+  return new CursorAgent({ platform: "linux" });
 }
 
 function withTemporaryPath(candidates: string[], callback: () => void): void {
@@ -61,7 +80,7 @@ describe("CursorAgent", () => {
   });
 
   it("has the cursor agent name", () => {
-    expect(new CursorAgent().name).toBe("cursor");
+    expect(createAgent().name).toBe("cursor");
   });
 
   it.each([
@@ -141,6 +160,23 @@ describe("CursorAgent", () => {
       expect.stringContaining("gnhf final output contract"),
     );
     expect(proc.stdin.end).toHaveBeenCalled();
+  });
+
+  it("stays inside an external supervisor process group", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CursorAgent({
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+
+    agent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "cursor-agent",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
+    );
   });
 
   it("uses a shell on Windows for cmd wrapper paths", () => {
@@ -258,12 +294,13 @@ describe("CursorAgent", () => {
       signal: controller.signal,
     });
     controller.abort();
+    proc.emit("close", null, null);
 
     await expect(promise).rejects.toThrow("Agent was aborted");
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
       "taskkill",
       ["/T", "/F", "/PID", "6789"],
-      { stdio: "ignore" },
+      { stdio: "ignore", timeout: 3_000 },
     );
     expect(proc.kill).not.toHaveBeenCalled();
   });
@@ -273,7 +310,7 @@ describe("CursorAgent", () => {
     mockSpawn.mockReturnValue(proc);
     const onMessage = vi.fn();
     const onUsage = vi.fn();
-    const agent = new CursorAgent();
+    const agent = createAgent();
     const draft = JSON.stringify({
       success: true,
       summary: "stale",
@@ -315,6 +352,7 @@ describe("CursorAgent", () => {
         outputTokens: 20,
         cacheReadTokens: 80,
         cacheWriteTokens: 5,
+        cost_usd: 0.25,
       },
     });
     proc.emit("close", 0);
@@ -331,6 +369,8 @@ describe("CursorAgent", () => {
         outputTokens: 20,
         cacheReadTokens: 80,
         cacheCreationTokens: 5,
+        reportedCostUsd: 0.25,
+        tokensAvailable: true,
       },
     });
     expect(onMessage).toHaveBeenCalledWith("working...");
@@ -341,13 +381,109 @@ describe("CursorAgent", () => {
       outputTokens: 20,
       cacheReadTokens: 80,
       cacheCreationTokens: 5,
+      reportedCostUsd: 0.25,
+      tokensAvailable: true,
+    });
+  });
+
+  it("marks token usage unavailable when Cursor reports only cost", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const content = JSON.stringify({
+      success: true,
+      summary: "ok",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+    const promise = createAgent().run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "assistant",
+      message: { content },
+    });
+    emitJson(proc, {
+      type: "result",
+      subtype: "success",
+      result: content,
+      usage: { cost_usd: 0.25 },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reportedCostUsd: 0.25,
+        tokensAvailable: false,
+      },
+    });
+  });
+
+  it("marks token usage unavailable when Cursor omits its usage receipt", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const content = JSON.stringify({
+      success: true,
+      summary: "ok",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+    const promise = createAgent().run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "assistant",
+      message: { content },
+    });
+    emitJson(proc, {
+      type: "result",
+      subtype: "success",
+      result: content,
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        tokensAvailable: false,
+      },
+    });
+  });
+
+  it("marks usage unavailable when the latest result omits usage", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const content = JSON.stringify({
+      success: true,
+      summary: "ok",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+    const promise = createAgent().run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "result",
+      subtype: "success",
+      result: content,
+      usage: { inputTokens: 10, outputTokens: 4 },
+    });
+    emitJson(proc, {
+      type: "result",
+      subtype: "success",
+      result: content,
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: { tokensAvailable: false },
     });
   });
 
   it("rejects stale structured output when the last assistant message is prose", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
     const stale = JSON.stringify({
       success: true,
       summary: "stale",
@@ -384,7 +520,7 @@ describe("CursorAgent", () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
     const onMessage = vi.fn();
-    const agent = new CursorAgent();
+    const agent = createAgent();
     const content = JSON.stringify({
       success: true,
       summary: "ok",
@@ -412,7 +548,7 @@ describe("CursorAgent", () => {
   it("accepts a fenced JSON final answer", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {
@@ -434,7 +570,7 @@ describe("CursorAgent", () => {
   it("recovers JSON when cursor prepends prose before the final object", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {
@@ -470,7 +606,7 @@ describe("CursorAgent", () => {
   it("rejects when cursor returns no text output", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     proc.emit("close", 0);
@@ -481,7 +617,7 @@ describe("CursorAgent", () => {
   it("rejects when the result event reports an error", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {
@@ -498,7 +634,7 @@ describe("CursorAgent", () => {
   it("reports a signed-out cursor exit as permanent so it does not burn retries", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     proc.stderr.emit(
@@ -516,7 +652,7 @@ describe("CursorAgent", () => {
   it("reports a signed-out cursor result event as permanent", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {
@@ -533,7 +669,7 @@ describe("CursorAgent", () => {
   it("keeps an ordinary non-zero exit retryable", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     proc.stderr.emit("data", Buffer.from("upstream provider is overloaded\n"));
@@ -547,7 +683,12 @@ describe("CursorAgent", () => {
     vi.useFakeTimers();
     const processKill = vi
       .spyOn(process, "kill")
-      .mockImplementation(() => true);
+      .mockImplementation((_pid, signal) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+        }
+        return true;
+      });
     try {
       const proc = createMockProcess();
       Object.defineProperty(proc, "pid", { value: 4321 });
@@ -564,6 +705,10 @@ describe("CursorAgent", () => {
       });
 
       const promise = agent.run("test prompt", "/work/dir");
+      let resolved = false;
+      void promise.then(() => {
+        resolved = true;
+      });
       emitJson(proc, {
         type: "result",
         subtype: "success",
@@ -578,6 +723,9 @@ describe("CursorAgent", () => {
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
 
       proc.emit("close", null);
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "done" },
       });
@@ -587,14 +735,69 @@ describe("CursorAgent", () => {
     }
   });
 
+  it("allows a successful Windows target to exit before tree cleanup", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 5678 });
+    mockSpawn.mockReturnValue(proc);
+    const windowsAgent = new CursorAgent({
+      finalResultGraceMs: 25,
+      platform: "win32",
+    });
+    const content = JSON.stringify({
+      success: true,
+      summary: "done",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+
+    try {
+      const promise = windowsAgent.run("test prompt", "/work/dir");
+      emitJson(proc, {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: content,
+      });
+
+      await vi.advanceTimersByTimeAsync(24);
+      expect(vi.mocked(execFileSync)).not.toHaveBeenCalledWith(
+        "taskkill",
+        expect.any(Array),
+        expect.any(Object),
+      );
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
+        "taskkill",
+        ["/T", "/F", "/PID", "5678"],
+        { stdio: "ignore", timeout: 3_000 },
+      );
+
+      proc.emit("close", null);
+      await expect(promise).resolves.toMatchObject({
+        output: { success: true, summary: "done" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("force kills cursor if it ignores the final-result shutdown signal", async () => {
     vi.useFakeTimers();
+    let groupPresent = true;
     const processKill = vi
       .spyOn(process, "kill")
       .mockImplementation((pid, signal) => {
         if (pid === -4321 && signal === "SIGKILL") {
+          groupPresent = false;
           queueMicrotask(() => {
             proc.emit("close", null);
+          });
+        }
+        if (pid === -4321 && signal === 0 && !groupPresent) {
+          throw Object.assign(new Error("process group exited"), {
+            code: "ESRCH",
           });
         }
         return true;
@@ -631,6 +834,7 @@ describe("CursorAgent", () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
 
+      await vi.advanceTimersByTimeAsync(100);
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "done" },
       });
@@ -640,11 +844,52 @@ describe("CursorAgent", () => {
     }
   });
 
+  it("rejects when lingering direct-child cleanup cannot be proven", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CursorAgent({
+      finalResultGraceMs: 25,
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+    const content = JSON.stringify({
+      success: true,
+      summary: "done",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+
+    try {
+      const promise = agent.run("test prompt", "/work/dir");
+      const rejection = expect(promise).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+      emitJson(proc, {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: content,
+      });
+
+      await vi.advanceTimersByTimeAsync(25 + 3_000 + 100);
+
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not schedule linger cleanup for error results", async () => {
     vi.useFakeTimers();
     const processKill = vi
       .spyOn(process, "kill")
-      .mockImplementation(() => true);
+      .mockImplementation((_pid, signal) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+        }
+        return true;
+      });
     try {
       const proc = createMockProcess();
       Object.defineProperty(proc, "pid", { value: 4321 });
@@ -655,6 +900,7 @@ describe("CursorAgent", () => {
       });
 
       const promise = agent.run("test prompt", "/work/dir");
+      const rejection = expect(promise).rejects.toThrow("auth failed");
       emitJson(proc, {
         type: "result",
         subtype: "error",
@@ -666,7 +912,8 @@ describe("CursorAgent", () => {
       expect(processKill).not.toHaveBeenCalled();
 
       proc.emit("close", 0);
-      await expect(promise).rejects.toThrow("auth failed");
+      await vi.advanceTimersByTimeAsync(3_100);
+      await rejection;
     } finally {
       processKill.mockRestore();
       vi.useRealTimers();
@@ -676,7 +923,7 @@ describe("CursorAgent", () => {
   it("rejects when the final answer is not valid JSON", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {
@@ -692,7 +939,7 @@ describe("CursorAgent", () => {
   it("rejects when the final answer misses required fields", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {

@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import {
   buildAgentOutputSchema,
+  isValidTokenCount,
   parseAgentOutput,
   type Agent,
   type AgentOutput,
@@ -15,12 +16,20 @@ import {
   setupAbortHandler,
   setupChildProcessHandlers,
 } from "./stream-utils.js";
+import {
+  ChildProcessShutdownTracker,
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+  shutdownWindowsProcessTree,
+  spawnManagedChildProcess,
+} from "./managed-process.js";
 
 interface PiAgentDeps {
   bin?: string;
   extraArgs?: string[];
   platform?: NodeJS.Platform;
   schema?: AgentOutputSchema;
+  supervisedProcessGroup?: boolean;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -56,31 +65,16 @@ function shouldUseWindowsShell(
   }
 }
 
-function terminatePiProcess(
+async function shutdownPiProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
-): void {
-  if (platform === "win32" && child.pid) {
-    try {
-      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: the process may have already exited.
-    }
-    return;
+  detached: boolean,
+): Promise<void> {
+  if (platform === "win32") {
+    return shutdownWindowsProcessTree(child);
   }
 
-  if (child.pid) {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-      return;
-    } catch {
-      // Fall back to the direct child if it was not started as a process group.
-    }
-  }
-
-  child.kill("SIGTERM");
+  await shutdownChildProcess(child, { detached });
 }
 
 function buildPiPrompt(prompt: string, schema: AgentOutputSchema): string {
@@ -124,11 +118,20 @@ function numberField(record: JsonRecord, names: string[]): number | undefined {
 function toTokenUsage(usage: JsonRecord | undefined): TokenUsage | null {
   if (!usage) return null;
 
+  const inputTokens = numberField(usage, ["input"]);
+  const outputTokens = numberField(usage, ["output"]);
+  const totalTokens = numberField(usage, ["totalTokens", "total_tokens"]);
+  const cost = isRecord(usage.cost) ? usage.cost : undefined;
+  const reportedCostUsd = cost ? numberField(cost, ["total"]) : undefined;
   return {
-    inputTokens: numberField(usage, ["input"]) ?? 0,
-    outputTokens: numberField(usage, ["output"]) ?? 0,
+    inputTokens: inputTokens ?? 0,
+    outputTokens: outputTokens ?? 0,
     cacheReadTokens: numberField(usage, ["cacheRead"]) ?? 0,
     cacheCreationTokens: numberField(usage, ["cacheWrite"]) ?? 0,
+    ...(isValidTokenCount(totalTokens) ? { totalTokens } : {}),
+    ...(isValidTokenCount(reportedCostUsd) ? { reportedCostUsd } : {}),
+    tokensAvailable:
+      isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
   };
 }
 
@@ -137,8 +140,21 @@ function isSameUsage(a: TokenUsage, b: TokenUsage): boolean {
     a.inputTokens === b.inputTokens &&
     a.outputTokens === b.outputTokens &&
     a.cacheReadTokens === b.cacheReadTokens &&
-    a.cacheCreationTokens === b.cacheCreationTokens
+    a.cacheCreationTokens === b.cacheCreationTokens &&
+    a.totalTokens === b.totalTokens &&
+    a.reportedCostUsd === b.reportedCostUsd &&
+    a.tokensAvailable === b.tokensAvailable
   );
+}
+
+function createUnavailableUsage(): TokenUsage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    tokensAvailable: false,
+  };
 }
 
 function messageKey(message: JsonRecord): string | null {
@@ -200,15 +216,22 @@ function textByIndexToString(textByIndex: Map<number, string>): string {
 export class PiAgent implements Agent {
   name = "pi";
 
+  private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
+  private detached: boolean;
   private extraArgs?: string[];
   private platform: NodeJS.Platform;
   private schema: AgentOutputSchema;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(deps: PiAgentDeps = {}) {
     this.bin = deps.bin ?? "pi";
     this.extraArgs = deps.extraArgs;
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.schema =
       deps.schema ?? buildAgentOutputSchema({ includeStopField: false });
   }
@@ -222,22 +245,39 @@ export class PiAgent implements Agent {
 
     return new Promise((resolve, reject) => {
       const logStream = logPath ? createWriteStream(logPath) : null;
-      const child = spawn(this.bin, buildPiArgs(this.extraArgs), {
-        cwd,
-        detached: this.platform !== "win32",
-        shell: shouldUseWindowsShell(this.bin, this.platform),
-        stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
+      const child = spawnManagedChildProcess(
+        spawn,
+        this.bin,
+        buildPiArgs(this.extraArgs),
+        {
+          cwd,
+          detached: this.detached,
+          shell: shouldUseWindowsShell(this.bin, this.platform),
+          stdio: ["pipe", "pipe", "pipe"],
+          env: process.env,
+        },
+        this.shutdowns,
+        this.platform,
+      );
+      this.activeChild = child;
+      child.on("close", () => {
+        if (this.activeChild === child) {
+          this.activeChild = null;
+        }
       });
+      const finalizeRun = () =>
+        this.shutdowns.finalizeOwnedProcessGroup(child, this.detached, () =>
+          shutdownPiProcess(child, this.platform, this.detached),
+        );
+      const shutdownRun = () =>
+        this.shutdowns.start(() =>
+          shutdownPiProcess(child, this.platform, this.detached),
+        );
 
       child.stdin?.write(buildPiPrompt(prompt, this.schema));
       child.stdin?.end();
 
-      if (
-        setupAbortHandler(signal, child, reject, () =>
-          terminatePiProcess(child, this.platform),
-        )
-      ) {
+      if (setupAbortHandler(signal, child, reject, shutdownRun)) {
         return;
       }
 
@@ -245,43 +285,64 @@ export class PiAgent implements Agent {
       const streamTextByIndex = new Map<number, string>();
       const completeTextByIndex = new Map<number, string>();
       const usageByMessageKey = new Map<string, TokenUsage>();
-      let lastEmittedUsage: TokenUsage = {
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheReadTokens: 0,
-        cacheCreationTokens: 0,
-      };
+      let lastEmittedUsage = createUnavailableUsage();
       let anonymousKeySeq = 0;
       let currentStreamingMessageKey: string | null = null;
 
-      const updateUsage = (message: JsonRecord, streaming = false) => {
-        const usage = isRecord(message.usage)
-          ? toTokenUsage(message.usage)
-          : null;
-        if (!usage) return;
+      const updateUsage = (
+        message: JsonRecord | null,
+        streaming = false,
+        requireReceipt = false,
+        usageOverride?: JsonRecord,
+      ) => {
+        const usage = toTokenUsage(
+          usageOverride ??
+            (message !== null && isRecord(message.usage)
+              ? message.usage
+              : undefined),
+        );
+        if (!usage && !requireReceipt) return;
 
-        let key = messageKey(message);
-        if (key === null) {
-          if (streaming && currentStreamingMessageKey !== null) {
-            key = currentStreamingMessageKey;
-          } else {
-            key = `assistant-anonymous-${anonymousKeySeq++}`;
-            if (streaming) currentStreamingMessageKey = key;
-          }
+        let key = streaming ? currentStreamingMessageKey : null;
+        if (key === null && message !== null) {
+          key = messageKey(message);
         }
-        usageByMessageKey.set(key, usage);
+        if (key === null) {
+          key = `assistant-anonymous-${anonymousKeySeq++}`;
+        }
+        if (streaming) currentStreamingMessageKey = key;
+        usageByMessageKey.set(key, usage ?? createUnavailableUsage());
 
-        const cumulative: TokenUsage = {
-          inputTokens: 0,
-          outputTokens: 0,
-          cacheReadTokens: 0,
-          cacheCreationTokens: 0,
-        };
+        const cumulative = createUnavailableUsage();
         for (const entry of usageByMessageKey.values()) {
           cumulative.inputTokens += entry.inputTokens;
           cumulative.outputTokens += entry.outputTokens;
           cumulative.cacheReadTokens += entry.cacheReadTokens;
           cumulative.cacheCreationTokens += entry.cacheCreationTokens;
+        }
+        const usageReceipts = [...usageByMessageKey.values()];
+        cumulative.tokensAvailable = usageReceipts.every(
+          (entry) => entry.tokensAvailable,
+        );
+        delete cumulative.totalTokens;
+        delete cumulative.reportedCostUsd;
+        if (
+          usageReceipts.every((entry) => isValidTokenCount(entry.totalTokens))
+        ) {
+          cumulative.totalTokens = usageReceipts.reduce(
+            (total, entry) => total + entry.totalTokens!,
+            0,
+          );
+        }
+        if (
+          usageReceipts.every((entry) =>
+            isValidTokenCount(entry.reportedCostUsd),
+          )
+        ) {
+          cumulative.reportedCostUsd = usageReceipts.reduce(
+            (total, entry) => total + entry.reportedCostUsd!,
+            0,
+          );
         }
 
         if (!isSameUsage(cumulative, lastEmittedUsage)) {
@@ -293,17 +354,43 @@ export class PiAgent implements Agent {
       const rememberAssistantMessage = (
         message: unknown,
         streaming = false,
+        requireReceipt = false,
+        usageOverride?: JsonRecord,
       ) => {
         if (!isRecord(message) || roleOf(message) !== "assistant") return;
         latestAssistantMessage = message;
-        updateUsage(message, streaming);
+        if (streaming) {
+          currentStreamingMessageKey =
+            currentStreamingMessageKey ??
+            messageKey(message) ??
+            `assistant-anonymous-${anonymousKeySeq++}`;
+        }
+        updateUsage(message, streaming, requireReceipt, usageOverride);
       };
 
       parseJSONLStream<JsonRecord>(child.stdout!, logStream, (event) => {
         if (!isRecord(event)) return;
 
+        if (event.type === "message_start") {
+          if (
+            isRecord(event.message) &&
+            roleOf(event.message) === "assistant"
+          ) {
+            currentStreamingMessageKey =
+              messageKey(event.message) ??
+              currentStreamingMessageKey ??
+              `assistant-anonymous-${anonymousKeySeq++}`;
+            updateUsage(event.message, true);
+          }
+        }
+
         if (event.type === "message_update") {
-          rememberAssistantMessage(event.message, true);
+          const liveUsage = isRecord(event.usage) ? event.usage : undefined;
+          if (isRecord(event.message)) {
+            rememberAssistantMessage(event.message, true, false, liveUsage);
+          } else if (liveUsage !== undefined) {
+            updateUsage(null, true, false, liveUsage);
+          }
 
           if (isRecord(event.assistantMessageEvent)) {
             const assistantEvent = event.assistantMessageEvent;
@@ -339,64 +426,82 @@ export class PiAgent implements Agent {
         }
 
         if (event.type === "message_end" || event.type === "turn_end") {
-          rememberAssistantMessage(event.message, true);
+          rememberAssistantMessage(event.message, true, true);
           currentStreamingMessageKey = null;
         }
 
-        if (
-          event.type === "agent_end" &&
-          Array.isArray(event.messages) &&
-          !latestAssistantMessage
-        ) {
-          for (let i = event.messages.length - 1; i >= 0; i -= 1) {
-            const message = event.messages[i];
+        if (event.type === "agent_end" && Array.isArray(event.messages)) {
+          usageByMessageKey.clear();
+          currentStreamingMessageKey = null;
+          lastEmittedUsage = createUnavailableUsage();
+          for (const message of event.messages) {
             if (roleOf(message) === "assistant") {
-              rememberAssistantMessage(message);
-              break;
+              rememberAssistantMessage(message, false, true);
             }
           }
         }
       });
 
-      setupChildProcessHandlers(child, "pi", logStream, reject, () => {
-        if (latestAssistantMessage) {
-          const stopReason = latestAssistantMessage.stopReason;
-          if (stopReason === "error" || stopReason === "aborted") {
-            const errorMessage =
-              stringField(latestAssistantMessage, [
-                "errorMessage",
-                "error",
-                "message",
-              ]) ?? compactJson(latestAssistantMessage);
-            reject(new Error(`pi reported error: ${errorMessage}`));
+      setupChildProcessHandlers(
+        child,
+        "pi",
+        logStream,
+        reject,
+        () => {
+          if (latestAssistantMessage) {
+            const stopReason = latestAssistantMessage.stopReason;
+            if (stopReason === "error" || stopReason === "aborted") {
+              const errorMessage =
+                stringField(latestAssistantMessage, [
+                  "errorMessage",
+                  "error",
+                  "message",
+                ]) ?? compactJson(latestAssistantMessage);
+              reject(new Error(`pi reported error: ${errorMessage}`));
+              return;
+            }
+          }
+
+          const finalText =
+            textFromAssistantMessage(latestAssistantMessage).trim() ||
+            textByIndexToString(completeTextByIndex).trim() ||
+            textByIndexToString(streamTextByIndex).trim();
+
+          if (!finalText) {
+            reject(new Error("pi returned no text output"));
             return;
           }
-        }
 
-        const finalText =
-          textFromAssistantMessage(latestAssistantMessage).trim() ||
-          textByIndexToString(completeTextByIndex).trim() ||
-          textByIndexToString(streamTextByIndex).trim();
+          let output: AgentOutput;
+          try {
+            output = parseAgentOutput(finalText, this.schema, "pi");
+          } catch (err) {
+            const message =
+              err instanceof SyntaxError
+                ? `Failed to parse pi output: ${err.message}`
+                : `Invalid pi output: ${err instanceof Error ? err.message : err}`;
+            reject(new Error(message));
+            return;
+          }
 
-        if (!finalText) {
-          reject(new Error("pi returned no text output"));
-          return;
-        }
-
-        let output: AgentOutput;
-        try {
-          output = parseAgentOutput(finalText, this.schema, "pi");
-        } catch (err) {
-          const message =
-            err instanceof SyntaxError
-              ? `Failed to parse pi output: ${err.message}`
-              : `Invalid pi output: ${err instanceof Error ? err.message : err}`;
-          reject(new Error(message));
-          return;
-        }
-
-        resolve({ output, usage: lastEmittedUsage });
-      });
+          resolve({ output, usage: lastEmittedUsage });
+        },
+        { finalize: finalizeRun, shutdown: shutdownRun },
+      );
     });
+  }
+
+  async close(): Promise<void> {
+    const activeChild = this.activeChild;
+    if (activeChild !== null) {
+      this.shutdowns.start(() =>
+        shutdownPiProcess(activeChild, this.platform, this.detached),
+      );
+    }
+    await this.shutdowns.finalize();
+  }
+
+  getUnverifiedCleanupError() {
+    return this.shutdowns.getUnverifiedCleanupError();
   }
 }

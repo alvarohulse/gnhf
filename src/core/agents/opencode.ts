@@ -1,13 +1,11 @@
-import {
-  execFileSync,
-  spawn,
-  type ChildProcessWithoutNullStreams,
-} from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createWriteStream, type WriteStream } from "node:fs";
 import { createServer } from "node:net";
 import {
   buildAgentOutputSchema,
+  isValidTokenCount,
   parseAgentOutput,
+  validateAgentOutput,
   type Agent,
   type AgentOutput,
   type AgentOutputSchema,
@@ -16,9 +14,17 @@ import {
   type TokenUsage,
 } from "./types.js";
 import { appendDebugLog, serializeError } from "../debug-log.js";
-import { shutdownChildProcess } from "./managed-process.js";
+import {
+  ChildProcessShutdownTracker,
+  IncompleteChildProcessShutdownError,
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+  shutdownWindowsProcessTree,
+  spawnManagedChildProcess,
+} from "./managed-process.js";
 
 interface OpenCodeMessagePart {
+  messageID?: string;
   type?: string;
   text?: string;
   metadata?: {
@@ -31,6 +37,8 @@ interface OpenCodeMessagePart {
 interface OpenCodeTokens {
   input?: number;
   output?: number;
+  reasoning?: number;
+  total?: number;
   cache?: {
     read?: number;
     write?: number;
@@ -42,6 +50,7 @@ interface OpenCodeMessageResponse {
     id?: string;
     role?: string;
     structured?: AgentOutput;
+    cost?: number;
     tokens?: OpenCodeTokens;
   };
   parts?: OpenCodeMessagePart[];
@@ -75,6 +84,7 @@ interface OpenCodeStreamEvent {
         messageID?: string;
         type?: string;
         text?: string;
+        cost?: number;
         tokens?: OpenCodeTokens;
         metadata?: {
           openai?: {
@@ -86,6 +96,7 @@ interface OpenCodeStreamEvent {
         id?: string;
         role?: string;
         structured?: AgentOutput;
+        cost?: number;
         tokens?: OpenCodeTokens;
       };
     };
@@ -140,6 +151,7 @@ interface OpenCodeDeps {
   platform?: NodeJS.Platform;
   schema?: AgentOutputSchema;
   spawn?: typeof spawn;
+  supervisedProcessGroup?: boolean;
 }
 
 interface OpenCodeServer {
@@ -163,6 +175,7 @@ interface RequestOptions {
 }
 
 interface OpenCodeTextPartState {
+  messageId?: string;
   phase?: string;
   text: string;
 }
@@ -210,21 +223,6 @@ function buildPrompt(prompt: string, schema: AgentOutputSchema): string {
     "Do not include any prose before or after the JSON.",
     `The JSON must match this schema exactly: ${JSON.stringify(schema)}`,
   ].join("\n");
-}
-
-/**
- * On Windows with `shell: true`, `child.pid` is the `cmd.exe` wrapper, not
- * the actual server process.  `taskkill /T` terminates the entire process
- * tree rooted at that PID so the real server doesn't survive shutdown.
- */
-async function killWindowsProcessTree(pid: number): Promise<void> {
-  try {
-    execFileSync("taskkill", ["/T", "/F", "/PID", String(pid)], {
-      stdio: "ignore",
-    });
-  } catch {
-    // Best-effort: the process may have already exited.
-  }
 }
 
 function createAbortError(): Error {
@@ -294,13 +292,113 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function toUsage(tokens?: OpenCodeTokens): TokenUsage {
+function toUsage(tokens?: OpenCodeTokens, cost?: number): TokenUsage {
+  const inputTokens = tokens?.input;
+  const outputTokens = tokens?.output;
+  const reasoningTokens = tokens?.reasoning;
+  const cacheReadTokens = tokens?.cache?.read;
+  const cacheCreationTokens = tokens?.cache?.write;
+  const componentTotal =
+    isValidTokenCount(inputTokens) &&
+    isValidTokenCount(outputTokens) &&
+    isValidTokenCount(reasoningTokens) &&
+    isValidTokenCount(cacheReadTokens) &&
+    isValidTokenCount(cacheCreationTokens)
+      ? inputTokens +
+        outputTokens +
+        reasoningTokens +
+        cacheReadTokens +
+        cacheCreationTokens
+      : undefined;
+  const totalTokens = isValidTokenCount(tokens?.total)
+    ? tokens.total
+    : componentTotal;
   return {
-    inputTokens: tokens?.input ?? 0,
-    outputTokens: tokens?.output ?? 0,
-    cacheReadTokens: tokens?.cache?.read ?? 0,
-    cacheCreationTokens: tokens?.cache?.write ?? 0,
+    inputTokens: inputTokens ?? 0,
+    outputTokens: outputTokens ?? 0,
+    cacheReadTokens: cacheReadTokens ?? 0,
+    cacheCreationTokens: cacheCreationTokens ?? 0,
+    ...(isValidTokenCount(totalTokens) ? { totalTokens } : {}),
+    ...(isValidTokenCount(cost) ? { reportedCostUsd: cost } : {}),
+    tokensAvailable:
+      isValidTokenCount(inputTokens) &&
+      isValidTokenCount(outputTokens) &&
+      isValidTokenCount(totalTokens),
   };
+}
+
+function combineUsage(receipts: TokenUsage[]): TokenUsage {
+  const combined: TokenUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    tokensAvailable:
+      receipts.length > 0 &&
+      receipts.every((receipt) => receipt.tokensAvailable === true),
+  };
+  for (const receipt of receipts) {
+    combined.inputTokens += receipt.inputTokens;
+    combined.outputTokens += receipt.outputTokens;
+    combined.cacheReadTokens += receipt.cacheReadTokens;
+    combined.cacheCreationTokens += receipt.cacheCreationTokens;
+  }
+  if (
+    receipts.length > 0 &&
+    receipts.every((receipt) => isValidTokenCount(receipt.totalTokens))
+  ) {
+    combined.totalTokens = receipts.reduce(
+      (total, receipt) => total + receipt.totalTokens!,
+      0,
+    );
+  }
+  if (
+    receipts.length > 0 &&
+    receipts.every((receipt) => isValidTokenCount(receipt.reportedCostUsd))
+  ) {
+    combined.reportedCostUsd = receipts.reduce(
+      (total, receipt) => total + receipt.reportedCostUsd!,
+      0,
+    );
+  }
+  return combined;
+}
+
+function mergeMessageUsage(
+  assistantUsage: TokenUsage | undefined,
+  stepUsage: TokenUsage | undefined,
+): TokenUsage {
+  if (assistantUsage === undefined) {
+    return stepUsage!;
+  }
+  if (stepUsage === undefined) {
+    return assistantUsage;
+  }
+  const assistantTotal = assistantUsage.totalTokens ?? -1;
+  const stepTotal = stepUsage.totalTokens ?? -1;
+  const merged =
+    assistantTotal >= stepTotal ? { ...assistantUsage } : { ...stepUsage };
+  const reportedCostUsd = isValidTokenCount(assistantUsage.reportedCostUsd)
+    ? assistantUsage.reportedCostUsd
+    : stepUsage.reportedCostUsd;
+  if (isValidTokenCount(reportedCostUsd)) {
+    merged.reportedCostUsd = reportedCostUsd;
+  }
+  return merged;
+}
+
+function mergeTerminalMessageUsage(
+  assistantUsage: TokenUsage | undefined,
+  stepUsage: TokenUsage | undefined,
+): TokenUsage {
+  const merged = mergeMessageUsage(assistantUsage, stepUsage);
+  const terminalCost = assistantUsage?.reportedCostUsd;
+  if (isValidTokenCount(terminalCost)) {
+    merged.reportedCostUsd = terminalCost;
+  } else {
+    delete merged.reportedCostUsd;
+  }
+  return merged;
 }
 
 function withTimeoutSignal(
@@ -317,6 +415,7 @@ export class OpenCodeAgent implements Agent {
   name = "opencode";
 
   private bin: string;
+  private detached: boolean;
   private extraArgs?: string[];
   private fetchFn: typeof fetch;
   private getPortFn: () => Promise<number>;
@@ -326,6 +425,7 @@ export class OpenCodeAgent implements Agent {
   private spawnFn: typeof spawn;
   private server: OpenCodeServer | null = null;
   private closingPromise: Promise<void> | null = null;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(deps: OpenCodeDeps = {}) {
     this.bin = deps.bin ?? "opencode";
@@ -334,6 +434,10 @@ export class OpenCodeAgent implements Agent {
     this.getPortFn = deps.getPort ?? getAvailablePort;
     this.killProcessFn = deps.killProcess ?? process.kill.bind(process);
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.schema =
       deps.schema ?? buildAgentOutputSchema({ includeStopField: false });
     this.spawnFn = deps.spawn ?? spawn;
@@ -347,6 +451,8 @@ export class OpenCodeAgent implements Agent {
     const { onUsage, onMessage, signal, logPath } = options ?? {};
     const logStream = logPath ? createWriteStream(logPath) : null;
     const runController = new AbortController();
+    let runCompleted = false;
+    let runServer: OpenCodeServer | null = null;
     let sessionId: string | null = null;
     const runStartedAt = Date.now();
 
@@ -370,8 +476,9 @@ export class OpenCodeAgent implements Agent {
 
     try {
       const server = await this.ensureServer(cwd, runController.signal);
+      runServer = server;
       sessionId = await this.createSession(server, cwd, runController.signal);
-      const result = await this.streamMessage(
+      const streamedResult = await this.streamMessage(
         server,
         sessionId,
         buildPrompt(prompt, this.schema),
@@ -383,10 +490,14 @@ export class OpenCodeAgent implements Agent {
       appendDebugLog("opencode:run:end", {
         sessionId,
         elapsedMs: Date.now() - runStartedAt,
-        inputTokens: result.usage.inputTokens,
-        outputTokens: result.usage.outputTokens,
+        inputTokens: streamedResult.usage.inputTokens,
+        outputTokens: streamedResult.usage.outputTokens,
       });
-      return result;
+      runCompleted = streamedResult.sawSessionIdle;
+      return {
+        output: streamedResult.output,
+        usage: streamedResult.usage,
+      };
     } catch (error) {
       if (runController.signal.aborted || isAbortError(error)) {
         appendDebugLog("opencode:run:aborted", {
@@ -407,23 +518,37 @@ export class OpenCodeAgent implements Agent {
     } finally {
       signal?.removeEventListener("abort", onAbort);
       logStream?.end();
-      if (this.server && sessionId) {
-        if (runController.signal.aborted) {
-          await this.abortSession(this.server, sessionId);
+      if (runServer && sessionId) {
+        let mayDeleteSession = true;
+        if (!runCompleted || runController.signal.aborted) {
+          mayDeleteSession = await this.abortSession(runServer, sessionId);
+          if (!mayDeleteSession) {
+            await this.shutdownServer();
+          }
         }
-        await this.deleteSession(this.server, sessionId);
+        if (mayDeleteSession) {
+          await this.deleteSession(runServer, sessionId);
+        }
       }
+      await this.shutdowns.waitForAll();
     }
   }
 
   async close(): Promise<void> {
     await this.shutdownServer();
+    await this.shutdowns.finalize();
+  }
+
+  getUnverifiedCleanupError() {
+    return this.shutdowns.getUnverifiedCleanupError();
   }
 
   private async ensureServer(
     cwd: string,
     signal?: AbortSignal,
   ): Promise<OpenCodeServer> {
+    await this.shutdowns.waitForAll();
+
     if (this.server && !this.server.closed) {
       if (this.server.cwd !== cwd) {
         await this.shutdownServer();
@@ -440,8 +565,9 @@ export class OpenCodeAgent implements Agent {
 
     const port = await this.getPortFn();
     const isWindows = this.platform === "win32";
-    const detached = !isWindows;
-    const child = this.spawnFn(
+    const detached = this.detached;
+    const child = spawnManagedChildProcess(
+      this.spawnFn,
       this.bin,
       [
         "serve",
@@ -459,6 +585,8 @@ export class OpenCodeAgent implements Agent {
         stdio: ["ignore", "pipe", "pipe"],
         env: buildOpencodeChildEnv(),
       },
+      this.shutdowns,
+      this.platform,
     ) as unknown as ChildProcessWithoutNullStreams;
 
     const server: OpenCodeServer = {
@@ -472,6 +600,13 @@ export class OpenCodeAgent implements Agent {
       stderr: "",
       stdout: "",
     };
+    child.on("error", (error) => {
+      if (error instanceof IncompleteChildProcessShutdownError) {
+        void this.shutdowns
+          .start(() => Promise.reject(error))
+          .catch(() => undefined);
+      }
+    });
 
     const maxOutput = 64 * 1024;
     const maxMirroredLineLength = 2048;
@@ -542,7 +677,20 @@ export class OpenCodeAgent implements Agent {
         stdout: server.stdout.slice(-2048),
       });
       if (this.server === server) {
-        this.server = null;
+        if (server.detached) {
+          const clearClosedServer = () => {
+            if (this.server === server) {
+              this.server = null;
+            }
+          };
+          void this.shutdowns
+            .finalizeOwnedProcessGroup(server.child, server.detached, () =>
+              this.shutdownServerProcess(server),
+            )
+            .then(clearClosedServer, () => undefined);
+        } else {
+          this.server = null;
+        }
       }
     });
 
@@ -658,11 +806,16 @@ export class OpenCodeAgent implements Agent {
     logStream: WriteStream | null,
     onUsage?: (usage: TokenUsage) => void,
     onMessage?: (text: string) => void,
-  ): Promise<AgentResult> {
+  ): Promise<AgentResult & { sawSessionIdle: boolean }> {
     const streamAbortController = new AbortController();
+    const messageAbortController = new AbortController();
     const streamSignal = AbortSignal.any([
       signal,
       streamAbortController.signal,
+    ]);
+    const messageSignal = AbortSignal.any([
+      signal,
+      messageAbortController.signal,
     ]);
     const streamStartedAt = Date.now();
     appendDebugLog("opencode:stream:start", { sessionId });
@@ -682,12 +835,19 @@ export class OpenCodeAgent implements Agent {
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      tokensAvailable: false,
     };
     const usageByMessageId = new Map<string, TokenUsage>();
+    const assistantUsageByMessageId = new Map<string, TokenUsage>();
+    const stepUsageByMessageId = new Map<string, Map<string, TokenUsage>>();
     const textParts = new Map<string, OpenCodeTextPartState>();
     let lastFinalAnswerText: string | null = null;
-    let lastUsageSignature = "0:0:0:0";
-    let structuredOutputFromSSE: AgentOutput | null = null;
+    let lastFinalAnswerMessageId: string | null = null;
+    let lastUsageSignature = "0:0:0:0:0:na:true";
+    const structuredOutputByMessageId = new Map<string, AgentOutput>();
+    const usageReceiptMessageIds = new Set<string>();
+    let lastStructuredOutputMessageId: string | null = null;
+    let sawUnboundStructuredOutput = false;
     let streamErrorInfo: OpenCodeStreamErrorInfo | null = null;
 
     // Telemetry: capture "what was happening on the stream right up until
@@ -750,7 +910,7 @@ export class OpenCodeAgent implements Agent {
             parts: [{ type: "text", text: prompt }],
             format: buildStructuredOutputFormat(this.schema),
           },
-          signal,
+          signal: messageSignal,
         });
         appendDebugLog("opencode:message-post:end", {
           sessionId,
@@ -798,43 +958,109 @@ export class OpenCodeAgent implements Agent {
     }, 15_000);
     stallTimer.unref?.();
 
-    const updateUsage = (
-      messageId: string | undefined,
-      tokens?: OpenCodeTokens,
-    ) => {
-      if (!messageId || !tokens) return;
-      usageByMessageId.set(messageId, toUsage(tokens));
-
-      let nextInputTokens = 0;
-      let nextOutputTokens = 0;
-      let nextCacheReadTokens = 0;
-      let nextCacheCreationTokens = 0;
-      for (const messageUsage of usageByMessageId.values()) {
-        nextInputTokens += messageUsage.inputTokens;
-        nextOutputTokens += messageUsage.outputTokens;
-        nextCacheReadTokens += messageUsage.cacheReadTokens;
-        nextCacheCreationTokens += messageUsage.cacheCreationTokens;
-      }
-
+    const emitUsage = () => {
       const signature = [
-        nextInputTokens,
-        nextOutputTokens,
-        nextCacheReadTokens,
-        nextCacheCreationTokens,
+        usage.inputTokens,
+        usage.outputTokens,
+        usage.cacheReadTokens,
+        usage.cacheCreationTokens,
+        usage.totalTokens ?? "na",
+        usage.reportedCostUsd ?? "na",
+        usage.tokensAvailable,
       ].join(":");
-      usage.inputTokens = nextInputTokens;
-      usage.outputTokens = nextOutputTokens;
-      usage.cacheReadTokens = nextCacheReadTokens;
-      usage.cacheCreationTokens = nextCacheCreationTokens;
       if (signature !== lastUsageSignature) {
         lastUsageSignature = signature;
         onUsage?.({ ...usage });
       }
     };
 
-    const emitText = (partId: string, nextText: string, phase?: string) => {
+    const markUsageUnavailable = () => {
+      usage.tokensAvailable = false;
+      delete usage.totalTokens;
+      delete usage.reportedCostUsd;
+      emitUsage();
+    };
+
+    const updateUsage = (
+      messageId: string | undefined,
+      tokens?: OpenCodeTokens,
+      cost?: number,
+      requireReceipt = false,
+      stepId?: string,
+    ) => {
+      if (!messageId) {
+        if (requireReceipt) {
+          markUsageUnavailable();
+        }
+        return;
+      }
+      if (tokens !== undefined || cost !== undefined) {
+        usageReceiptMessageIds.add(messageId);
+      }
+      if (!tokens && cost === undefined && !requireReceipt) {
+        return;
+      }
+      const nextUsage = toUsage(tokens, cost);
+      if (stepId !== undefined) {
+        const stepUsage =
+          stepUsageByMessageId.get(messageId) ?? new Map<string, TokenUsage>();
+        stepUsage.set(stepId, nextUsage);
+        stepUsageByMessageId.set(messageId, stepUsage);
+        const combinedStepUsage = combineUsage([...stepUsage.values()]);
+        usageByMessageId.set(
+          messageId,
+          mergeMessageUsage(
+            assistantUsageByMessageId.get(messageId),
+            combinedStepUsage,
+          ),
+        );
+      } else {
+        assistantUsageByMessageId.set(messageId, nextUsage);
+        const stepUsage = stepUsageByMessageId.get(messageId);
+        usageByMessageId.set(
+          messageId,
+          mergeMessageUsage(
+            nextUsage,
+            stepUsage ? combineUsage([...stepUsage.values()]) : undefined,
+          ),
+        );
+      }
+
+      const combined = combineUsage([...usageByMessageId.values()]);
+      usage.inputTokens = combined.inputTokens;
+      usage.outputTokens = combined.outputTokens;
+      usage.cacheReadTokens = combined.cacheReadTokens;
+      usage.cacheCreationTokens = combined.cacheCreationTokens;
+      usage.tokensAvailable = combined.tokensAvailable;
+      if (combined.totalTokens === undefined) {
+        delete usage.totalTokens;
+      } else {
+        usage.totalTokens = combined.totalTokens;
+      }
+      if (combined.reportedCostUsd === undefined) {
+        delete usage.reportedCostUsd;
+      } else {
+        usage.reportedCostUsd = combined.reportedCostUsd;
+      }
+      emitUsage();
+    };
+
+    const emitText = (
+      partId: string,
+      nextText: string,
+      phase?: string,
+      messageId?: string,
+    ) => {
+      const current = textParts.get(partId);
+      const resolvedMessageId = messageId ?? current?.messageId;
       const trimmed = nextText.trim();
-      textParts.set(partId, { text: nextText, phase });
+      textParts.set(partId, {
+        text: nextText,
+        phase,
+        ...(resolvedMessageId === undefined
+          ? {}
+          : { messageId: resolvedMessageId }),
+      });
       notePhase(phase);
       if (!trimmed) return;
       // Reasoning-phase text and echoed user-prompt text used to leak into
@@ -843,6 +1069,7 @@ export class OpenCodeAgent implements Agent {
       // structured output - everything else is just transcript noise.
       if (phase === "final_answer") {
         lastFinalAnswerText = nextText;
+        lastFinalAnswerMessageId = resolvedMessageId ?? null;
       }
       onMessage?.(trimmed);
     };
@@ -885,12 +1112,17 @@ export class OpenCodeAgent implements Agent {
         if (!part) return false;
 
         if (part.type === "text" && typeof part.id === "string") {
-          emitText(part.id, part.text ?? "", part.metadata?.openai?.phase);
+          emitText(
+            part.id,
+            part.text ?? "",
+            part.metadata?.openai?.phase,
+            part.messageID,
+          );
           return false;
         }
 
         if (part.type === "step-finish") {
-          updateUsage(part.messageID, part.tokens);
+          updateUsage(part.messageID, part.tokens, part.cost, false, part.id);
           return false;
         }
 
@@ -898,11 +1130,17 @@ export class OpenCodeAgent implements Agent {
       }
 
       if (payload?.type === "message.updated") {
-        if (properties.info?.role === "assistant") {
-          updateUsage(properties.info.id, properties.info.tokens);
-        }
-        if (properties.info?.structured) {
-          structuredOutputFromSSE = properties.info.structured;
+        const info = properties.info;
+        if (info?.role === "assistant") {
+          updateUsage(info.id, info.tokens, info.cost, true);
+          if (info.structured) {
+            if (info.id === undefined) {
+              sawUnboundStructuredOutput = true;
+            } else {
+              structuredOutputByMessageId.set(info.id, info.structured);
+              lastStructuredOutputMessageId = info.id;
+            }
+          }
         }
         return false;
       }
@@ -1022,6 +1260,10 @@ export class OpenCodeAgent implements Agent {
         bytesRead += chunk.length;
         processBufferedEvents();
       }
+    } catch (error) {
+      messageAbortController.abort();
+      await messageRequest;
+      throw error;
     } finally {
       clearInterval(stallTimer);
       streamAbortController.abort();
@@ -1036,7 +1278,14 @@ export class OpenCodeAgent implements Agent {
       telemetry: buildTelemetry(),
     });
 
+    if (streamErrorInfo) {
+      messageAbortController.abort();
+    }
     const messageResult = await messageRequest;
+    if (streamErrorInfo) {
+      markUsageUnavailable();
+      throw new Error(buildProviderErrorMessage(streamErrorInfo));
+    }
     if (!messageResult.ok) {
       if (
         isAbortError(messageResult.error) ||
@@ -1061,29 +1310,85 @@ export class OpenCodeAgent implements Agent {
       }
     }
 
-    if (structuredOutputFromSSE) {
+    const finalOutputText = toNonEmptyString(lastFinalAnswerText);
+
+    if (
+      finalOutputText === null &&
+      lastStructuredOutputMessageId === null &&
+      !sawUnboundStructuredOutput
+    ) {
+      appendDebugLog("opencode:output:missing", {
+        sessionId,
+        hasStructuredOutput: false,
+      });
+      throw new Error("OpenCode produced no final answer");
+    }
+
+    const terminalMessageId =
+      lastStructuredOutputMessageId ?? lastFinalAnswerMessageId;
+    const structuredOutput =
+      terminalMessageId === null
+        ? undefined
+        : structuredOutputByMessageId.get(terminalMessageId);
+    const hasMatchingUsageReceipt =
+      terminalMessageId !== null &&
+      usageReceiptMessageIds.has(terminalMessageId);
+    const structuredOutputMismatch =
+      sawUnboundStructuredOutput ||
+      (lastStructuredOutputMessageId !== null &&
+        structuredOutput === undefined) ||
+      (finalOutputText !== null &&
+        lastFinalAnswerMessageId !== terminalMessageId);
+    if (
+      terminalMessageId === null ||
+      !hasMatchingUsageReceipt ||
+      structuredOutputMismatch
+    ) {
+      markUsageUnavailable();
+      appendDebugLog("opencode:output:identity-error", {
+        sessionId,
+        terminalMessageId,
+        hasFinalAnswer: finalOutputText !== null,
+        hasMatchingStructuredOutput: structuredOutput !== undefined,
+        hasMatchingUsageReceipt,
+        sawUnboundStructuredOutput,
+      });
+      throw new Error(
+        "OpenCode terminal output identity could not be verified",
+      );
+    }
+
+    const terminalUsage = combineUsage(
+      [...usageByMessageId.keys()].map((messageId) => {
+        const stepUsage = stepUsageByMessageId.get(messageId);
+        return mergeTerminalMessageUsage(
+          assistantUsageByMessageId.get(messageId),
+          stepUsage === undefined
+            ? undefined
+            : combineUsage([...stepUsage.values()]),
+        );
+      }),
+    );
+
+    if (structuredOutput !== undefined) {
+      const output = validateAgentOutput(structuredOutput, this.schema);
       appendDebugLog("opencode:output:structured", {
         sessionId,
+        messageId: terminalMessageId,
         source: "sse",
       });
       return {
-        output: structuredOutputFromSSE,
-        usage,
+        output,
+        usage: terminalUsage,
+        sawSessionIdle,
       };
     }
 
-    if (streamErrorInfo) {
-      throw new Error(buildProviderErrorMessage(streamErrorInfo));
-    }
-
-    const finalOutputText = toNonEmptyString(lastFinalAnswerText);
-
     if (finalOutputText === null) {
-      appendDebugLog("opencode:output:missing", {
-        sessionId,
-        hasStructuredOutput: structuredOutputFromSSE !== null,
-      });
-      throw new Error("OpenCode produced no final answer");
+      markUsageUnavailable();
+      throw new Error(
+        "OpenCode terminal output identity could not be verified",
+      );
     }
 
     try {
@@ -1095,7 +1400,8 @@ export class OpenCodeAgent implements Agent {
       });
       return {
         output,
-        usage,
+        usage: terminalUsage,
+        sawSessionIdle,
       };
     } catch (error) {
       appendDebugLog("opencode:output:parse-error", {
@@ -1132,25 +1438,43 @@ export class OpenCodeAgent implements Agent {
   private async abortSession(
     server: OpenCodeServer,
     sessionId: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await this.request(server, `/session/${sessionId}/abort`, {
         method: "POST",
         timeoutMs: 1_000,
       });
       appendDebugLog("opencode:session:abort", { sessionId });
+      return true;
     } catch (error) {
       appendDebugLog("opencode:session:abort-failed", {
         sessionId,
         error: serializeError(error),
       });
-      // Best effort only.
+      return false;
     }
   }
 
   private async shutdownServer(): Promise<void> {
-    if (!this.server || this.server.closed) {
-      this.server = null;
+    if (!this.server) {
+      return;
+    }
+
+    const server = this.server;
+    if (server.closed) {
+      try {
+        await this.shutdowns.finalizeOwnedProcessGroup(
+          server.child,
+          server.detached,
+          () => this.shutdownServerProcess(server),
+        );
+      } catch (error) {
+        this.shutdowns.acknowledgeFailure(error);
+        throw error;
+      }
+      if (this.server === server) {
+        this.server = null;
+      }
       return;
     }
 
@@ -1159,7 +1483,6 @@ export class OpenCodeAgent implements Agent {
       return;
     }
 
-    const server = this.server;
     const shutdownStartedAt = Date.now();
     appendDebugLog("opencode:shutdown", {
       cwd: server.cwd,
@@ -1167,26 +1490,47 @@ export class OpenCodeAgent implements Agent {
       pid: server.child.pid,
     });
 
-    this.closingPromise = (
-      this.platform === "win32" && server.child.pid
-        ? killWindowsProcessTree(server.child.pid)
-        : shutdownChildProcess(server.child, {
-            detached: server.detached,
-            killProcess: this.killProcessFn,
-            timeoutMs: 3_000,
-          })
-    ).finally(() => {
-      if (this.server === server) {
-        this.server = null;
-      }
-      this.closingPromise = null;
-      appendDebugLog("opencode:shutdown:done", {
-        port: server.port,
-        elapsedMs: Date.now() - shutdownStartedAt,
+    const shutdown = this.shutdowns.start(() =>
+      this.shutdownServerProcess(server),
+    );
+    this.closingPromise = shutdown
+      .then(
+        () => {
+          if (this.server === server) {
+            this.server = null;
+          }
+          appendDebugLog("opencode:shutdown:done", {
+            port: server.port,
+            elapsedMs: Date.now() - shutdownStartedAt,
+          });
+        },
+        (error) => {
+          this.shutdowns.acknowledgeFailure(error);
+          appendDebugLog("opencode:shutdown:failed", {
+            port: server.port,
+            elapsedMs: Date.now() - shutdownStartedAt,
+            error: serializeError(error),
+          });
+          throw error;
+        },
+      )
+      .finally(() => {
+        this.closingPromise = null;
       });
-    });
 
     await this.closingPromise;
+  }
+
+  private shutdownServerProcess(server: OpenCodeServer): Promise<void> {
+    if (this.platform === "win32") {
+      return shutdownWindowsProcessTree(server.child);
+    }
+
+    return shutdownChildProcess(server.child, {
+      detached: server.detached,
+      killProcess: this.killProcessFn,
+      timeoutMs: 3_000,
+    });
   }
 
   private async requestJSON<T>(

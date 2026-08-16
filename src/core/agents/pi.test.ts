@@ -6,6 +6,19 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
+vi.mock("./managed-process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./managed-process.js")>();
+  return {
+    ...actual,
+    spawnManagedChildProcess: (
+      spawnProcess: typeof import("node:child_process").spawn,
+      command: string,
+      args: string[],
+      options: import("node:child_process").SpawnOptions,
+    ) => spawnProcess(command, args, options),
+  };
+});
+
 import { execFileSync, spawn } from "node:child_process";
 import { PiAgent } from "./pi.js";
 import { buildAgentOutputSchema } from "./types.js";
@@ -14,6 +27,8 @@ const mockSpawn = vi.mocked(spawn);
 
 function createMockProcess() {
   const proc = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    signalCode: null,
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     stdin: {
@@ -92,6 +107,23 @@ describe("PiAgent", () => {
     );
   });
 
+  it("stays inside an external supervisor process group", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent({
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+
+    agent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "pi",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
+    );
+  });
+
   it("uses a shell on Windows for cmd wrapper paths", () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
@@ -132,14 +164,49 @@ describe("PiAgent", () => {
       signal: controller.signal,
     });
     controller.abort();
+    proc.emit("close", null, null);
 
     await expect(promise).rejects.toThrow("Agent was aborted");
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
       "taskkill",
       ["/T", "/F", "/PID", "6789"],
-      { stdio: "ignore" },
+      { stdio: "ignore", timeout: 3_000 },
     );
     expect(proc.kill).not.toHaveBeenCalled();
+  });
+
+  it("surfaces ownership loss when the group leader closes during abort", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 4321 });
+    mockSpawn.mockReturnValue(proc);
+    const processKill = vi
+      .spyOn(process, "kill")
+      .mockImplementation(() => true);
+    const controller = new AbortController();
+    const agent = new PiAgent({ platform: "linux" });
+
+    try {
+      const runPromise = agent.run("test prompt", "/work/dir", {
+        signal: controller.signal,
+      });
+      const rejection = expect(runPromise).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+      controller.abort();
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
+
+      proc.emit("close", null);
+      await vi.advanceTimersByTimeAsync(100);
+      await rejection;
+      expect(processKill).not.toHaveBeenCalledWith(-4321, "SIGKILL");
+      await expect(agent.close()).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("streams text deltas to onMessage", async () => {
@@ -247,6 +314,7 @@ describe("PiAgent", () => {
         outputTokens: 7,
         cacheReadTokens: 3,
         cacheCreationTokens: 0,
+        tokensAvailable: true,
       },
     });
     expect(onUsage).toHaveBeenCalledWith({
@@ -254,6 +322,307 @@ describe("PiAgent", () => {
       outputTokens: 7,
       cacheReadTokens: 3,
       cacheCreationTokens: 0,
+      tokensAvailable: true,
+    });
+  });
+
+  it("maps live totals and terminal cost receipts", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const onUsage = vi.fn();
+    const agent = new PiAgent();
+    const usage = {
+      input: 4,
+      output: 2,
+      cacheRead: 3,
+      cacheWrite: 1,
+      totalTokens: 12,
+      cost: { total: 0.4 },
+    };
+
+    const promise = agent.run("test prompt", "/work/dir", { onUsage });
+    emitJson(proc, {
+      type: "message_update",
+      message: { role: "assistant", responseId: "r1" },
+      usage,
+    });
+    emitJson(proc, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        responseId: "r1",
+        usage,
+        content: [{ type: "text", text: finalOutput() }],
+      },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 4,
+        outputTokens: 2,
+        cacheReadTokens: 3,
+        cacheCreationTokens: 1,
+        totalTokens: 12,
+        reportedCostUsd: 0.4,
+        tokensAvailable: true,
+      },
+    });
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ totalTokens: 12, reportedCostUsd: 0.4 }),
+    );
+  });
+
+  it("applies top-level live usage to the active assistant message", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const onUsage = vi.fn();
+    const agent = new PiAgent();
+    const usage = {
+      input: 4,
+      output: 2,
+      cacheRead: 3,
+      cacheWrite: 1,
+      totalTokens: 12,
+      cost: { total: 0.4 },
+    };
+
+    const promise = agent.run("test prompt", "/work/dir", { onUsage });
+    emitJson(proc, {
+      type: "message_start",
+      message: { role: "assistant", responseId: "r1" },
+    });
+    emitJson(proc, {
+      type: "message_update",
+      usage,
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: finalOutput(),
+      },
+    });
+
+    expect(onUsage).toHaveBeenLastCalledWith({
+      inputTokens: 4,
+      outputTokens: 2,
+      cacheReadTokens: 3,
+      cacheCreationTokens: 1,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      tokensAvailable: true,
+    });
+
+    emitJson(proc, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        responseId: "r1",
+        usage,
+        content: [{ type: "text", text: finalOutput() }],
+      },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      output: { success: true },
+      usage: { totalTokens: 12, reportedCostUsd: 0.4 },
+    });
+  });
+
+  it("removes streamed cost when agent_end omits it", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const onUsage = vi.fn();
+    const agent = new PiAgent();
+
+    const promise = agent.run("test prompt", "/work/dir", { onUsage });
+    emitJson(proc, {
+      type: "message_update",
+      message: { role: "assistant", responseId: "r1" },
+      usage: {
+        input: 4,
+        output: 2,
+        totalTokens: 6,
+        cost: { total: 0.4 },
+      },
+    });
+    expect(onUsage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ reportedCostUsd: 0.4 }),
+    );
+
+    emitJson(proc, {
+      type: "agent_end",
+      messages: [
+        {
+          role: "assistant",
+          responseId: "r1",
+          usage: { input: 4, output: 2, totalTokens: 6 },
+          content: finalOutput(),
+        },
+      ],
+    });
+    proc.emit("close", 0);
+
+    const result = await promise;
+    expect(result.usage).toMatchObject({
+      inputTokens: 4,
+      outputTokens: 2,
+      totalTokens: 6,
+      tokensAvailable: true,
+    });
+    expect(result.usage).not.toHaveProperty("reportedCostUsd");
+  });
+
+  it("discards provisional usage when agent_end has no messages", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent();
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "message_update",
+      usage: {
+        input: 4,
+        output: 2,
+        totalTokens: 6,
+        cost: { total: 0.4 },
+      },
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: finalOutput(),
+      },
+    });
+    emitJson(proc, { type: "agent_end", messages: [] });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      output: { success: true },
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        tokensAvailable: false,
+      },
+    });
+  });
+
+  it("replaces anonymous live usage when the terminal message adds an id", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent();
+    const usage = { input: 4, output: 2, totalTokens: 6 };
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "message_update",
+      usage,
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: finalOutput(),
+      },
+    });
+    emitJson(proc, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        responseId: "r1",
+        usage,
+        content: [{ type: "text", text: finalOutput() }],
+      },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      output: { success: true },
+      usage: {
+        inputTokens: 4,
+        outputTokens: 2,
+        totalTokens: 6,
+      },
+    });
+  });
+
+  it("replaces anonymous streamed cost with the identified terminal receipt", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent();
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "message_update",
+      usage: {
+        input: 4,
+        output: 2,
+        totalTokens: 6,
+        cost: { total: 0.4 },
+      },
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: finalOutput(),
+      },
+    });
+    emitJson(proc, {
+      type: "agent_end",
+      messages: [
+        {
+          role: "assistant",
+          responseId: "r1",
+          usage: {
+            input: 4,
+            output: 2,
+            totalTokens: 6,
+            cost: { total: 0.5 },
+          },
+          content: finalOutput(),
+        },
+      ],
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      output: { success: true },
+      usage: {
+        inputTokens: 4,
+        outputTokens: 2,
+        totalTokens: 6,
+        reportedCostUsd: 0.5,
+      },
+    });
+  });
+
+  it("marks aggregate usage unavailable when a completed message omits usage", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent();
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        responseId: "r1",
+        usage: { input: 5, output: 3 },
+        content: "working",
+      },
+    });
+    emitJson(proc, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        responseId: "r2",
+        content: finalOutput(),
+      },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 5,
+        outputTokens: 3,
+        tokensAvailable: false,
+      },
     });
   });
 
@@ -274,6 +643,40 @@ describe("PiAgent", () => {
 
     await expect(promise).resolves.toMatchObject({
       output: { success: true, summary: "ok" },
+      usage: { tokensAvailable: false },
+    });
+  });
+
+  it("tracks every completed assistant message from agent_end", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent();
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "agent_end",
+      messages: [
+        {
+          role: "assistant",
+          responseId: "r1",
+          content: "working",
+          usage: { input: 5, output: 3 },
+        },
+        {
+          role: "assistant",
+          responseId: "r2",
+          content: finalOutput(),
+        },
+      ],
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 5,
+        outputTokens: 3,
+        tokensAvailable: false,
+      },
     });
   });
 
@@ -490,10 +893,11 @@ describe("PiAgent", () => {
   it("rejects spawn errors", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new PiAgent();
+    const agent = new PiAgent({ platform: "linux" });
 
     const promise = agent.run("test prompt", "/work/dir");
     proc.emit("error", new Error("ENOENT"));
+    proc.emit("close", null, null);
 
     await expect(promise).rejects.toThrow("Failed to spawn pi: ENOENT");
   });

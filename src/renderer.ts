@@ -63,7 +63,11 @@ function formatTokenCount(
   tokens: number,
   direction: "in" | "out",
   estimated = false,
+  available = true,
 ): string {
+  if (!available) {
+    return `? ${direction}`;
+  }
   const prefix = estimated ? "~" : "";
   return `${prefix}${formatTokens(tokens)} ${direction}`;
 }
@@ -80,8 +84,8 @@ function buildTerminalTitle(state: OrchestratorState, now: number): string {
       : state.status;
   return (
     `gnhf ${lead}` +
-    ` · ${formatTokenCount(state.totalInputTokens, "in", state.tokensEstimated)}` +
-    ` · ${formatTokenCount(state.totalOutputTokens, "out", state.tokensEstimated)}` +
+    ` · ${formatTokenCount(state.totalInputTokens, "in", state.tokensEstimated, state.tokensAvailable !== false)}` +
+    ` · ${formatTokenCount(state.totalOutputTokens, "out", state.tokensEstimated, state.tokensAvailable !== false)}` +
     ` · ${formatCommitCount(state.commitCount)}`
   );
 }
@@ -147,6 +151,7 @@ export function renderStatsCells(
   outputTokens: number,
   commitCount: number,
   tokensEstimated = false,
+  tokensAvailable = true,
 ): Cell[] {
   return [
     ...textToCells(elapsed, "bold"),
@@ -154,14 +159,14 @@ export function renderStatsCells(
     ...textToCells("\u00b7", "dim"),
     ...textToCells("  ", "normal"),
     ...textToCells(
-      formatTokenCount(inputTokens, "in", tokensEstimated),
+      formatTokenCount(inputTokens, "in", tokensEstimated, tokensAvailable),
       "normal",
     ),
     ...textToCells("  ", "normal"),
     ...textToCells("\u00b7", "dim"),
     ...textToCells("  ", "normal"),
     ...textToCells(
-      formatTokenCount(outputTokens, "out", tokensEstimated),
+      formatTokenCount(outputTokens, "out", tokensEstimated, tokensAvailable),
       "normal",
     ),
     ...textToCells("  ", "normal"),
@@ -241,6 +246,7 @@ export function renderStats(
   outputTokens: number,
   commitCount: number,
   tokensEstimated = false,
+  tokensAvailable = true,
 ): string {
   return rowToString(
     renderStatsCells(
@@ -249,6 +255,7 @@ export function renderStats(
       outputTokens,
       commitCount,
       tokensEstimated,
+      tokensAvailable,
     ),
   );
 }
@@ -513,6 +520,7 @@ export function buildContentCells(
         state.totalOutputTokens,
         state.commitCount,
         state.tokensEstimated,
+        state.tokensAvailable !== false,
       ),
     ] as Cell[][],
     agent: [

@@ -1,0 +1,40 @@
+Target: e26391904e36821970289908a35d5136af593cf4
+Built CLI: dist/cli.mjs
+Environment: disposable local Git repository; no install, deployment, network agent, or canary
+
+Scenario: stop before the first iteration, publish an owner-scoped worktree receipt, preserve the requested worktree, and keep runtime metadata untracked
+Command: gnhf "supervisor receipt evidence e263" --agent opencode --max-iterations 0 --prevent-sleep off --worktree --preserve-worktree
+Environment: GNHF_WORKTREE_RECEIPT_PATH=<fixture>/receipt/worktree.json, GNHF_TELEMETRY=0
+Exit code: 0
+
+CLI permanent summary:
+  gnhf stopped
+  opencode ran for 0s before: max iterations reached (0)
+  iterations      0 total       0 good       0 failed
+  tokens          unavailable
+  branch diff     0 commits     +0           -0
+  gnhf: worktree preserved at <fixture>/fixture-gnhf-worktrees/supervisor-receipt-e-1d5b24
+
+Published receipt:
+{
+  "schemaVersion": 1,
+  "receiptId": "<receipt-id>",
+  "runId": "supervisor-receipt-e-1d5b24",
+  "state": "created",
+  "worktreePath": "<fixture>/fixture-gnhf-worktrees/supervisor-receipt-e-1d5b24",
+  "baseCommit": "b413524d5f7f6f29d03cbef362160457808ac856"
+}
+Receipt mode: 600
+
+Git and metadata verification:
+  original branch: main
+  original commit count: 1
+  preserved branch: gnhf/supervisor-receipt-e-1d5b24
+  preserved status: clean
+  tracked .gnhf paths: none
+  .gnhf/runs/.../notes.md ignore source: .git/info/exclude:.gnhf/runs/
+  .gnhf/setup-failures/example.json ignore source: .git/info/exclude:.gnhf/setup-failures/
+
+Lifecycle receipts:
+{"event":"run:complete","signal":null,"status":"aborted","iterations":0,"successCount":0,"failCount":0,"totalInputTokens":null,"totalOutputTokens":null,"tokensAvailable":false,"reportedCostUsd":null,"commitCount":0,"worktreePath":"<fixture>/fixture-gnhf-worktrees/supervisor-receipt-e-1d5b24"}
+{"event":"worktree:preserved","worktreePath":"<fixture>/fixture-gnhf-worktrees/supervisor-receipt-e-1d5b24","reason":"requested"}

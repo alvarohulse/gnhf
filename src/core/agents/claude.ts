@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import {
   buildAgentOutputSchema,
+  isValidTokenCount,
   type Agent,
   type AgentOutput,
   type AgentOutputSchema,
@@ -10,7 +11,13 @@ import {
   type TokenUsage,
   PermanentAgentError,
 } from "./types.js";
-import { shutdownChildProcess } from "./managed-process.js";
+import {
+  ChildProcessShutdownTracker,
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+  shutdownWindowsProcessTree,
+  spawnManagedChildProcess,
+} from "./managed-process.js";
 import { parseJSONLStream, setupAbortHandler } from "./stream-utils.js";
 
 const DEFAULT_FINAL_RESULT_EXIT_GRACE_MS = 15_000;
@@ -40,12 +47,12 @@ interface ClaudeResultEvent {
   type: "result";
   subtype: string;
   is_error?: boolean;
-  total_cost_usd: number;
-  usage: {
-    input_tokens: number;
-    cache_read_input_tokens: number;
-    cache_creation_input_tokens: number;
-    output_tokens: number;
+  total_cost_usd?: number;
+  usage?: {
+    input_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+    output_tokens?: number;
   };
   structured_output: AgentOutput | null;
 }
@@ -58,6 +65,7 @@ interface ClaudeAgentDeps {
   finalResultGraceMs?: number;
   platform?: NodeJS.Platform;
   schema?: AgentOutputSchema;
+  supervisedProcessGroup?: boolean;
 }
 
 function shouldUseWindowsShell(
@@ -91,44 +99,17 @@ function shouldUseWindowsShell(
   }
 }
 
-function terminateClaudeProcess(
-  child: ReturnType<typeof spawn>,
-  platform: NodeJS.Platform,
-): void {
-  if (platform === "win32" && child.pid) {
-    try {
-      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: the process may have already exited.
-    }
-    return;
-  }
-
-  if (child.pid) {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-      return;
-    } catch {
-      // Fall back to the direct child if it was not started as a process group.
-    }
-  }
-
-  child.kill("SIGTERM");
-}
-
 async function shutdownClaudeProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
+  detached: boolean,
 ): Promise<void> {
   if (platform === "win32") {
-    terminateClaudeProcess(child, platform);
-    return;
+    return shutdownWindowsProcessTree(child);
   }
 
   await shutdownChildProcess(child, {
-    detached: true,
+    detached,
   });
 }
 
@@ -172,12 +153,62 @@ function toTokenUsage(usage: {
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
 }): TokenUsage {
+  const inputTokens = usage.input_tokens;
+  const outputTokens = usage.output_tokens;
+  const cacheReadTokens = usage.cache_read_input_tokens ?? 0;
+  const cacheCreationTokens = usage.cache_creation_input_tokens ?? 0;
+  const tokensAvailable =
+    isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens);
+  const normalizedInputTokens = (inputTokens ?? 0) + cacheReadTokens;
   return {
-    inputTokens:
-      (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0),
-    outputTokens: usage.output_tokens ?? 0,
-    cacheReadTokens: usage.cache_read_input_tokens ?? 0,
-    cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
+    inputTokens: normalizedInputTokens,
+    outputTokens: outputTokens ?? 0,
+    cacheReadTokens,
+    cacheCreationTokens,
+    ...(tokensAvailable
+      ? {
+          totalTokens:
+            normalizedInputTokens + (outputTokens ?? 0) + cacheCreationTokens,
+        }
+      : {}),
+    tokensAvailable,
+  };
+}
+
+function toResultUsage(event: ClaudeResultEvent): TokenUsage | null {
+  const inputTokens = event.usage?.input_tokens;
+  const outputTokens = event.usage?.output_tokens;
+  const cacheReadTokens = event.usage?.cache_read_input_tokens;
+  const cacheCreationTokens = event.usage?.cache_creation_input_tokens;
+  const reportedCostUsd = event.total_cost_usd;
+  const tokensAvailable =
+    isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens);
+  const reportedCostAvailable = isValidTokenCount(reportedCostUsd);
+
+  if (!tokensAvailable && !reportedCostAvailable) {
+    return null;
+  }
+
+  return {
+    inputTokens: tokensAvailable
+      ? inputTokens + (isValidTokenCount(cacheReadTokens) ? cacheReadTokens : 0)
+      : 0,
+    outputTokens: tokensAvailable ? outputTokens : 0,
+    cacheReadTokens: isValidTokenCount(cacheReadTokens) ? cacheReadTokens : 0,
+    cacheCreationTokens: isValidTokenCount(cacheCreationTokens)
+      ? cacheCreationTokens
+      : 0,
+    ...(tokensAvailable
+      ? {
+          totalTokens:
+            inputTokens +
+            outputTokens +
+            (isValidTokenCount(cacheReadTokens) ? cacheReadTokens : 0) +
+            (isValidTokenCount(cacheCreationTokens) ? cacheCreationTokens : 0),
+        }
+      : {}),
+    ...(reportedCostAvailable ? { reportedCostUsd } : {}),
+    tokensAvailable,
   };
 }
 
@@ -186,7 +217,8 @@ function isSameUsage(a: TokenUsage, b: TokenUsage): boolean {
     a.inputTokens === b.inputTokens &&
     a.outputTokens === b.outputTokens &&
     a.cacheReadTokens === b.cacheReadTokens &&
-    a.cacheCreationTokens === b.cacheCreationTokens
+    a.cacheCreationTokens === b.cacheCreationTokens &&
+    a.tokensAvailable === b.tokensAvailable
   );
 }
 
@@ -304,11 +336,14 @@ function describeExitFailure(
 export class ClaudeAgent implements Agent {
   name = "claude";
 
+  private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
   private extraArgs?: string[];
   private finalResultGraceMs: number;
+  private detached: boolean;
   private platform: NodeJS.Platform;
   private schema: AgentOutputSchema;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(binOrDeps: string | ClaudeAgentDeps = {}) {
     const deps = typeof binOrDeps === "string" ? { bin: binOrDeps } : binOrDeps;
@@ -317,6 +352,10 @@ export class ClaudeAgent implements Agent {
     this.finalResultGraceMs =
       deps.finalResultGraceMs ?? DEFAULT_FINAL_RESULT_EXIT_GRACE_MS;
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.schema =
       deps.schema ?? buildAgentOutputSchema({ includeStopField: false });
   }
@@ -331,29 +370,59 @@ export class ClaudeAgent implements Agent {
     return new Promise((resolve, reject) => {
       const logStream = logPath ? createWriteStream(logPath) : null;
 
-      const child = spawn(
+      const child = spawnManagedChildProcess(
+        spawn,
         this.bin,
         buildClaudeArgs(prompt, this.schema, this.extraArgs),
         {
           cwd,
-          detached: this.platform !== "win32",
+          detached: this.detached,
           shell: shouldUseWindowsShell(this.bin, this.platform),
           stdio: ["ignore", "pipe", "pipe"],
           env: process.env,
         },
+        this.shutdowns,
+        this.platform,
       );
+      this.activeChild = child;
+      child.on("close", () => {
+        if (this.activeChild === child) {
+          this.activeChild = null;
+        }
+      });
+      const finalizeRun = () =>
+        this.shutdowns.finalizeOwnedProcessGroup(child, this.detached, () =>
+          shutdownClaudeProcess(child, this.platform, this.detached),
+        );
+      const shutdownRun = () =>
+        this.shutdowns.start(() =>
+          shutdownClaudeProcess(child, this.platform, this.detached),
+        );
+      const rejectCleanupFailure = (error: unknown) => {
+        reject(
+          error instanceof Error
+            ? error
+            : new Error(`Claude process cleanup failed: ${String(error)}`),
+        );
+      };
+      const rejectAfterShutdown = (error: Error) => {
+        void (async () => {
+          try {
+            await shutdownRun();
+            reject(error);
+          } catch (cleanupError) {
+            rejectCleanupFailure(cleanupError);
+          }
+        })();
+      };
 
-      if (
-        setupAbortHandler(signal, child, reject, () =>
-          terminateClaudeProcess(child, this.platform),
-        )
-      ) {
+      if (setupAbortHandler(signal, child, reject, shutdownRun)) {
         return;
       }
 
       let resultEvent: ClaudeResultEvent | null = null;
       let finalStructuredResultEvent: ClaudeResultEvent | null = null;
-      let latestResultUsage: ClaudeResultEvent["usage"] | null = null;
+      let latestResultUsage: TokenUsage | null = null;
       let finalResultCleanupTimer: ReturnType<typeof setTimeout> | null = null;
       let closedAfterFinalCleanup = false;
       let stderr = "";
@@ -363,12 +432,28 @@ export class ClaudeAgent implements Agent {
         outputTokens: 0,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       };
       const usageByMessageId = new Map<string, TokenUsage>();
       let anonymousAssistantCount = 0;
       let lastAnonymousAssistantId: string | null = null;
       let lastAnonymousAssistantUsage: TokenUsage | null = null;
       let pendingAnonymousAssistantUsage: TokenUsage | null = null;
+
+      const getResultUsage = (): TokenUsage => {
+        if (latestResultUsage !== null) {
+          return latestResultUsage;
+        }
+        latestResultUsage = {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: false,
+        };
+        onUsage?.({ ...latestResultUsage });
+        return latestResultUsage;
+      };
 
       child.stderr!.on("data", (data: Buffer) => {
         stderr += data.toString();
@@ -379,7 +464,9 @@ export class ClaudeAgent implements Agent {
       });
 
       child.on("error", (err) => {
-        reject(new Error(`Failed to spawn claude: ${err.message}`));
+        rejectAfterShutdown(
+          new Error(`Failed to spawn claude: ${err.message}`),
+        );
       });
 
       parseJSONLStream<ClaudeEvent>(child.stdout!, logStream, (event) => {
@@ -453,6 +540,17 @@ export class ClaudeAgent implements Agent {
           }
 
           usageByMessageId.set(messageId, nextUsage);
+          cumulative.tokensAvailable = [...usageByMessageId.values()].every(
+            (usage) => usage.tokensAvailable,
+          );
+          if (cumulative.tokensAvailable) {
+            cumulative.totalTokens =
+              cumulative.inputTokens +
+              cumulative.outputTokens +
+              cumulative.cacheCreationTokens;
+          } else {
+            delete cumulative.totalTokens;
+          }
           onUsage?.({ ...cumulative });
 
           if (onMessage) {
@@ -473,16 +571,32 @@ export class ClaudeAgent implements Agent {
 
         if (event.type === "result") {
           const next = event as ClaudeResultEvent;
-          latestResultUsage = next.usage;
+          const nextUsage = toResultUsage(next) ?? {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            tokensAvailable: false,
+          };
+          latestResultUsage = nextUsage;
+          onUsage?.({ ...nextUsage });
           if (isFinalStructuredResult(next)) {
             finalStructuredResultEvent = next;
             if (finalResultCleanupTimer) {
               clearTimeout(finalResultCleanupTimer);
             }
-            finalResultCleanupTimer = setTimeout(() => {
+            const cleanupFinalResult = () => {
               closedAfterFinalCleanup = true;
-              void shutdownClaudeProcess(child, this.platform);
-            }, this.finalResultGraceMs);
+              void shutdownRun().catch(rejectCleanupFailure);
+            };
+            if (this.platform === "win32") {
+              cleanupFinalResult();
+            } else {
+              finalResultCleanupTimer = setTimeout(
+                cleanupFinalResult,
+                this.finalResultGraceMs,
+              );
+            }
           } else if (
             !finalStructuredResultEvent &&
             (next.is_error ||
@@ -495,11 +609,25 @@ export class ClaudeAgent implements Agent {
         }
       });
 
-      child.on("close", (code) => {
+      child.on("close", async (code) => {
         if (finalResultCleanupTimer) {
           clearTimeout(finalResultCleanupTimer);
         }
         logStream?.end();
+        try {
+          await finalizeRun();
+          if (closedAfterFinalCleanup) {
+            await this.shutdowns.waitForAll();
+          }
+        } catch (error) {
+          reject(
+            error instanceof Error
+              ? error
+              : new Error(`Claude process cleanup failed: ${String(error)}`),
+          );
+          return;
+        }
+        const terminalUsage = getResultUsage();
         if (code !== 0 && !closedAfterFinalCleanup) {
           const failure = describeExitFailure(code, stdoutTail, stderr);
           reject(
@@ -538,13 +666,22 @@ export class ClaudeAgent implements Agent {
         }
 
         const output: AgentOutput = terminalResultEvent.structured_output;
-        const usage = toTokenUsage(
-          latestResultUsage ?? terminalResultEvent.usage,
-        );
-
-        onUsage?.(usage);
-        resolve({ output, usage });
+        resolve({ output, usage: terminalUsage });
       });
     });
+  }
+
+  async close(): Promise<void> {
+    const activeChild = this.activeChild;
+    if (activeChild !== null) {
+      this.shutdowns.start(() =>
+        shutdownClaudeProcess(activeChild, this.platform, this.detached),
+      );
+    }
+    await this.shutdowns.finalize();
+  }
+
+  getUnverifiedCleanupError() {
+    return this.shutdowns.getUnverifiedCleanupError();
   }
 }

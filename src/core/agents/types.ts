@@ -150,10 +150,31 @@ export interface TokenUsage {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
-  // True when the agent could not source authoritative usage from the model
-  // and the numbers are heuristic estimates. ACP adapters that don't emit
-  // usage_update notifications fall into this case.
+  totalTokens?: number;
+  reportedCostUsd?: number;
+  tokensAvailable?: boolean;
+  // Marks provisional counts for display. tokensAvailable independently
+  // declares completeness; limits require available, non-estimated receipts.
   estimated?: boolean;
+}
+
+export function isValidTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+export function hasCompleteTokenUsage(
+  usage: TokenUsage,
+): usage is TokenUsage & { tokensAvailable: true } {
+  return usage.tokensAvailable === true;
+}
+
+export function getTokenUsageTotal(usage: TokenUsage): number {
+  return isValidTokenCount(usage.totalTokens)
+    ? usage.totalTokens
+    : usage.inputTokens +
+        usage.outputTokens +
+        usage.cacheReadTokens +
+        usage.cacheCreationTokens;
 }
 
 export interface AgentResult {
@@ -171,6 +192,20 @@ export class PermanentAgentError extends Error {
   }
 }
 
+export class IncompleteAgentShutdownError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "IncompleteAgentShutdownError";
+  }
+}
+
+export class UnverifiedAgentCleanupError extends IncompleteAgentShutdownError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "UnverifiedAgentCleanupError";
+  }
+}
+
 export type OnUsage = (usage: TokenUsage) => void;
 
 export type OnMessage = (text: string) => void;
@@ -185,6 +220,7 @@ export interface AgentRunOptions {
 export interface Agent {
   name: string;
   close?(): Promise<void> | void;
+  getUnverifiedCleanupError?(): UnverifiedAgentCleanupError | null;
   run(
     prompt: string,
     cwd: string,

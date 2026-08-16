@@ -116,6 +116,8 @@ const stubRunInfo: RunInfo = {
   stopWhen: undefined,
   commitMessagePath: "/repo/.gnhf/runs/test-run/commit-message",
   commitMessage: undefined,
+  runtimeLimitsPath: "/repo/.gnhf/runs/test-run/runtime-limits.json",
+  runtimeLimits: {},
 };
 
 const acpSessionStateDir = join(stubRunInfo.runDir, "acp-sessions");

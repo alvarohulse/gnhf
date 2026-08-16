@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "<receipt-id>",
+  "runId": "slow-cleanup-dirty-e-8a8aa1",
+  "state": "created",
+  "worktreePath": "<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1",
+  "baseCommit": "9e79686de8abb9e80ad882a485aac22721b5cf0d"
+}

@@ -6,6 +6,19 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
+vi.mock("./managed-process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./managed-process.js")>();
+  return {
+    ...actual,
+    spawnManagedChildProcess: (
+      spawnProcess: typeof import("node:child_process").spawn,
+      command: string,
+      args: string[],
+      options: import("node:child_process").SpawnOptions,
+    ) => spawnProcess(command, args, options),
+  };
+});
+
 import { execFileSync, spawn } from "node:child_process";
 import { CopilotAgent } from "./copilot.js";
 import { buildAgentOutputSchema } from "./types.js";
@@ -14,6 +27,8 @@ const mockSpawn = vi.mocked(spawn);
 
 function createMockProcess() {
   const proc = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    signalCode: null,
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     stdin: null,
@@ -41,6 +56,7 @@ describe("CopilotAgent", () => {
     const args = mockSpawn.mock.calls[0]![1] as string[];
     expect(mockSpawn).toHaveBeenCalledWith("copilot", args, {
       cwd: "/work/dir",
+      detached: false,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
@@ -115,6 +131,74 @@ describe("CopilotAgent", () => {
     expect(args).not.toContain("--allow-all");
   });
 
+  it("creates an owned process group for unsupervised Unix runs", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CopilotAgent({
+      platform: "linux",
+      supervisedProcessGroup: false,
+    });
+
+    agent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "copilot",
+      expect.any(Array),
+      expect.objectContaining({ detached: true }),
+    );
+  });
+
+  it("stays inside an external supervisor process group", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CopilotAgent({
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+
+    agent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "copilot",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
+    );
+  });
+
+  it("surfaces ownership loss when the group leader closes during abort", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 4321 });
+    mockSpawn.mockReturnValue(proc);
+    const processKill = vi
+      .spyOn(process, "kill")
+      .mockImplementation(() => true);
+    const controller = new AbortController();
+    const agent = new CopilotAgent({ platform: "linux" });
+
+    try {
+      const runPromise = agent.run("test prompt", "/work/dir", {
+        signal: controller.signal,
+      });
+      const rejection = expect(runPromise).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+      controller.abort();
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
+
+      proc.emit("close", null);
+      await vi.advanceTimersByTimeAsync(100);
+      await rejection;
+      expect(processKill).not.toHaveBeenCalledWith(-4321, "SIGKILL");
+      await expect(agent.close()).rejects.toThrow(
+        "Could not prove process cleanup completed",
+      );
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("kills the full process tree on Windows when aborted", async () => {
     const proc = createMockProcess();
     Object.defineProperty(proc, "pid", { value: 6789 });
@@ -126,12 +210,13 @@ describe("CopilotAgent", () => {
       signal: controller.signal,
     });
     controller.abort();
+    proc.emit("close", null, null);
 
     await expect(promise).rejects.toThrow("Agent was aborted");
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
       "taskkill",
       ["/T", "/F", "/PID", "6789"],
-      { stdio: "ignore" },
+      { stdio: "ignore", timeout: 3_000 },
     );
     expect(proc.kill).not.toHaveBeenCalled();
   });
@@ -171,6 +256,7 @@ describe("CopilotAgent", () => {
         outputTokens: 7,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       },
     });
     expect(onMessage).toHaveBeenCalledWith(content);
@@ -179,6 +265,38 @@ describe("CopilotAgent", () => {
       outputTokens: 7,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      tokensAvailable: false,
+    });
+  });
+
+  it("marks complete input and output totals available", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CopilotAgent();
+    const content = JSON.stringify({
+      success: true,
+      summary: "ok",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "assistant.message",
+      data: { content },
+    });
+    emitJson(proc, {
+      type: "result",
+      usage: { inputTokens: 5, outputTokens: 7 },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 5,
+        outputTokens: 7,
+        tokensAvailable: true,
+      },
     });
   });
 

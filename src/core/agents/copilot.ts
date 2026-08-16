@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import {
   buildAgentOutputSchema,
+  isValidTokenCount,
   parseAgentOutput,
   type Agent,
   type AgentOutputSchema,
@@ -14,6 +15,13 @@ import {
   setupAbortHandler,
   setupChildProcessHandlers,
 } from "./stream-utils.js";
+import {
+  ChildProcessShutdownTracker,
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+  shutdownWindowsProcessTree,
+  spawnManagedChildProcess,
+} from "./managed-process.js";
 
 interface CopilotAssistantMessageEvent {
   type: "assistant.message";
@@ -36,6 +44,7 @@ interface CopilotAgentDeps {
   extraArgs?: string[];
   platform?: NodeJS.Platform;
   schema?: AgentOutputSchema;
+  supervisedProcessGroup?: boolean;
 }
 
 function shouldUseWindowsShell(
@@ -69,22 +78,16 @@ function shouldUseWindowsShell(
   }
 }
 
-function terminateCopilotProcess(
+async function shutdownCopilotProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
-): void {
-  if (platform === "win32" && child.pid) {
-    try {
-      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: the process may have already exited.
-    }
-    return;
+  detached: boolean,
+): Promise<void> {
+  if (platform === "win32") {
+    return shutdownWindowsProcessTree(child);
   }
 
-  child.kill("SIGTERM");
+  await shutdownChildProcess(child, { detached });
 }
 
 function userSpecifiedPermissionMode(userArgs: string[]): boolean {
@@ -187,22 +190,31 @@ function usageFromRecord(usage: Record<string, unknown>): TokenUsage | null {
     outputTokens: outputTokens ?? 0,
     cacheReadTokens: cacheReadTokens ?? 0,
     cacheCreationTokens: cacheCreationTokens ?? 0,
+    tokensAvailable:
+      isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
   };
 }
 
 export class CopilotAgent implements Agent {
   name = "copilot";
 
+  private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
+  private detached: boolean;
   private extraArgs?: string[];
   private platform: NodeJS.Platform;
   private schema: AgentOutputSchema;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(binOrDeps: string | CopilotAgentDeps = {}) {
     const deps = typeof binOrDeps === "string" ? { bin: binOrDeps } : binOrDeps;
     this.bin = deps.bin ?? "copilot";
     this.extraArgs = deps.extraArgs;
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.schema =
       deps.schema ?? buildAgentOutputSchema({ includeStopField: false });
   }
@@ -217,22 +229,36 @@ export class CopilotAgent implements Agent {
     return new Promise((resolve, reject) => {
       const logStream = logPath ? createWriteStream(logPath) : null;
 
-      const child = spawn(
+      const child = spawnManagedChildProcess(
+        spawn,
         this.bin,
         buildCopilotArgs(prompt, this.schema, this.extraArgs),
         {
           cwd,
+          detached: this.detached,
           shell: shouldUseWindowsShell(this.bin, this.platform),
           stdio: ["ignore", "pipe", "pipe"],
           env: process.env,
         },
+        this.shutdowns,
+        this.platform,
       );
+      this.activeChild = child;
+      child.on("close", () => {
+        if (this.activeChild === child) {
+          this.activeChild = null;
+        }
+      });
+      const finalizeRun = () =>
+        this.shutdowns.finalizeOwnedProcessGroup(child, this.detached, () =>
+          shutdownCopilotProcess(child, this.platform, this.detached),
+        );
+      const shutdownRun = () =>
+        this.shutdowns.start(() =>
+          shutdownCopilotProcess(child, this.platform, this.detached),
+        );
 
-      if (
-        setupAbortHandler(signal, child, reject, () =>
-          terminateCopilotProcess(child, this.platform),
-        )
-      ) {
+      if (setupAbortHandler(signal, child, reject, shutdownRun)) {
         return;
       }
 
@@ -242,6 +268,7 @@ export class CopilotAgent implements Agent {
         outputTokens: 0,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       };
 
       parseJSONLStream<CopilotEvent>(child.stdout!, logStream, (event) => {
@@ -267,32 +294,54 @@ export class CopilotAgent implements Agent {
             );
             cumulative.cacheReadTokens = usage.cacheReadTokens;
             cumulative.cacheCreationTokens = usage.cacheCreationTokens;
+            cumulative.tokensAvailable = usage.tokensAvailable;
             onUsage?.({ ...cumulative });
           }
         }
       });
 
-      setupChildProcessHandlers(child, "copilot", logStream, reject, () => {
-        if (!lastAgentMessage) {
-          reject(new Error("copilot returned no agent message"));
-          return;
-        }
+      setupChildProcessHandlers(
+        child,
+        "copilot",
+        logStream,
+        reject,
+        () => {
+          if (!lastAgentMessage) {
+            reject(new Error("copilot returned no agent message"));
+            return;
+          }
 
-        try {
-          const output = parseAgentOutput(
-            lastAgentMessage,
-            this.schema,
-            "copilot",
-          );
-          resolve({ output, usage: cumulative });
-        } catch (err) {
-          reject(
-            new Error(
-              `Failed to parse copilot output: ${err instanceof Error ? err.message : err}`,
-            ),
-          );
-        }
-      });
+          try {
+            const output = parseAgentOutput(
+              lastAgentMessage,
+              this.schema,
+              "copilot",
+            );
+            resolve({ output, usage: cumulative });
+          } catch (err) {
+            reject(
+              new Error(
+                `Failed to parse copilot output: ${err instanceof Error ? err.message : err}`,
+              ),
+            );
+          }
+        },
+        { finalize: finalizeRun, shutdown: shutdownRun },
+      );
     });
+  }
+
+  async close(): Promise<void> {
+    const activeChild = this.activeChild;
+    if (activeChild !== null) {
+      this.shutdowns.start(() =>
+        shutdownCopilotProcess(activeChild, this.platform, this.detached),
+      );
+    }
+    await this.shutdowns.finalize();
+  }
+
+  getUnverifiedCleanupError() {
+    return this.shutdowns.getUnverifiedCleanupError();
   }
 }

@@ -9,6 +9,7 @@ import {
 import { posix, win32 } from "node:path";
 import {
   buildAgentOutputSchema,
+  isValidTokenCount,
   parseAgentOutput,
   PermanentAgentError,
   type Agent,
@@ -17,7 +18,13 @@ import {
   type AgentRunOptions,
   type TokenUsage,
 } from "./types.js";
-import { shutdownChildProcess } from "./managed-process.js";
+import {
+  ChildProcessShutdownTracker,
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+  shutdownWindowsProcessTree,
+  spawnManagedChildProcess,
+} from "./managed-process.js";
 import { parseJSONLStream, setupAbortHandler } from "./stream-utils.js";
 
 const DEFAULT_FINAL_RESULT_EXIT_GRACE_MS = 15_000;
@@ -100,6 +107,7 @@ interface CursorAgentDeps {
   finalResultGraceMs?: number;
   platform?: NodeJS.Platform;
   schema?: AgentOutputSchema;
+  supervisedProcessGroup?: boolean;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -153,44 +161,17 @@ function shouldUseWindowsShell(
   }
 }
 
-function terminateCursorProcess(
-  child: ReturnType<typeof spawn>,
-  platform: NodeJS.Platform,
-): void {
-  if (platform === "win32" && child.pid) {
-    try {
-      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: the process may have already exited.
-    }
-    return;
-  }
-
-  if (child.pid) {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-      return;
-    } catch {
-      // Fall back to the direct child if it was not started as a process group.
-    }
-  }
-
-  child.kill("SIGTERM");
-}
-
 async function shutdownCursorProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
+  detached: boolean,
 ): Promise<void> {
   if (platform === "win32") {
-    terminateCursorProcess(child, platform);
-    return;
+    return shutdownWindowsProcessTree(child);
   }
 
   await shutdownChildProcess(child, {
-    detached: true,
+    detached,
   });
 }
 
@@ -269,12 +250,23 @@ function usageFromRecord(usage: JsonRecord): TokenUsage | null {
     "cache_creation_tokens",
     "cache_creation_input_tokens",
   ]);
+  const reportedCostUsd = numberField(usage, [
+    "costUsd",
+    "cost_usd",
+    "totalCostUsd",
+    "total_cost_usd",
+  ]);
+  const hasValidReportedCost =
+    reportedCostUsd !== undefined &&
+    Number.isFinite(reportedCostUsd) &&
+    reportedCostUsd >= 0;
 
   if (
     inputTokens === undefined &&
     outputTokens === undefined &&
     cacheReadTokens === undefined &&
-    cacheCreationTokens === undefined
+    cacheCreationTokens === undefined &&
+    !hasValidReportedCost
   ) {
     return null;
   }
@@ -284,6 +276,9 @@ function usageFromRecord(usage: JsonRecord): TokenUsage | null {
     outputTokens: outputTokens ?? 0,
     cacheReadTokens: cacheReadTokens ?? 0,
     cacheCreationTokens: cacheCreationTokens ?? 0,
+    ...(hasValidReportedCost ? { reportedCostUsd } : {}),
+    tokensAvailable:
+      isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
   };
 }
 
@@ -321,17 +316,24 @@ function isPermanentCursorError(output: string): boolean {
 export class CursorAgent implements Agent {
   name = "cursor";
 
+  private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
   private extraArgs?: string[];
   private finalResultGraceMs: number;
+  private detached: boolean;
   private platform: NodeJS.Platform;
   private schema: AgentOutputSchema;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(deps: CursorAgentDeps = {}) {
     this.extraArgs = deps.extraArgs;
     this.finalResultGraceMs =
       deps.finalResultGraceMs ?? DEFAULT_FINAL_RESULT_EXIT_GRACE_MS;
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.bin = deps.bin ?? resolveCursorBin(this.platform);
     this.schema =
       deps.schema ?? buildAgentOutputSchema({ includeStopField: false });
@@ -346,22 +348,56 @@ export class CursorAgent implements Agent {
 
     return new Promise((resolve, reject) => {
       const logStream = logPath ? createWriteStream(logPath) : null;
-      const child = spawn(this.bin, buildCursorArgs(this.extraArgs), {
-        cwd,
-        detached: this.platform !== "win32",
-        shell: shouldUseWindowsShell(this.bin, this.platform),
-        stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
+      const child = spawnManagedChildProcess(
+        spawn,
+        this.bin,
+        buildCursorArgs(this.extraArgs),
+        {
+          cwd,
+          detached: this.detached,
+          shell: shouldUseWindowsShell(this.bin, this.platform),
+          stdio: ["pipe", "pipe", "pipe"],
+          env: process.env,
+        },
+        this.shutdowns,
+        this.platform,
+      );
+      this.activeChild = child;
+      child.on("close", () => {
+        if (this.activeChild === child) {
+          this.activeChild = null;
+        }
       });
+      const finalizeRun = () =>
+        this.shutdowns.finalizeOwnedProcessGroup(child, this.detached, () =>
+          shutdownCursorProcess(child, this.platform, this.detached),
+        );
+      const shutdownRun = () =>
+        this.shutdowns.start(() =>
+          shutdownCursorProcess(child, this.platform, this.detached),
+        );
+      const rejectCleanupFailure = (error: unknown) => {
+        reject(
+          error instanceof Error
+            ? error
+            : new Error(`Cursor process cleanup failed: ${String(error)}`),
+        );
+      };
+      const rejectAfterShutdown = (error: Error) => {
+        void (async () => {
+          try {
+            await shutdownRun();
+            reject(error);
+          } catch (cleanupError) {
+            rejectCleanupFailure(cleanupError);
+          }
+        })();
+      };
 
       child.stdin?.write(buildCursorPrompt(prompt, this.schema));
       child.stdin?.end();
 
-      if (
-        setupAbortHandler(signal, child, reject, () =>
-          terminateCursorProcess(child, this.platform),
-        )
-      ) {
+      if (setupAbortHandler(signal, child, reject, shutdownRun)) {
         return;
       }
 
@@ -376,6 +412,7 @@ export class CursorAgent implements Agent {
         outputTokens: 0,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        tokensAvailable: false,
       };
 
       child.stderr!.on("data", (data: Buffer) => {
@@ -383,7 +420,9 @@ export class CursorAgent implements Agent {
       });
 
       child.on("error", (err) => {
-        reject(new Error(`Failed to spawn cursor: ${err.message}`));
+        rejectAfterShutdown(
+          new Error(`Failed to spawn cursor: ${err.message}`),
+        );
       });
 
       parseJSONLStream<CursorEvent>(child.stdout!, logStream, (event) => {
@@ -411,30 +450,49 @@ export class CursorAgent implements Agent {
             "cursor reported an error result";
         }
 
-        if (result.usage) {
-          const nextUsage = usageFromRecord(result.usage);
-          if (nextUsage) {
-            usage = nextUsage;
-            onUsage?.({ ...usage });
-          }
-        }
+        const nextUsage = result.usage ? usageFromRecord(result.usage) : null;
+        usage = nextUsage ?? {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: false,
+        };
+        onUsage?.({ ...usage });
 
         if (isNonErrorResult(result)) {
           if (finalResultCleanupTimer) {
             clearTimeout(finalResultCleanupTimer);
           }
-          finalResultCleanupTimer = setTimeout(() => {
+          const cleanupFinalResult = () => {
             closedAfterFinalCleanup = true;
-            void shutdownCursorProcess(child, this.platform);
-          }, this.finalResultGraceMs);
+            void shutdownRun().catch(rejectCleanupFailure);
+          };
+          finalResultCleanupTimer = setTimeout(
+            cleanupFinalResult,
+            this.finalResultGraceMs,
+          );
         }
       });
 
-      child.on("close", (code) => {
+      child.on("close", async (code) => {
         if (finalResultCleanupTimer) {
           clearTimeout(finalResultCleanupTimer);
         }
         logStream?.end();
+        try {
+          await finalizeRun();
+          if (closedAfterFinalCleanup) {
+            await this.shutdowns.waitForAll();
+          }
+        } catch (error) {
+          reject(
+            error instanceof Error
+              ? error
+              : new Error(`Cursor process cleanup failed: ${String(error)}`),
+          );
+          return;
+        }
         if (code !== 0 && !closedAfterFinalCleanup) {
           const detail = `cursor exited with code ${code}: ${stderr}`;
           reject(
@@ -478,5 +536,19 @@ export class CursorAgent implements Agent {
         }
       });
     });
+  }
+
+  async close(): Promise<void> {
+    const activeChild = this.activeChild;
+    if (activeChild !== null) {
+      this.shutdowns.start(() =>
+        shutdownCursorProcess(activeChild, this.platform, this.detached),
+      );
+    }
+    await this.shutdowns.finalize();
+  }
+
+  getUnverifiedCleanupError() {
+    return this.shutdowns.getUnverifiedCleanupError();
   }
 }

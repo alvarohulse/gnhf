@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -9,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { CONVENTIONAL_COMMIT_MESSAGE } from "./core/commit-message.js";
 import type { Config } from "./core/config.js";
@@ -49,6 +50,8 @@ const stubRunInfo: RunInfo = {
   stopWhen: undefined,
   commitMessagePath: "/repo/.gnhf/runs/run-abc/commit-message",
   commitMessage: undefined,
+  runtimeLimitsPath: "/repo/.gnhf/runs/run-abc/runtime-limits.json",
+  runtimeLimits: {},
 };
 
 interface CliMockOverrides {
@@ -61,10 +64,15 @@ interface CliMockOverrides {
   createBranch?: ReturnType<typeof vi.fn>;
   ensureCleanWorkingTree?: ReturnType<typeof vi.fn>;
   createWorktree?: ReturnType<typeof vi.fn>;
+  setupRun?: ReturnType<typeof vi.fn>;
+  persistRunEvidence?: ReturnType<typeof vi.fn>;
   removeWorktree?: ReturnType<typeof vi.fn>;
   listWorktreePaths?: ReturnType<typeof vi.fn>;
   worktreeExists?: ReturnType<typeof vi.fn>;
   getBranchDiffStats?: ReturnType<typeof vi.fn>;
+  getBranchCommitCount?: ReturnType<typeof vi.fn>;
+  hasWorkingTreeChanges?: ReturnType<typeof vi.fn>;
+  peekRunBaseCommit?: ReturnType<typeof vi.fn>;
   peekRunMetadata?: ReturnType<typeof vi.fn>;
   resumeRun?: ReturnType<typeof vi.fn>;
   getLastIterationNumber?: ReturnType<typeof vi.fn>;
@@ -81,6 +89,8 @@ interface CliMockOverrides {
     close: ReturnType<typeof vi.fn>;
   };
   stdinIsTTY?: boolean;
+  consoleErrorSink?: unknown[][];
+  writeConfiguredWorktreeReceipt?: ReturnType<typeof vi.fn>;
 }
 
 async function runCliWithMocks(
@@ -92,7 +102,11 @@ async function runCliWithMocks(
   const stdoutWrite = vi
     .spyOn(process.stdout, "write")
     .mockImplementation(() => true);
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+  const consoleError = vi
+    .spyOn(console, "error")
+    .mockImplementation((...args: unknown[]) => {
+      overrides.consoleErrorSink?.push(args);
+    });
   const exitSpy = vi.spyOn(process, "exit").mockImplementation(((
     code?: string | number | null,
   ) => {
@@ -111,6 +125,8 @@ async function runCliWithMocks(
   const startSleepPrevention =
     overrides.startSleepPrevention ??
     vi.fn(() => Promise.resolve({ type: "skipped", reason: "unsupported" }));
+  const writeConfiguredWorktreeReceipt =
+    overrides.writeConfiguredWorktreeReceipt ?? vi.fn();
   const telemetry = overrides.telemetry ?? {
     track: vi.fn(),
     pageview: vi.fn(),
@@ -118,7 +134,30 @@ async function runCliWithMocks(
   };
   let consoleErrorCalls: unknown[][] = [];
   let stdoutWriteCalls: unknown[][] = [];
-  const setupRun = vi.fn(() => stubRunInfo);
+  const setupRun =
+    overrides.setupRun ??
+    vi.fn(
+      (
+        _runId: string,
+        _prompt: string,
+        _baseCommit: string,
+        _cwd: string,
+        schemaOptions: {
+          runtimeLimits?: Record<string, number | null | undefined>;
+        },
+      ) => ({
+        ...stubRunInfo,
+        runtimeLimits: Object.fromEntries(
+          Object.entries(schemaOptions.runtimeLimits ?? {}).filter(
+            ([, value]) => value !== null && value !== undefined,
+          ),
+        ),
+      }),
+    );
+  const persistRunEvidence =
+    overrides.persistRunEvidence ?? vi.fn((runInfo: RunInfo) => runInfo);
+  const peekRunBaseCommit =
+    overrides.peekRunBaseCommit ?? vi.fn(() => stubRunInfo.baseCommit);
   const peekRunMetadata = overrides.peekRunMetadata ?? vi.fn(() => stubRunInfo);
   const resumeRun = overrides.resumeRun ?? vi.fn();
   const getLastIterationNumber =
@@ -196,9 +235,14 @@ async function runCliWithMocks(
         linesAdded: 1284,
         linesDeleted: 412,
       })),
+    getBranchCommitCount: overrides.getBranchCommitCount ?? vi.fn(() => 0),
+    hasWorkingTreeChanges:
+      overrides.hasWorkingTreeChanges ?? vi.fn(() => false),
   }));
   vi.doMock("./core/run.js", () => ({
     setupRun,
+    persistRunEvidence,
+    peekRunBaseCommit,
     peekRunMetadata,
     resumeRun,
     getLastIterationNumber,
@@ -207,6 +251,9 @@ async function runCliWithMocks(
   vi.doMock("./core/agents/factory.js", () => ({ createAgent }));
   vi.doMock("./core/sleep.js", () => ({
     startSleepPrevention,
+  }));
+  vi.doMock("./core/worktree-receipt.js", () => ({
+    writeConfiguredWorktreeReceipt,
   }));
   vi.doMock("./core/telemetry.js", () => ({
     initDefaultTelemetry: vi.fn(),
@@ -292,6 +339,8 @@ async function runCliWithMocks(
     loadConfig,
     createAgent,
     setupRun,
+    persistRunEvidence,
+    peekRunBaseCommit,
     peekRunMetadata,
     resumeRun,
     getLastIterationNumber,
@@ -302,6 +351,7 @@ async function runCliWithMocks(
     readStdinText,
     startSleepPrevention,
     telemetry,
+    writeConfiguredWorktreeReceipt,
   };
 }
 
@@ -494,6 +544,7 @@ async function runCliResumeWithActualRun(
   opts: {
     liveCommitMessage?: typeof CONVENTIONAL_COMMIT_MESSAGE;
     storedCommitMessage?: "default" | "conventional";
+    storedRuntimeLimits?: Record<string, number>;
   } = {},
 ) {
   const originalArgv = [...process.argv];
@@ -513,18 +564,29 @@ async function runCliResumeWithActualRun(
   const tempDir = mkdtempSync(join(tmpdir(), "gnhf-cli-resume-test-"));
   const runDir = join(tempDir, ".gnhf", "runs", "existing-run");
   const promptPath = join(runDir, "prompt.md");
+  const notesPath = join(runDir, "notes.md");
   const baseCommitPath = join(runDir, "base-commit");
   const stopWhenPath = join(runDir, "stop-when");
   const commitMessagePath = join(runDir, "commit-message");
   const schemaPath = join(runDir, "output-schema.json");
+  const runtimeLimitsPath = join(runDir, "runtime-limits.json");
   mkdirSync(runDir, { recursive: true });
+  execFileSync("git", ["init", "--quiet"], { cwd: tempDir });
   writeFileSync(promptPath, "existing prompt", "utf-8");
+  writeFileSync(notesPath, "# existing run\n", "utf-8");
   writeFileSync(baseCommitPath, "abc123\n", "utf-8");
   if (storedStopWhen !== undefined) {
     writeFileSync(stopWhenPath, `${storedStopWhen}\n`, "utf-8");
   }
   if (opts.storedCommitMessage !== undefined) {
     writeFileSync(commitMessagePath, `${opts.storedCommitMessage}\n`, "utf-8");
+  }
+  if (opts.storedRuntimeLimits !== undefined) {
+    writeFileSync(
+      runtimeLimitsPath,
+      `${JSON.stringify(opts.storedRuntimeLimits, null, 2)}\n`,
+      "utf-8",
+    );
   }
 
   const appendDebugLog = vi.fn();
@@ -610,6 +672,7 @@ async function runCliResumeWithActualRun(
     stopWhenContent?: string;
     commitMessageExists: boolean;
     commitMessageContent?: string;
+    runtimeLimits: Record<string, number>;
   };
 
   try {
@@ -640,6 +703,9 @@ async function runCliResumeWithActualRun(
       commitMessageContent: commitMessageExists
         ? readFileSync(commitMessagePath, "utf-8")
         : undefined,
+      runtimeLimits: JSON.parse(
+        readFileSync(runtimeLimitsPath, "utf-8"),
+      ) as Record<string, number>,
     };
   } finally {
     process.argv = originalArgv;
@@ -742,6 +808,58 @@ describe("cli", () => {
     expect(stdout).toContain("branch diff");
     expect(stdout).toContain("6 commits");
     expect(stdout).toContain("git push no-mistakes");
+  });
+
+  it("does not publish unavailable token totals as exact", async () => {
+    const { appendDebugLog, stdoutWriteCalls, telemetry } =
+      await runCliWithMocks(
+        ["ship it"],
+        {
+          agent: "cursor",
+          agentPathOverride: {},
+          agentArgsOverride: {},
+          acpRegistryOverrides: {},
+          maxConsecutiveFailures: 3,
+          preventSleep: false,
+        },
+        {
+          orchestratorGetState: vi.fn(() => ({
+            status: "stopped" as const,
+            gracefulStopRequested: false,
+            currentIteration: 1,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+            tokensAvailable: false,
+            tokensEstimated: false,
+            commitCount: 1,
+            iterations: [],
+            successCount: 1,
+            failCount: 0,
+            consecutiveFailures: 0,
+            startTime: new Date("2026-01-01T00:00:00Z"),
+            waitingUntil: null,
+            lastMessage: null,
+          })),
+        },
+      );
+
+    expect(stdoutWriteCalls.flat().join("")).toContain("unavailable");
+    expect(appendDebugLog).toHaveBeenCalledWith(
+      "run:complete",
+      expect.objectContaining({
+        totalInputTokens: null,
+        totalOutputTokens: null,
+        tokensAvailable: false,
+      }),
+    );
+    expect(telemetry.track).toHaveBeenCalledWith(
+      "run",
+      expect.objectContaining({
+        total_input_tokens: null,
+        total_output_tokens: null,
+        tokens_available: false,
+      }),
+    );
   });
 
   it("redacts raw ACP command specs in the exit summary", async () => {
@@ -1071,9 +1189,17 @@ describe("cli", () => {
     expect((schema.properties as Record<string, unknown>).scope).toBeDefined();
   });
 
-  it("passes max iteration and token caps to the orchestrator", async () => {
+  it("passes iteration, token, and reported-cost caps to the orchestrator", async () => {
     const { orchestratorCtor } = await runCliWithMocks(
-      ["ship it", "--max-iterations", "12", "--max-tokens", "3456"],
+      [
+        "ship it",
+        "--max-iterations",
+        "12",
+        "--max-tokens",
+        "3456",
+        "--max-reported-cost-usd",
+        "7.25",
+      ],
       {
         agent: "claude",
         agentPathOverride: {},
@@ -1088,26 +1214,92 @@ describe("cli", () => {
     expect(orchestratorCtor.mock.calls[0]?.[6]).toEqual({
       maxIterations: 12,
       maxTokens: 3456,
+      maxReportedCostUsd: 7.25,
     });
   });
 
-  it("passes push mode to the orchestrator when --push is set", async () => {
-    const { orchestratorCtor } = await runCliWithMocks(["ship it", "--push"], {
-      agent: "claude",
-      agentPathOverride: {},
-      agentArgsOverride: {},
-      acpRegistryOverrides: {},
-      maxConsecutiveFailures: 3,
-      preventSleep: false,
-    });
+  it("restores persisted runtime caps when resuming", async () => {
+    const { orchestratorCtor, runtimeLimits } = await runCliResumeWithActualRun(
+      [],
+      undefined,
+      {
+        storedRuntimeLimits: {
+          maxIterations: 12,
+          maxTokens: 3456,
+          maxReportedCostUsd: 7.25,
+        },
+      },
+    );
 
-    expect(orchestratorCtor).toHaveBeenCalledTimes(1);
     expect(orchestratorCtor.mock.calls[0]?.[6]).toEqual({
-      maxIterations: undefined,
+      maxIterations: 12,
+      maxTokens: 3456,
+      maxReportedCostUsd: 7.25,
+      stopWhen: undefined,
+    });
+    expect(runtimeLimits).toEqual({
+      maxIterations: 12,
+      maxTokens: 3456,
+      maxReportedCostUsd: 7.25,
+    });
+  });
+
+  it("clears a persisted runtime cap explicitly", async () => {
+    const { orchestratorCtor, runtimeLimits } = await runCliResumeWithActualRun(
+      ["--clear-max-tokens"],
+      undefined,
+      {
+        storedRuntimeLimits: {
+          maxIterations: 12,
+          maxTokens: 3456,
+        },
+      },
+    );
+
+    expect(orchestratorCtor.mock.calls[0]?.[6]).toEqual({
+      maxIterations: 12,
       maxTokens: undefined,
       stopWhen: undefined,
-      push: true,
     });
+    expect(runtimeLimits).toEqual({ maxIterations: 12 });
+  });
+
+  it("rejects a non-finite reported-cost cap", async () => {
+    await expect(
+      runCliWithMocks(["ship it", "--max-reported-cost-usd", "NaN"], {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: false,
+      }),
+    ).rejects.toThrow("process.exit unexpectedly called with 1");
+  });
+
+  it("rejects --push without starting an agent", async () => {
+    const createAgent = vi.fn();
+    const consoleErrorSink: unknown[][] = [];
+
+    await expect(
+      runCliWithMocks(
+        ["ship it", "--push"],
+        {
+          agent: "claude",
+          agentPathOverride: {},
+          agentArgsOverride: {},
+          acpRegistryOverrides: {},
+          maxConsecutiveFailures: 3,
+          preventSleep: false,
+        },
+        { consoleErrorSink, createAgent },
+      ),
+    ).rejects.toThrow("process.exit unexpectedly called with 1");
+
+    expect(createAgent).not.toHaveBeenCalled();
+    expect(consoleErrorSink.flat().join("\n")).toContain(
+      "gnhf never pushes user work",
+    );
   });
 
   it("passes meteor frequency to the renderer", async () => {
@@ -1304,6 +1496,139 @@ describe("cli", () => {
       acpRegistryOverrides: {},
       maxConsecutiveFailures: 3,
       preventSleep: false,
+    });
+  });
+
+  it("starts Linux sleep re-execution before creating a worktree", async () => {
+    const createWorktree = vi.fn();
+    const startSleepPrevention = vi.fn(() =>
+      Promise.resolve({
+        type: "skipped" as const,
+        reason: "unavailable" as const,
+      }),
+    );
+
+    await runCliWithMocks(
+      ["ship it", "--worktree"],
+      {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: true,
+      },
+      { createWorktree, startSleepPrevention },
+    );
+
+    expect(startSleepPrevention).toHaveBeenCalledTimes(1);
+    expect(createWorktree).toHaveBeenCalledTimes(1);
+    expect(startSleepPrevention.mock.invocationCallOrder[0]).toBeLessThan(
+      createWorktree.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("publishes pending worktree identity before invoking git", async () => {
+    const createWorktree = vi.fn();
+    const writeConfiguredWorktreeReceipt = vi.fn(() => "receipt-1");
+    const { createAgent } = await runCliWithMocks(
+      ["ship it", "--worktree", "--preserve-worktree"],
+      {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: false,
+      },
+      { createWorktree, writeConfiguredWorktreeReceipt },
+    );
+
+    expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(1, {
+      runId: expect.stringMatching(/^ship-it-[0-9a-f]+$/),
+      baseCommit: "abc123",
+      state: "pending",
+      worktreePath: expect.stringMatching(
+        /^[/\\]repo-gnhf-worktrees[/\\]ship-it-[0-9a-f]+$/,
+      ),
+    });
+    expect(
+      writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0],
+    ).toBeLessThan(createWorktree.mock.invocationCallOrder[0]!);
+    expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(2, {
+      runId: expect.stringMatching(/^ship-it-[0-9a-f]+$/),
+      baseCommit: "abc123",
+      receiptId: "receipt-1",
+      state: "created",
+      worktreePath: expect.stringMatching(
+        /^[/\\]repo-gnhf-worktrees[/\\]ship-it-[0-9a-f]+$/,
+      ),
+    });
+    expect(
+      writeConfiguredWorktreeReceipt.mock.invocationCallOrder[1],
+    ).toBeLessThan(createAgent.mock.invocationCallOrder[0]!);
+    expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(3, {
+      runId: expect.stringMatching(/^ship-it-[0-9a-f]+$/),
+      baseCommit: "abc123",
+      receiptId: "receipt-1",
+      state: "shutdown",
+      disposition: "preserved",
+      preservationReason: "requested",
+      worktreePath: expect.stringMatching(
+        /^[/\\]repo-gnhf-worktrees[/\\]ship-it-[0-9a-f]+$/,
+      ),
+    });
+  });
+
+  it("publishes a terminal receipt after removing a clean worktree", async () => {
+    const removeWorktree = vi.fn();
+    const persistRunEvidence = vi.fn((runInfo: RunInfo) => ({
+      ...runInfo,
+      runDir: `/repo/.gnhf/runs/${runInfo.runId}`,
+      notesPath: `/repo/.gnhf/runs/${runInfo.runId}/notes.md`,
+      logPath: `/repo/.gnhf/runs/${runInfo.runId}/gnhf.log`,
+    }));
+    const writeConfiguredWorktreeReceipt = vi.fn(() => "receipt-1");
+
+    const { stdoutWriteCalls } = await runCliWithMocks(
+      ["ship it", "--worktree"],
+      {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: false,
+      },
+      {
+        removeWorktree,
+        persistRunEvidence,
+        setupRun: vi.fn((runId: string) => ({
+          ...stubRunInfo,
+          runId,
+          baseCommit: "a".repeat(40),
+        })),
+        writeConfiguredWorktreeReceipt,
+      },
+    );
+
+    expect(removeWorktree).toHaveBeenCalledTimes(1);
+    expect(persistRunEvidence).toHaveBeenCalledTimes(1);
+    expect(persistRunEvidence.mock.invocationCallOrder[0]).toBeLessThan(
+      removeWorktree.mock.invocationCallOrder[0]!,
+    );
+    expect(stdoutWriteCalls.flat().join("")).toContain(
+      "/repo/.gnhf/runs/ship-it-",
+    );
+    expect(writeConfiguredWorktreeReceipt).toHaveBeenLastCalledWith({
+      runId: expect.stringMatching(/^ship-it-[0-9a-f]+$/),
+      baseCommit: "a".repeat(40),
+      receiptId: "receipt-1",
+      state: "shutdown",
+      disposition: "removed",
+      worktreePath: expect.stringMatching(
+        /^[/\\]repo-gnhf-worktrees[/\\]ship-it-[0-9a-f]+$/,
+      ),
     });
   });
 
@@ -3138,6 +3463,7 @@ describe("cli", () => {
         throw new Error("fatal: already exists");
       })
       .mockImplementationOnce(() => {});
+    const writeConfiguredWorktreeReceipt = vi.fn(() => "receipt-1");
 
     await runCliWithMocks(
       ["ship it", "--worktree"],
@@ -3149,7 +3475,7 @@ describe("cli", () => {
         maxConsecutiveFailures: 3,
         preventSleep: false,
       },
-      { createWorktree },
+      { createWorktree, writeConfiguredWorktreeReceipt },
     );
 
     const firstPath = createWorktree.mock.calls[0]?.[1] as string;
@@ -3157,6 +3483,17 @@ describe("cli", () => {
     expect(createWorktree).toHaveBeenCalledTimes(2);
     expect(createWorktree.mock.calls[1]?.[1]).toBe(`${firstPath}-1`);
     expect(createWorktree.mock.calls[1]?.[2]).toBe(`${firstBranch}-1`);
+    expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        receiptId: "receipt-1",
+        state: "pending",
+        worktreePath: `${firstPath}-1`,
+      }),
+    );
+    expect(
+      writeConfiguredWorktreeReceipt.mock.invocationCallOrder[1],
+    ).toBeLessThan(createWorktree.mock.invocationCallOrder[1]!);
   });
 
   it("queries git worktrees once when no preserved worktree exists", async () => {
@@ -3176,6 +3513,145 @@ describe("cli", () => {
     );
 
     expect(listWorktreePaths).toHaveBeenCalledTimes(1);
+  });
+
+  it("records an occupied final collision path as preserved", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "gnhf-final-collision-"));
+    const repoRoot = join(tempDir, "repo");
+    const hash = createHash("sha256")
+      .update("ship it")
+      .digest("hex")
+      .slice(0, 6);
+    const finalRunId = `ship-it-${hash}-99`;
+    const finalWorktreePath = join(tempDir, "repo-gnhf-worktrees", finalRunId);
+    mkdirSync(finalWorktreePath, { recursive: true });
+    const writeConfiguredWorktreeReceipt = vi.fn(() => "receipt-1");
+
+    try {
+      await expect(
+        runCliWithMocks(
+          ["ship it", "--worktree"],
+          {
+            agent: "claude",
+            agentPathOverride: {},
+            agentArgsOverride: {},
+            acpRegistryOverrides: {},
+            maxConsecutiveFailures: 3,
+            preventSleep: false,
+          },
+          {
+            createWorktree: vi.fn(() => {
+              throw new Error("fatal: already exists");
+            }),
+            getRepoRootDir: vi.fn(() => repoRoot),
+            writeConfiguredWorktreeReceipt,
+          },
+        ),
+      ).rejects.toThrow("process.exit unexpectedly called with 1");
+
+      expect(writeConfiguredWorktreeReceipt).toHaveBeenLastCalledWith({
+        runId: finalRunId,
+        baseCommit: "abc123",
+        receiptId: "receipt-1",
+        state: "shutdown",
+        disposition: "preserved",
+        preservationReason: "uncertain",
+        worktreePath: finalWorktreePath,
+      });
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("records and reports a worktree when run metadata setup fails", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "gnhf-setup-failure-"));
+    const repoRoot = join(tempDir, "repo");
+    const consoleErrorSink: unknown[][] = [];
+    let createdWorktreePath: string | null = null;
+    const setupRun = vi.fn(() => {
+      throw new Error("metadata disk full");
+    });
+    const writeConfiguredWorktreeReceipt = vi.fn(() => "receipt-1");
+    const createWorktree = vi.fn((_repo, worktreePath: string) => {
+      createdWorktreePath = worktreePath;
+      mkdirSync(worktreePath, { recursive: true });
+    });
+
+    try {
+      await expect(
+        runCliWithMocks(
+          ["ship it", "--worktree"],
+          {
+            agent: "claude",
+            agentPathOverride: {},
+            agentArgsOverride: {},
+            acpRegistryOverrides: {},
+            maxConsecutiveFailures: 3,
+            preventSleep: false,
+          },
+          {
+            consoleErrorSink,
+            createWorktree,
+            getRepoRootDir: vi.fn(() => repoRoot),
+            setupRun,
+            writeConfiguredWorktreeReceipt,
+          },
+        ),
+      ).rejects.toThrow("process.exit unexpectedly called with 1");
+
+      expect(createdWorktreePath).not.toBeNull();
+      expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(1, {
+        runId: basename(createdWorktreePath!),
+        baseCommit: "abc123",
+        state: "pending",
+        worktreePath: createdWorktreePath,
+      });
+      expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(2, {
+        runId: basename(createdWorktreePath!),
+        baseCommit: "abc123",
+        receiptId: "receipt-1",
+        state: "created",
+        worktreePath: createdWorktreePath,
+      });
+      expect(
+        writeConfiguredWorktreeReceipt.mock.invocationCallOrder[1],
+      ).toBeLessThan(setupRun.mock.invocationCallOrder[0]!);
+      expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(3, {
+        runId: basename(createdWorktreePath!),
+        baseCommit: "abc123",
+        receiptId: "receipt-1",
+        state: "shutdown",
+        disposition: "preserved",
+        preservationReason: "setup-failed",
+        worktreePath: createdWorktreePath,
+      });
+      expect(consoleErrorSink.flat().join("\n")).toContain(
+        `worktree preserved at ${createdWorktreePath}`,
+      );
+      const recordPath = join(
+        createdWorktreePath!,
+        ".gnhf",
+        "setup-failures",
+        `${basename(createdWorktreePath!)}.json`,
+      );
+      expect(JSON.parse(readFileSync(recordPath, "utf-8"))).toMatchObject({
+        worktreePath: createdWorktreePath,
+        reason: "setup-failed",
+        error: "metadata disk full",
+      });
+      expect(
+        existsSync(
+          join(
+            createdWorktreePath!,
+            ".gnhf",
+            "runs",
+            basename(createdWorktreePath!),
+          ),
+        ),
+      ).toBe(false);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("preserves a new worktree with pending commit repair changes", async () => {
@@ -3208,11 +3684,152 @@ describe("cli", () => {
           waitingUntil: null,
           lastMessage: null,
           hasPendingCommitFailure: true,
+          hasPendingWorkspaceRecovery: true,
         })),
       },
     );
 
     expect(removeWorktree).not.toHaveBeenCalled();
+  });
+
+  it("preserves a clean worktree with interrupted recovery pending", async () => {
+    const removeWorktree = vi.fn();
+
+    await runCliWithMocks(
+      ["ship it", "--worktree"],
+      {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: false,
+      },
+      {
+        removeWorktree,
+        orchestratorGetState: vi.fn(() => ({
+          status: "stopped" as const,
+          gracefulStopRequested: false,
+          currentIteration: 1,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          commitCount: 0,
+          iterations: [],
+          successCount: 0,
+          failCount: 0,
+          consecutiveFailures: 0,
+          startTime: new Date("2026-01-01T00:00:00Z"),
+          waitingUntil: null,
+          lastMessage: null,
+          hasPendingCommitFailure: false,
+          hasPendingWorkspaceRecovery: true,
+        })),
+      },
+    );
+
+    expect(removeWorktree).not.toHaveBeenCalled();
+  });
+
+  it("preserves a worktree when git refuses final removal", async () => {
+    const consoleErrorSink: unknown[][] = [];
+    const removeWorktree = vi.fn(() => {
+      throw new Error("worktree contains modified or untracked files");
+    });
+
+    await runCliWithMocks(
+      ["ship it", "--worktree"],
+      {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: false,
+      },
+      {
+        consoleErrorSink,
+        removeWorktree,
+        setupRun: vi.fn(() => ({
+          ...stubRunInfo,
+          baseCommit: "a".repeat(40),
+        })),
+      },
+    );
+
+    expect(removeWorktree).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSink.flat().join("\n")).toContain(
+      "worktree preserved at",
+    );
+  });
+
+  it("preserves a clean worktree when shutdown times out", async () => {
+    vi.useFakeTimers();
+    const removeWorktree = vi.fn();
+    const consoleErrorSink: unknown[][] = [];
+    const exitHandlers: Array<() => void> = [];
+    const processOn = vi.spyOn(process, "on");
+    processOn.mockImplementation(((event: string, handler: () => void) => {
+      if (event === "exit") {
+        exitHandlers.push(handler);
+      }
+      return process;
+    }) as typeof process.on);
+
+    try {
+      const cliPromise = runCliWithMocks(
+        ["ship it", "--worktree"],
+        {
+          agent: "claude",
+          agentPathOverride: {},
+          agentArgsOverride: {},
+          acpRegistryOverrides: {},
+          maxConsecutiveFailures: 3,
+          preventSleep: false,
+        },
+        {
+          consoleErrorSink,
+          getBranchCommitCount: vi.fn(() => 0),
+          hasWorkingTreeChanges: vi.fn(() => false),
+          orchestratorStart: vi.fn(() => new Promise<void>(() => {})),
+          orchestratorGetState: vi.fn(() => ({
+            status: "running" as const,
+            currentIteration: 1,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+            commitCount: 0,
+            iterations: [],
+            successCount: 1,
+            failCount: 0,
+            consecutiveFailures: 0,
+            startTime: new Date("2026-01-01T00:00:00Z"),
+            waitingUntil: null,
+            lastMessage: null,
+          })),
+          removeWorktree,
+        },
+      );
+      const exitPromise = expect(cliPromise).rejects.toThrow(
+        "process.exit unexpectedly called with 1",
+      );
+
+      await vi.waitFor(() => {
+        expect(exitHandlers).toHaveLength(1);
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await exitPromise;
+
+      for (const handler of exitHandlers) {
+        handler();
+      }
+
+      expect(removeWorktree).not.toHaveBeenCalled();
+      expect(consoleErrorSink.flat().join("\n")).toContain(
+        "worktree preserved at",
+      );
+    } finally {
+      processOn.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("resumes a preserved suffixed worktree instead of creating another one", async () => {
@@ -3230,6 +3847,14 @@ describe("cli", () => {
     mkdirSync(join(suffixedWorktreePath, ".gnhf", "runs", suffixedRunId), {
       recursive: true,
     });
+    const setupFailurePath = join(
+      suffixedWorktreePath,
+      ".gnhf",
+      "setup-failures",
+      `${suffixedRunId}.json`,
+    );
+    mkdirSync(dirname(setupFailurePath), { recursive: true });
+    writeFileSync(setupFailurePath, '{"error":"metadata disk full"}\n');
 
     const createWorktree = vi.fn((_repo, path) => {
       if (path === join(worktreeRoot, runId)) {
@@ -3241,7 +3866,10 @@ describe("cli", () => {
       ...stubRunInfo,
       runId: suffixedRunId,
       runDir: join(suffixedWorktreePath, ".gnhf", "runs", suffixedRunId),
+      baseCommit: "a".repeat(40),
     }));
+    const removeWorktree = vi.fn();
+    const persistRunEvidence = vi.fn((runInfo: RunInfo) => runInfo);
 
     try {
       const { orchestratorCtor } = await runCliWithMocks(
@@ -3261,6 +3889,8 @@ describe("cli", () => {
             cwd === suffixedWorktreePath ? suffixedBranch : "main",
           ),
           listWorktreePaths: vi.fn(() => new Set([suffixedWorktreePath])),
+          persistRunEvidence,
+          removeWorktree,
           resumeRun,
         },
       );
@@ -3272,6 +3902,86 @@ describe("cli", () => {
       );
       expect(createWorktree).not.toHaveBeenCalled();
       expect(orchestratorCtor.mock.calls[0]?.[4]).toBe(suffixedWorktreePath);
+      const archivedSetupFailurePath = join(
+        suffixedWorktreePath,
+        ".gnhf",
+        "runs",
+        suffixedRunId,
+        "setup-failure.json",
+      );
+      expect(existsSync(setupFailurePath)).toBe(false);
+      expect(readFileSync(archivedSetupFailurePath, "utf-8")).toContain(
+        "metadata disk full",
+      );
+      expect(persistRunEvidence).toHaveBeenCalledTimes(1);
+      expect(removeWorktree).toHaveBeenCalledWith(
+        expect.any(String),
+        suffixedWorktreePath,
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("records a preserved worktree before base metadata can be read", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "gnhf-resume-failure-"));
+    const repoRoot = join(tempDir, "repo");
+    const hash = createHash("sha256")
+      .update("ship it")
+      .digest("hex")
+      .slice(0, 6);
+    const runId = `ship-it-${hash}`;
+    const branch = `gnhf/${runId}`;
+    const worktreePath = join(tempDir, "repo-gnhf-worktrees", runId);
+    mkdirSync(join(worktreePath, ".gnhf", "runs", runId), {
+      recursive: true,
+    });
+    const resumeRun = vi.fn(() => {
+      throw new Error("resume metadata unreadable");
+    });
+    const peekRunBaseCommit = vi.fn(() => {
+      throw new Error("base metadata unreadable");
+    });
+    const getCurrentBranch = vi.fn((cwd: string) =>
+      cwd === worktreePath ? branch : "main",
+    );
+    const writeConfiguredWorktreeReceipt = vi.fn();
+
+    try {
+      await expect(
+        runCliWithMocks(
+          ["ship it", "--worktree"],
+          {
+            agent: "claude",
+            agentPathOverride: {},
+            agentArgsOverride: {},
+            acpRegistryOverrides: {},
+            maxConsecutiveFailures: 3,
+            preventSleep: false,
+          },
+          {
+            getRepoRootDir: vi.fn(() => repoRoot),
+            getCurrentBranch,
+            listWorktreePaths: vi.fn(() => new Set([worktreePath])),
+            peekRunBaseCommit,
+            resumeRun,
+            writeConfiguredWorktreeReceipt,
+          },
+        ),
+      ).rejects.toThrow("process.exit unexpectedly called with 1");
+
+      expect(writeConfiguredWorktreeReceipt).toHaveBeenCalledWith({
+        runId,
+        state: "created",
+        worktreePath,
+      });
+      expect(
+        writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0],
+      ).toBeLessThan(getCurrentBranch.mock.invocationCallOrder[1]!);
+      expect(
+        writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0],
+      ).toBeLessThan(resumeRun.mock.invocationCallOrder[0]!);
+      expect(peekRunBaseCommit).not.toHaveBeenCalled();
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
@@ -3332,6 +4042,7 @@ describe("cli", () => {
         maxIterations: undefined,
         maxTokens: undefined,
         stopWhen: undefined,
+        preserveWorkspaceOnForceStop: true,
       });
     } finally {
       rmSync(tempDir, { recursive: true, force: true });

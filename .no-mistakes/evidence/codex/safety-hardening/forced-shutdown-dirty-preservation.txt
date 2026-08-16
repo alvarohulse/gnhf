@@ -1,0 +1,56 @@
+Scenario: force-stop a real built CLI run after its agent dirties a generated worktree
+Command: gnhf "slow cleanup dirty evidence" --agent opencode --prevent-sleep off --worktree, then two SIGINT signals
+Exit code: 130
+
+--- CLI permanent stdout summary ---
+╭──────────────────────────────────────────────────────────────╮
+│ ✦ gnhf wrapped                                               │
+│   opencode worked for 0s on gnhf/slow-cleanup-dirty-e-8a8aa1 │
+╰──────────────────────────────────────────────────────────────╯
+
+  iterations      1 total       0 good       0 failed
+  tokens          unavailable                
+  branch diff     0 commits     +0           -0
+  files           0 added       0 updated    0 deleted
+
+  notes           <fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1/.gnhf/runs/slow-cleanup-dirty-e-8a8aa1/notes.md
+  debug log       <fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1/.gnhf/runs/slow-cleanup-dirty-e-8a8aa1/gnhf.log
+
+  next steps      git log --oneline 9e79686de8ab..HEAD
+                  git diff --stat 9e79686de8ab..HEAD
+                  gh pr create
+
+  too much        git push no-mistakes:
+  to review?      https://github.com/kunchenguid/no-mistakes
+--- CLI stderr ---
+
+  gnhf: worktree preserved at <fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1
+  gnhf: merge the branch and remove with: git worktree remove "<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1"
+
+--- Published worktree receipt ---
+{
+  "schemaVersion": 1,
+  "receiptId": "<receipt-id>",
+  "runId": "slow-cleanup-dirty-e-8a8aa1",
+  "state": "created",
+  "worktreePath": "<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1",
+  "baseCommit": "9e79686de8abb9e80ad882a485aac22721b5cf0d"
+}
+--- Preserved Git state ---
+original branch: main
+original commit count: 1
+preserved branch: gnhf/slow-cleanup-dirty-e-8a8aa1
+preserved status:
+ M README.md
+preserved README marker:
+- mock change 1786861000297
+--- Process ownership check ---
+managed opencode server pid <pid> alive after shutdown: no
+unrelated sibling pid <pid> alive after shutdown: yes
+--- Relevant lifecycle events ---
+{"timestamp":"<timestamp>","pid":"<pid>","event":"signal:SIGINT"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"signal:SIGINT"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"run:complete","signal":"SIGINT","status":"stopped","iterations":1,"successCount":0,"failCount":0,"totalInputTokens":null,"totalOutputTokens":null,"tokensAvailable":false,"reportedCostUsd":null,"commitCount":0,"worktreePath":"<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"worktree:preserved","worktreePath":"<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-e-8a8aa1","reason":"dirty"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"workspace:changed","sessionId":"session-1","marker":"- mock change 1786861000297"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"server:shutdown","reason":"SIGTERM"}

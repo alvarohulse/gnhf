@@ -2,6 +2,11 @@ import type { ChildProcess } from "node:child_process";
 import type { Readable } from "node:stream";
 import type { WriteStream } from "node:fs";
 
+interface ChildProcessCleanup {
+  finalize: () => Promise<void>;
+  shutdown: () => Promise<void>;
+}
+
 /**
  * Wire stderr collection, spawn-error handling, and the common close-handler
  * prefix (logStream.end + non-zero exit code rejection) for a child process.
@@ -13,6 +18,7 @@ export function setupChildProcessHandlers(
   logStream: WriteStream | null,
   reject: (err: Error) => void,
   onSuccess: () => void,
+  cleanup?: ChildProcessCleanup,
 ): void {
   let stderr = "";
 
@@ -20,17 +26,38 @@ export function setupChildProcessHandlers(
     stderr += data.toString();
   });
 
+  const settleAfterCleanup = (
+    cleanupProcess: (() => Promise<void>) | undefined,
+    settle: () => void,
+  ) => {
+    if (cleanupProcess === undefined) {
+      settle();
+      return;
+    }
+    void cleanupProcess().then(settle, (error: unknown) => {
+      reject(
+        error instanceof Error
+          ? error
+          : new Error(`Agent process cleanup failed: ${String(error)}`),
+      );
+    });
+  };
+
   child.on("error", (err) => {
-    reject(new Error(`Failed to spawn ${agentName}: ${err.message}`));
+    settleAfterCleanup(cleanup?.shutdown, () => {
+      reject(new Error(`Failed to spawn ${agentName}: ${err.message}`));
+    });
   });
 
   child.on("close", (code) => {
     logStream?.end();
-    if (code !== 0) {
-      reject(new Error(`${agentName} exited with code ${code}: ${stderr}`));
-      return;
-    }
-    onSuccess();
+    settleAfterCleanup(cleanup?.finalize, () => {
+      if (code !== 0) {
+        reject(new Error(`${agentName} exited with code ${code}: ${stderr}`));
+        return;
+      }
+      onSuccess();
+    });
   });
 }
 
@@ -69,21 +96,38 @@ export function setupAbortHandler(
   signal: AbortSignal | undefined,
   child: ChildProcess,
   reject: (err: Error) => void,
-  abortChild: () => void = () => {
+  abortChild: () => void | Promise<void> = () => {
     child.kill("SIGTERM");
   },
 ): boolean {
   if (!signal) return false;
 
   const onAbort = () => {
-    abortChild();
+    try {
+      const shutdown = abortChild();
+      if (shutdown !== undefined) {
+        const rejectAborted = () => reject(new Error("Agent was aborted"));
+        void shutdown.then(rejectAborted, (error: unknown) => {
+          reject(
+            error instanceof Error
+              ? error
+              : new Error(`Agent process cleanup failed: ${String(error)}`),
+          );
+        });
+        return;
+      }
+    } catch {
+      reject(new Error("Agent was aborted"));
+      return;
+    }
     reject(new Error("Agent was aborted"));
   };
+  const handleAbort = () => onAbort();
   if (signal.aborted) {
-    onAbort();
+    handleAbort();
     return true;
   }
-  signal.addEventListener("abort", onAbort, { once: true });
-  child.on("close", () => signal.removeEventListener("abort", onAbort));
+  signal.addEventListener("abort", handleAbort, { once: true });
+  child.on("close", () => signal.removeEventListener("abort", handleAbort));
   return false;
 }

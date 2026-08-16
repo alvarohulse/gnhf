@@ -12,6 +12,19 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
+vi.mock("./managed-process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./managed-process.js")>();
+  return {
+    ...actual,
+    spawnManagedChildProcess: (
+      spawnProcess: typeof import("node:child_process").spawn,
+      command: string,
+      args: string[],
+      options: import("node:child_process").SpawnOptions,
+    ) => spawnProcess(command, args, options),
+  };
+});
+
 vi.mock("../debug-log.js", () => ({
   appendDebugLog: vi.fn(),
   initDebugLog: vi.fn(),
@@ -28,6 +41,8 @@ const mockSpawn = vi.mocked(spawn);
 
 function createMockProcess() {
   const proc = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    signalCode: null,
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     stdin: null,
@@ -200,6 +215,7 @@ describe("RovoDevAgent", () => {
         outputTokens: 4,
         cacheReadTokens: 3,
         cacheCreationTokens: 2,
+        tokensAvailable: true,
       },
     });
     expect(onUsage).toHaveBeenCalledWith({
@@ -207,6 +223,7 @@ describe("RovoDevAgent", () => {
       outputTokens: 4,
       cacheReadTokens: 3,
       cacheCreationTokens: 2,
+      tokensAvailable: true,
     });
     expect(onMessage).toHaveBeenCalledWith(
       '{"success":true,"summary":"done","key_changes_made":["a"],"key_learnings":["b"]}',
@@ -241,6 +258,26 @@ describe("RovoDevAgent", () => {
         stdio: ["ignore", "pipe", "pipe"],
         env: process.env,
       }),
+    );
+  });
+
+  it("stays inside an external supervisor process group", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const supervisedAgent = new RovoDevAgent(schemaPath, {
+      fetch: fetchMock as typeof fetch,
+      getPort,
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+    fetchMock.mockResolvedValueOnce(jsonResponse({ status: "healthy" }));
+
+    await supervisedAgent["ensureServer"]("/repo");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "acli",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
     );
   });
 
@@ -605,6 +642,50 @@ describe("RovoDevAgent", () => {
     vi.useRealTimers();
   });
 
+  it("surfaces an owned group that remains after the server leader exits", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 6789 });
+    let groupPresent = true;
+    const killProcess = vi.fn(
+      (_pid: number, signal: number | NodeJS.Signals) => {
+        if (signal !== 0 || groupPresent) {
+          return true as const;
+        }
+        const error = new Error(
+          "process group is absent",
+        ) as NodeJS.ErrnoException;
+        error.code = "ESRCH";
+        throw error;
+      },
+    );
+    mockSpawn.mockReturnValue(proc);
+    const detachedAgent = new RovoDevAgent(schemaPath, {
+      fetch: fetchMock as typeof fetch,
+      getPort,
+      killProcess,
+      platform: "linux",
+    });
+    fetchMock.mockResolvedValueOnce(jsonResponse({ status: "healthy" }));
+
+    await detachedAgent["ensureServer"]("/repo");
+    proc.emit("close", 0, null);
+
+    const closePromise = detachedAgent.close();
+    const rejection = expect(closePromise).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
+
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    expect(killProcess).toHaveBeenCalledWith(-6789, 0);
+    expect(killProcess).not.toHaveBeenCalledWith(-6789, "SIGKILL");
+    groupPresent = false;
+    await expect(detachedAgent.close()).resolves.toBeUndefined();
+    expect(detachedAgent["server"]).toBeNull();
+    vi.useRealTimers();
+  });
+
   it("kills the full process tree on Windows when closing", async () => {
     const proc = createMockProcess();
     Object.defineProperty(proc, "pid", { value: 6789 });
@@ -637,12 +718,14 @@ describe("RovoDevAgent", () => {
       .mockResolvedValueOnce(jsonResponse({ message: "deleted" }));
 
     await windowsAgent.run("test", "/repo");
-    await windowsAgent.close();
+    const closePromise = windowsAgent.close();
+    proc.emit("close", 0, null);
+    await closePromise;
 
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
       "taskkill",
       ["/T", "/F", "/PID", "6789"],
-      { stdio: "ignore" },
+      { stdio: "ignore", timeout: 3_000 },
     );
     expect(proc.kill).not.toHaveBeenCalled();
   });
@@ -718,5 +801,65 @@ describe("RovoDevAgent", () => {
     expect(calledUrls).toContain(
       "http://127.0.0.1:8765/v3/sessions/session-123",
     );
+  });
+
+  it("cancels the active turn before deleting a session after an error", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ status: "healthy" }))
+      .mockResolvedValueOnce(
+        jsonResponse({ session_id: "session-123", title: "gnhf" }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ message: "ok", prompt_set: true }))
+      .mockResolvedValueOnce(jsonResponse({ response: "Chat message set" }))
+      .mockResolvedValueOnce(textResponse(""))
+      .mockResolvedValueOnce(jsonResponse({ message: "cancelled" }))
+      .mockResolvedValueOnce(jsonResponse({ message: "deleted" }));
+
+    await expect(agent.run("test", "/repo")).rejects.toThrow(
+      "rovodev returned no text output",
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      "http://127.0.0.1:8765/v3/cancel",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      7,
+      "http://127.0.0.1:8765/v3/sessions/session-123",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  it("retains the session and shuts down when cancellation is not acknowledged", async () => {
+    const proc = createMockProcess();
+    vi.mocked(proc.kill).mockImplementation((signal) => {
+      queueMicrotask(() => proc.emit("close", 0, signal));
+      return true;
+    });
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ status: "healthy" }))
+      .mockResolvedValueOnce(
+        jsonResponse({ session_id: "session-123", title: "gnhf" }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ message: "ok", prompt_set: true }))
+      .mockResolvedValueOnce(jsonResponse({ response: "Chat message set" }))
+      .mockResolvedValueOnce(textResponse(""))
+      .mockResolvedValueOnce(new Response("cancel failed", { status: 500 }));
+
+    await expect(agent.run("test", "/repo")).rejects.toThrow(
+      "rovodev returned no text output",
+    );
+
+    const calledUrls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(calledUrls).toContain("http://127.0.0.1:8765/v3/cancel");
+    expect(calledUrls).not.toContain(
+      "http://127.0.0.1:8765/v3/sessions/session-123",
+    );
+    expect(proc.kill).toHaveBeenCalledWith("SIGTERM");
   });
 });

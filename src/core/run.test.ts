@@ -1,13 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 vi.mock("node:fs", () => ({
+  cpSync: vi.fn(),
   mkdirSync: vi.fn(),
   writeFileSync: vi.fn(),
   appendFileSync: vi.fn(),
   readFileSync: vi.fn(() => ""),
   readdirSync: vi.fn(() => []),
   existsSync: vi.fn(() => false),
+  renameSync: vi.fn(),
   rmSync: vi.fn(),
 }));
 
@@ -22,32 +24,49 @@ vi.mock("./git.js", () => ({
 
 import { execFileSync } from "node:child_process";
 import {
+  cpSync,
   mkdirSync,
   writeFileSync,
   appendFileSync,
   existsSync,
   readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
 } from "node:fs";
 import { findLegacyRunBaseCommit, getHeadCommit } from "./git.js";
 import {
   setupRun,
   appendNotes,
+  getLastIterationNumber,
   resumeRun,
   peekRunMetadata,
+  persistRunEvidence,
+  readWorkspaceRecovery,
+  readRunUsageState,
   toStringArray,
+  writeRunUsageState,
 } from "./run.js";
 import { CONVENTIONAL_COMMIT_MESSAGE } from "./commit-message.js";
 
 const P = "/project";
 
 const mockMkdirSync = vi.mocked(mkdirSync);
+const mockCpSync = vi.mocked(cpSync);
 const mockWriteFileSync = vi.mocked(writeFileSync);
 const mockAppendFileSync = vi.mocked(appendFileSync);
 const mockExistsSync = vi.mocked(existsSync);
 const mockReadFileSync = vi.mocked(readFileSync);
+const mockReaddirSync = vi.mocked(readdirSync);
+const mockRenameSync = vi.mocked(renameSync);
+const mockRmSync = vi.mocked(rmSync);
 const mockExecFileSync = vi.mocked(execFileSync);
 const mockFindLegacyRunBaseCommit = vi.mocked(findLegacyRunBaseCommit);
 const mockGetHeadCommit = vi.mocked(getHeadCommit);
+
+function requiredRunPaths(runDir: string): string[] {
+  return [runDir, join(runDir, "prompt.md"), join(runDir, "notes.md")];
+}
 
 describe("setupRun", () => {
   beforeEach(() => {
@@ -68,12 +87,26 @@ describe("setupRun", () => {
     );
   });
 
-  it("writes the ignore rule to .git/info/exclude", () => {
+  it("writes runtime metadata ignore rules to .git/info/exclude", () => {
     setupRun("run-abc", "test", "abc123", P, { includeStopField: false });
 
     expect(mockWriteFileSync).toHaveBeenCalledWith(
       join(P, ".git", "info", "exclude"),
-      ".gnhf/runs/\n",
+      ".gnhf/runs/\n.gnhf/setup-failures/\n",
+      "utf-8",
+    );
+  });
+
+  it("adds missing runtime metadata rules to an existing exclude file", () => {
+    const excludePath = join(P, ".git", "info", "exclude");
+    mockExistsSync.mockImplementationOnce((path) => path === excludePath);
+    mockReadFileSync.mockReturnValueOnce(".gnhf/runs/\n");
+
+    setupRun("run-abc", "test", "abc123", P, { includeStopField: false });
+
+    expect(mockAppendFileSync).toHaveBeenCalledWith(
+      excludePath,
+      ".gnhf/setup-failures/\n",
       "utf-8",
     );
   });
@@ -224,6 +257,38 @@ describe("setupRun", () => {
     );
   });
 
+  it("persists runtime limits for the run", () => {
+    const info = setupRun("run-abc", "test", "abc123", P, {
+      includeStopField: false,
+      runtimeLimits: {
+        maxIterations: 12,
+        maxTokens: 3456,
+        maxReportedCostUsd: 7.25,
+      },
+    });
+
+    const runtimeLimitsWrite = mockWriteFileSync.mock.calls.find(
+      (call) =>
+        typeof call[0] === "string" &&
+        basename(call[0]).startsWith(".runtime-limits.json."),
+    );
+    expect(runtimeLimitsWrite).toBeDefined();
+    expect(runtimeLimitsWrite).toEqual([
+      expect.stringMatching(/\.runtime-limits\.json\..+\.tmp$/),
+      `${JSON.stringify(info.runtimeLimits, null, 2)}\n`,
+      { encoding: "utf-8", flag: "wx", mode: 0o600 },
+    ]);
+    expect(mockRenameSync).toHaveBeenCalledWith(
+      runtimeLimitsWrite![0],
+      join(info.runDir, "runtime-limits.json"),
+    );
+    expect(info.runtimeLimits).toEqual({
+      maxIterations: 12,
+      maxTokens: 3456,
+      maxReportedCostUsd: 7.25,
+    });
+  });
+
   it("preserves the existing branch base commit on overwrite", () => {
     const baseCommitPath = join(P, ".gnhf", "runs", "run-abc", "base-commit");
     mockExistsSync.mockImplementation((path) => path === baseCommitPath);
@@ -283,6 +348,8 @@ describe("setupRun", () => {
       stopWhen: undefined,
       commitMessagePath: join(runDir, "commit-message"),
       commitMessage: undefined,
+      runtimeLimitsPath: join(runDir, "runtime-limits.json"),
+      runtimeLimits: {},
     });
   });
 });
@@ -294,7 +361,12 @@ describe("resumeRun", () => {
 
   it("refreshes output-schema.json to the current JSON schema", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
-    mockExistsSync.mockImplementation((path) => path === runDir);
+    mockExistsSync.mockImplementation(
+      (path) =>
+        path === runDir ||
+        path === join(runDir, "prompt.md") ||
+        path === join(runDir, "notes.md"),
+    );
 
     resumeRun("run-abc", P, { includeStopField: false });
 
@@ -313,9 +385,38 @@ describe("resumeRun", () => {
     expect(schema.required).not.toContain("should_fully_stop");
   });
 
-  it("rewrites output-schema.json with should_fully_stop when includeStopField is true", () => {
+  it("re-establishes the local ignore rule before resuming", () => {
+    const runDir = join(P, ".gnhf", "runs", "run-abc");
+    mockExistsSync.mockImplementation(
+      (path) =>
+        path === runDir ||
+        path === join(runDir, "prompt.md") ||
+        path === join(runDir, "notes.md"),
+    );
+
+    resumeRun("run-abc", P, { includeStopField: false });
+
+    expect(mockExecFileSync).toHaveBeenCalledWith(
+      "git",
+      ["rev-parse", "--git-path", "info/exclude"],
+      { cwd: P, encoding: "utf-8" },
+    );
+  });
+
+  it("rejects incomplete run metadata", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
     mockExistsSync.mockImplementation((path) => path === runDir);
+
+    expect(() => resumeRun("run-abc", P, { includeStopField: false })).toThrow(
+      "Incomplete run metadata",
+    );
+  });
+
+  it("rewrites output-schema.json with should_fully_stop when includeStopField is true", () => {
+    const runDir = join(P, ".gnhf", "runs", "run-abc");
+    mockExistsSync.mockImplementation((path) =>
+      requiredRunPaths(runDir).includes(String(path)),
+    );
 
     resumeRun("run-abc", P, { includeStopField: true });
 
@@ -332,7 +433,9 @@ describe("resumeRun", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
     const baseCommitPath = join(runDir, "base-commit");
     mockExistsSync.mockImplementation(
-      (path) => path === runDir || path === baseCommitPath,
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) ||
+        path === baseCommitPath,
     );
     mockReadFileSync.mockImplementation((path) =>
       path === baseCommitPath ? "abc123\n" : "",
@@ -348,7 +451,9 @@ describe("resumeRun", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
     const stopWhenPath = join(runDir, "stop-when");
     mockExistsSync.mockImplementation(
-      (path) => path === runDir || path === stopWhenPath,
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) ||
+        path === stopWhenPath,
     );
     mockReadFileSync.mockImplementation((path) =>
       path === stopWhenPath ? "all tests pass\n" : "",
@@ -362,18 +467,68 @@ describe("resumeRun", () => {
 
   it("returns undefined for stop-when when the file is missing", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
-    mockExistsSync.mockImplementation((path) => path === runDir);
+    mockExistsSync.mockImplementation((path) =>
+      requiredRunPaths(runDir).includes(String(path)),
+    );
 
     const info = resumeRun("run-abc", P, { includeStopField: false });
 
     expect(info.stopWhen).toBeUndefined();
   });
 
+  it("restores, overrides, and clears persisted runtime limits", () => {
+    const runDir = join(P, ".gnhf", "runs", "run-abc");
+    const runtimeLimitsPath = join(runDir, "runtime-limits.json");
+    mockExistsSync.mockImplementation(
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) ||
+        path === runtimeLimitsPath,
+    );
+    mockReadFileSync.mockImplementation((path) =>
+      path === runtimeLimitsPath
+        ? JSON.stringify({
+            maxIterations: 12,
+            maxTokens: 3456,
+            maxReportedCostUsd: 7.25,
+          })
+        : "",
+    );
+
+    const info = resumeRun("run-abc", P, {
+      includeStopField: false,
+      runtimeLimits: {
+        maxIterations: 20,
+        maxTokens: null,
+      },
+    });
+
+    expect(info.runtimeLimits).toEqual({
+      maxIterations: 20,
+      maxReportedCostUsd: 7.25,
+    });
+    const runtimeLimitsWrite = mockWriteFileSync.mock.calls.find(
+      (call) =>
+        typeof call[0] === "string" &&
+        basename(call[0]).startsWith(".runtime-limits.json."),
+    );
+    expect(runtimeLimitsWrite).toEqual([
+      expect.stringMatching(/\.runtime-limits\.json\..+\.tmp$/),
+      `${JSON.stringify(info.runtimeLimits, null, 2)}\n`,
+      { encoding: "utf-8", flag: "wx", mode: 0o600 },
+    ]);
+    expect(mockRenameSync).toHaveBeenCalledWith(
+      runtimeLimitsWrite![0],
+      runtimeLimitsPath,
+    );
+  });
+
   it("uses stored default commit message metadata on resume even when live config is conventional", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
     const commitMessagePath = join(runDir, "commit-message");
     mockExistsSync.mockImplementation(
-      (path) => path === runDir || path === commitMessagePath,
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) ||
+        path === commitMessagePath,
     );
     mockReadFileSync.mockImplementation((path) =>
       path === commitMessagePath ? "default\n" : "",
@@ -403,7 +558,9 @@ describe("resumeRun", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
     const commitMessagePath = join(runDir, "commit-message");
     mockExistsSync.mockImplementation(
-      (path) => path === runDir || path === commitMessagePath,
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) ||
+        path === commitMessagePath,
     );
     mockReadFileSync.mockImplementation((path) =>
       path === commitMessagePath ? "conventional\n" : "",
@@ -426,7 +583,8 @@ describe("resumeRun", () => {
     const schemaPath = join(runDir, "output-schema.json");
     const commitMessagePath = join(runDir, "commit-message");
     mockExistsSync.mockImplementation(
-      (path) => path === runDir || path === schemaPath,
+      (path) =>
+        requiredRunPaths(runDir).includes(String(path)) || path === schemaPath,
     );
     mockReadFileSync.mockImplementation((path) =>
       path === schemaPath
@@ -451,7 +609,9 @@ describe("resumeRun", () => {
 
   it("backfills missing base-commit for legacy runs", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
-    mockExistsSync.mockImplementation((path) => path === runDir);
+    mockExistsSync.mockImplementation((path) =>
+      requiredRunPaths(runDir).includes(String(path)),
+    );
     mockFindLegacyRunBaseCommit.mockReturnValue("legacy123");
 
     const info = resumeRun("run-abc", P, { includeStopField: false });
@@ -467,7 +627,9 @@ describe("resumeRun", () => {
 
   it("falls back to HEAD when a legacy run has no recoverable base commit", () => {
     const runDir = join(P, ".gnhf", "runs", "run-abc");
-    mockExistsSync.mockImplementation((path) => path === runDir);
+    mockExistsSync.mockImplementation((path) =>
+      requiredRunPaths(runDir).includes(String(path)),
+    );
     mockFindLegacyRunBaseCommit.mockReturnValue(null);
     mockGetHeadCommit.mockReturnValue("head456");
 
@@ -476,6 +638,136 @@ describe("resumeRun", () => {
     expect(mockGetHeadCommit).toHaveBeenCalledWith(P);
     expect(info.baseCommit).toBe("head456");
   });
+});
+
+describe("persistRunEvidence", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockExistsSync.mockReturnValue(false);
+  });
+
+  it("refuses to replace evidence from an existing run", () => {
+    const runDir = "/worktree/.gnhf/runs/run-abc";
+    const persistedRunDir = join("/repo", ".gnhf", "runs", "run-abc");
+    mockExistsSync.mockImplementation((path) => path === persistedRunDir);
+
+    expect(() =>
+      persistRunEvidence(
+        {
+          runId: "run-abc",
+          runDir,
+          promptPath: join(runDir, "prompt.md"),
+          notesPath: join(runDir, "notes.md"),
+          schemaPath: join(runDir, "output-schema.json"),
+          logPath: join(runDir, "gnhf.log"),
+          baseCommit: "abc123",
+          baseCommitPath: join(runDir, "base-commit"),
+          stopWhenPath: join(runDir, "stop-when"),
+          stopWhen: undefined,
+          commitMessagePath: join(runDir, "commit-message"),
+          commitMessage: undefined,
+          runtimeLimitsPath: join(runDir, "runtime-limits.json"),
+          runtimeLimits: {},
+        },
+        "/repo",
+      ),
+    ).toThrow(`Run evidence already exists: ${persistedRunDir}`);
+    expect(mockCpSync).not.toHaveBeenCalled();
+    expect(mockRmSync).not.toHaveBeenCalled();
+  });
+
+  it("atomically copies worktree evidence into the originating checkout", () => {
+    const runDir = "/worktree/.gnhf/runs/run-abc";
+    const runInfo = {
+      runId: "run-abc",
+      runDir,
+      promptPath: join(runDir, "prompt.md"),
+      notesPath: join(runDir, "notes.md"),
+      schemaPath: join(runDir, "output-schema.json"),
+      logPath: join(runDir, "gnhf.log"),
+      baseCommit: "abc123",
+      baseCommitPath: join(runDir, "base-commit"),
+      stopWhenPath: join(runDir, "stop-when"),
+      stopWhen: undefined,
+      commitMessagePath: join(runDir, "commit-message"),
+      commitMessage: undefined,
+      runtimeLimitsPath: join(runDir, "runtime-limits.json"),
+      runtimeLimits: {},
+    };
+
+    const persisted = persistRunEvidence(runInfo, "/repo");
+    const temporaryPath = mockCpSync.mock.calls[0]![1] as string;
+    const persistedRunDir = join("/repo", ".gnhf", "runs", "run-abc");
+
+    expect(mockCpSync).toHaveBeenCalledWith(runDir, temporaryPath, {
+      recursive: true,
+      errorOnExist: true,
+      force: false,
+    });
+    expect(dirname(temporaryPath)).toBe(dirname(persistedRunDir));
+    expect(basename(temporaryPath)).toMatch(/^\.run-abc\..+\.tmp$/);
+    expect(mockRmSync).not.toHaveBeenCalledWith(persistedRunDir, {
+      recursive: true,
+      force: true,
+    });
+    expect(mockRenameSync).toHaveBeenCalledWith(temporaryPath, persistedRunDir);
+    expect(persisted).toMatchObject({
+      runDir: persistedRunDir,
+      notesPath: join(persistedRunDir, "notes.md"),
+      logPath: join(persistedRunDir, "gnhf.log"),
+    });
+  });
+
+  it("refuses removal when another run has local evidence", () => {
+    const runDir = "/worktree/.gnhf/runs/run-abc";
+    mockReaddirSync.mockImplementation(
+      (path) =>
+        (path === dirname(runDir)
+          ? ["run-abc", "other-run"]
+          : []) as unknown as ReturnType<typeof readdirSync>,
+    );
+
+    expect(() => persistRunEvidence(createRunInfo(runDir), "/repo")).toThrow(
+      "Additional run evidence remains in worktree",
+    );
+    expect(mockCpSync).not.toHaveBeenCalled();
+  });
+
+  it("refuses removal when setup-failure evidence remains", () => {
+    const runDir = "/worktree/.gnhf/runs/run-abc";
+    const setupFailuresDir = join(dirname(dirname(runDir)), "setup-failures");
+    mockExistsSync.mockImplementation((path) => path === setupFailuresDir);
+    mockReaddirSync.mockImplementation(
+      (path) =>
+        (path === setupFailuresDir
+          ? ["other-run.json"]
+          : []) as unknown as ReturnType<typeof readdirSync>,
+    );
+
+    expect(() => persistRunEvidence(createRunInfo(runDir), "/repo")).toThrow(
+      "Setup failure evidence remains in worktree",
+    );
+    expect(mockCpSync).not.toHaveBeenCalled();
+  });
+
+  function createRunInfo(runDir: string) {
+    return {
+      runId: "run-abc",
+      runDir,
+      promptPath: join(runDir, "prompt.md"),
+      notesPath: join(runDir, "notes.md"),
+      schemaPath: join(runDir, "output-schema.json"),
+      logPath: join(runDir, "gnhf.log"),
+      baseCommit: "abc123",
+      baseCommitPath: join(runDir, "base-commit"),
+      stopWhenPath: join(runDir, "stop-when"),
+      stopWhen: undefined,
+      commitMessagePath: join(runDir, "commit-message"),
+      commitMessage: undefined,
+      runtimeLimitsPath: join(runDir, "runtime-limits.json"),
+      runtimeLimits: {},
+    };
+  }
 });
 
 describe("peekRunMetadata", () => {
@@ -532,6 +824,216 @@ describe("peekRunMetadata", () => {
       "Run directory not found",
     );
     expect(mockWriteFileSync).not.toHaveBeenCalled();
+  });
+});
+
+describe("workspace recovery", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockExistsSync.mockReturnValue(true);
+  });
+
+  it("restores persisted cleanup uncertainty", () => {
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({
+        kind: "interrupted",
+        detail: "descendant cleanup was not verified",
+        cleanupUncertain: true,
+      }),
+    );
+
+    expect(readWorkspaceRecovery({ runDir: "/run" })).toEqual({
+      kind: "interrupted",
+      detail: "descendant cleanup was not verified",
+      cleanupUncertain: true,
+    });
+  });
+
+  it("treats legacy recovery markers as cleanup-uncertain", () => {
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ kind: "interrupted", detail: "legacy recovery" }),
+    );
+
+    expect(readWorkspaceRecovery({ runDir: "/run" })).toEqual({
+      kind: "interrupted",
+      detail: "legacy recovery",
+      cleanupUncertain: true,
+    });
+  });
+
+  it("keeps legacy commit failures cleanup-certain", () => {
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ kind: "commit-failure", detail: "hook failed" }),
+    );
+
+    expect(readWorkspaceRecovery({ runDir: "/run" })).toEqual({
+      kind: "commit-failure",
+      detail: "hook failed",
+      cleanupUncertain: false,
+    });
+  });
+});
+
+describe("run usage state", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("reads persisted cumulative usage", () => {
+    const usageState = {
+      generation: 2,
+      phase: "terminal",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    };
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(JSON.stringify(usageState));
+
+    expect(readRunUsageState({ runDir: "/run" })).toEqual(usageState);
+  });
+
+  it("reads legacy cumulative usage as an unverified generation", () => {
+    const usageState = {
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    };
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(JSON.stringify(usageState));
+
+    expect(readRunUsageState({ runDir: "/run" })).toEqual(usageState);
+  });
+
+  it("rejects partial cumulative usage metadata", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ totalInputTokens: 4, totalOutputTokens: 2 }),
+    );
+
+    expect(() => readRunUsageState({ runDir: "/run" })).toThrow(
+      "Invalid run usage metadata",
+    );
+  });
+
+  it("rejects incomplete usage generation metadata", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({
+        generation: 2,
+        totalInputTokens: 4,
+        totalOutputTokens: 2,
+        totalTokens: 12,
+        reportedCostUsd: 0.4,
+        tokensUnavailable: false,
+        reportedCostUnavailable: false,
+        tokensEstimated: false,
+        hasAuthoritativeTokenReceipt: true,
+      }),
+    );
+
+    expect(() => readRunUsageState({ runDir: "/run" })).toThrow(
+      "Invalid run usage metadata",
+    );
+  });
+
+  it("rejects an invalid reported cost lower bound", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({
+        generation: 2,
+        phase: "terminal",
+        totalInputTokens: 4,
+        totalOutputTokens: 2,
+        totalTokens: 12,
+        reportedCostUsd: 0.4,
+        reportedCostLowerBoundUsd: -1,
+        tokensUnavailable: false,
+        reportedCostUnavailable: false,
+        tokensEstimated: false,
+        hasAuthoritativeTokenReceipt: true,
+      }),
+    );
+
+    expect(() => readRunUsageState({ runDir: "/run" })).toThrow(
+      "Invalid run usage metadata",
+    );
+  });
+
+  it("publishes cumulative usage atomically", () => {
+    const usageState = {
+      generation: 2,
+      phase: "terminal" as const,
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: null,
+      reportedCostLowerBoundUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: true,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    };
+
+    writeRunUsageState({ runDir: "/run" }, usageState);
+    const temporaryPath = mockWriteFileSync.mock.calls[0][0] as string;
+
+    expect(mockWriteFileSync).toHaveBeenCalledWith(
+      temporaryPath,
+      `${JSON.stringify(usageState, null, 2)}\n`,
+      {
+        encoding: "utf-8",
+        flag: "wx",
+        mode: 0o600,
+      },
+    );
+    expect(dirname(temporaryPath)).toBe(join("/run"));
+    expect(basename(temporaryPath)).toMatch(/^\.usage\.json\..+\.tmp$/);
+    expect(mockRenameSync).toHaveBeenCalledWith(
+      temporaryPath,
+      join("/run", "usage.json"),
+    );
+  });
+});
+
+describe("getLastIterationNumber", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("counts a persisted usage generation created before its transcript", () => {
+    mockReaddirSync.mockReturnValue([
+      "iteration-1.jsonl",
+      "usage.json",
+    ] as unknown as ReturnType<typeof readdirSync>);
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({
+        generation: 2,
+        phase: "in-progress",
+        totalInputTokens: 4,
+        totalOutputTokens: 2,
+        totalTokens: 12,
+        reportedCostUsd: 0.4,
+        tokensUnavailable: false,
+        reportedCostUnavailable: false,
+        tokensEstimated: false,
+        hasAuthoritativeTokenReceipt: true,
+      }),
+    );
+
+    expect(getLastIterationNumber({ runDir: "/run" })).toBe(2);
   });
 });
 

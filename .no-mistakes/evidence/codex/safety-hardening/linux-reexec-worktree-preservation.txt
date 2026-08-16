@@ -1,0 +1,53 @@
+Scenario: built gnhf CLI using a local Linux systemd-inhibit contract harness
+Purpose: exercise the real parent/child re-execution path where only the inhibited child creates the worktree and atomically publishes its identity
+Command: gnhf "receipt preservation evidence" --max-iterations 0 --prevent-sleep on --worktree --preserve-worktree
+Exit code: 0
+
+--- Inhibitor harness invocation ---
+harness pid=<pid> args=--what=idle:sleep --mode=block --who=gnhf --why=Prevent sleep while gnhf is running <node> <checkout>/dist/cli.mjs receipt preservation evidence --agent opencode --max-iterations 0 --prevent-sleep on --worktree --preserve-worktree
+--- CLI permanent stdout summary ---
+╭────────────────────────────────────────────────────────────╮
+│ × gnhf stopped                                             │
+│   opencode ran for 0s before: max iterations reached (0)   │
+╰────────────────────────────────────────────────────────────╯
+
+  iterations      0 total       0 good       0 failed
+  tokens          0 in          0 out        
+  branch diff     0 commits     +0           -0
+  files           0 added       0 updated    0 deleted
+
+  notes           <fixture>/repo-gnhf-worktrees/<run-id>/.gnhf/runs/<run-id>/notes.md
+  debug log       <fixture>/repo-gnhf-worktrees/<run-id>/.gnhf/runs/<run-id>/gnhf.log
+
+  next steps      git log --oneline 53a86c3a26ac..HEAD
+                  git diff --stat 53a86c3a26ac..HEAD
+                  gh pr create
+
+  too much        git push no-mistakes:
+  to review?      https://github.com/kunchenguid/no-mistakes
+--- CLI stderr ---
+
+  gnhf: Run log: <fixture>/repo-gnhf-worktrees/<run-id>/.gnhf/runs/<run-id>/gnhf.log
+
+
+  gnhf: worktree preserved at <fixture>/repo-gnhf-worktrees/<run-id>
+  gnhf: merge the branch and remove with: git worktree remove "<fixture>/repo-gnhf-worktrees/<run-id>"
+
+--- Atomic worktree receipt ---
+{
+  "schemaVersion": 1,
+  "receiptId": "<receipt-id>",
+  "runId": "<run-id>",
+  "state": "created",
+  "worktreePath": "<fixture>/repo-gnhf-worktrees/<run-id>",
+  "baseCommit": "53a86c3a26ac0f1c6716099b582a383268c5378f"
+}
+--- Git and lifecycle verification ---
+original branch: main
+original commit count: 1
+preserved branch: gnhf/<run-id>
+preserved worktree status: clean
+receipt mode: 600
+lifecycle events:
+{"timestamp":"<timestamp>","pid":"<pid>","event":"run:complete","signal":null,"status":"aborted","iterations":0,"successCount":0,"failCount":0,"totalInputTokens":0,"totalOutputTokens":0,"tokensAvailable":true,"reportedCostUsd":null,"commitCount":0,"worktreePath":"<fixture>/repo-gnhf-worktrees/<run-id>"}
+{"timestamp":"<timestamp>","pid":"<pid>","event":"worktree:preserved","worktreePath":"<fixture>/repo-gnhf-worktrees/<run-id>","reason":"requested"}

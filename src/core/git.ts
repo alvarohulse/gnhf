@@ -5,6 +5,7 @@ import { appendDebugLog, serializeError } from "./debug-log.js";
 
 const NOT_GIT_REPOSITORY_MESSAGE =
   'This command must be run inside a Git repository. Change into a repo or run "git init" first.';
+const GNHF_OWNED_METADATA_PREFIXES = [".gnhf/runs/", ".gnhf/setup-failures/"];
 
 function translateGitError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -114,6 +115,23 @@ export function ensureCleanWorkingTree(cwd: string): void {
       "Working tree is not clean. Commit or stash changes first.",
     );
   }
+}
+
+export function hasWorkingTreeChanges(cwd: string): boolean {
+  if (git(["status", "--porcelain", "--untracked-files=all"], cwd).length > 0) {
+    return true;
+  }
+
+  return git(
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    cwd,
+  )
+    .split("\0")
+    .some(
+      (path) =>
+        path.length > 0 &&
+        !GNHF_OWNED_METADATA_PREFIXES.some((prefix) => path.startsWith(prefix)),
+    );
 }
 
 export function createBranch(branchName: string, cwd: string): void {
@@ -250,15 +268,15 @@ export function commitAll(message: string, cwd: string): void {
     message,
   ];
 
-  git(["add", "-A"], cwd);
   try {
-    git(["diff", "--cached", "--quiet"], cwd);
-    return;
-  } catch {
-    // Exit 1 means there are staged changes to commit.
-  }
+    git(["add", "-A"], cwd);
+    try {
+      git(["diff", "--cached", "--quiet"], cwd);
+      return;
+    } catch {
+      // Exit 1 means there are staged changes to commit.
+    }
 
-  try {
     git(commitArgs, cwd);
   } catch (error) {
     const commitError = new CommitFailedError(error);
@@ -308,7 +326,10 @@ export function createWorktree(
 }
 
 export function removeWorktree(baseCwd: string, worktreePath: string): void {
-  git(["worktree", "remove", "--force", worktreePath], baseCwd);
+  git(
+    ["-c", "status.showUntrackedFiles=all", "worktree", "remove", worktreePath],
+    baseCwd,
+  );
 }
 
 export function listWorktreePaths(baseCwd: string): Set<string> {

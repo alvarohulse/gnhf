@@ -1,7 +1,19 @@
 import { EventEmitter } from "node:events";
-import type { ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { shutdownChildProcess, signalChildProcess } from "./managed-process.js";
+import { initDebugLog, resetDebugLogForTests } from "../debug-log.js";
+import { UnverifiedAgentCleanupError } from "./types.js";
+import {
+  ChildProcessShutdownTracker,
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+  shutdownWindowsProcessTree,
+  signalChildProcess,
+  spawnManagedChildProcess,
+} from "./managed-process.js";
 
 function createChildProcess(pid = 1234): ChildProcess {
   return Object.assign(new EventEmitter(), {
@@ -14,6 +26,68 @@ function createChildProcess(pid = 1234): ChildProcess {
     signalCode: null,
   }) as unknown as ChildProcess;
 }
+
+describe("shouldDetachAgentProcess", () => {
+  it("keeps agents inside an external supervisor process group", () => {
+    expect(shouldDetachAgentProcess("linux", true)).toBe(false);
+  });
+
+  it("creates an owned process group for unsupervised Unix agents", () => {
+    expect(shouldDetachAgentProcess("linux", false)).toBe(true);
+  });
+
+  it("does not detach Windows agents", () => {
+    expect(shouldDetachAgentProcess("win32", false)).toBe(false);
+  });
+});
+
+describe("ChildProcessShutdownTracker", () => {
+  it("waits for retained shutdowns", async () => {
+    let resolveShutdown!: () => void;
+    const shutdown = new Promise<void>((resolve) => {
+      resolveShutdown = resolve;
+    });
+    const tracker = new ChildProcessShutdownTracker();
+    let finished = false;
+
+    tracker.start(() => shutdown);
+    const wait = tracker.waitForAll().then(() => {
+      finished = true;
+    });
+    await Promise.resolve();
+    expect(finished).toBe(false);
+
+    resolveShutdown();
+    await wait;
+    expect(finished).toBe(true);
+  });
+
+  it("retains shutdown failures until a waiter observes them", async () => {
+    const tracker = new ChildProcessShutdownTracker();
+    tracker.start(() =>
+      Promise.reject(new Error("process cleanup was not proven")),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await expect(tracker.waitForAll()).rejects.toThrow(
+      "process cleanup was not proven",
+    );
+    await expect(tracker.waitForAll()).resolves.toBeUndefined();
+  });
+
+  it("reports unverified cleanup only during finalization", async () => {
+    const tracker = new ChildProcessShutdownTracker();
+    const error = new UnverifiedAgentCleanupError(
+      "descendant cleanup was not verified",
+    );
+    tracker.recordUnverifiedCleanup(error);
+
+    expect(tracker.getUnverifiedCleanupError()).toBe(error);
+    await expect(tracker.waitForAll()).resolves.toBeUndefined();
+    await expect(tracker.finalize()).rejects.toBe(error);
+  });
+});
 
 describe("signalChildProcess", () => {
   beforeEach(() => {
@@ -47,6 +121,426 @@ describe("signalChildProcess", () => {
     });
 
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+});
+
+describe("spawnManagedChildProcess", () => {
+  it("places detached commands behind a stable process-group supervisor", () => {
+    const supervisor = Object.assign(createChildProcess(), {
+      stdin: new EventEmitter(),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      send: vi.fn(),
+    });
+    const spawnProcess = vi.fn(() => supervisor);
+
+    const child = spawnManagedChildProcess(
+      spawnProcess,
+      "agent-cli",
+      ["--json"],
+      {
+        cwd: "/repo",
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    expect(spawnProcess).toHaveBeenCalledWith(
+      process.execPath,
+      [
+        "-e",
+        expect.stringContaining('process.on("SIGTERM", () => {})'),
+        "--",
+        "0",
+        "agent-cli",
+        "--json",
+      ],
+      expect.objectContaining({
+        cwd: "/repo",
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe", "ipc"],
+      }),
+    );
+    expect(child.pid).toBe(supervisor.pid);
+  });
+
+  it("keeps a stable Windows tree root without a shell wrapper", () => {
+    const supervisor = Object.assign(createChildProcess(), {
+      stdin: new EventEmitter(),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      send: vi.fn(),
+    });
+    const spawnProcess = vi.fn(() => supervisor);
+
+    const child = spawnManagedChildProcess(
+      spawnProcess,
+      "agent-cli.cmd",
+      ["--json"],
+      {
+        cwd: "C:\\repo",
+        detached: false,
+        shell: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+      undefined,
+      "win32",
+    );
+
+    expect(spawnProcess).toHaveBeenCalledWith(
+      process.execPath,
+      [
+        "-e",
+        expect.stringContaining('shell: shellFlag === "1"'),
+        "--",
+        "1",
+        "agent-cli.cmd",
+        "--json",
+      ],
+      expect.objectContaining({
+        cwd: "C:\\repo",
+        detached: false,
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe", "ipc"],
+      }),
+    );
+    expect(child.pid).toBe(supervisor.pid);
+  });
+
+  it("records an unexpected Windows supervisor close before settling", () => {
+    const supervisor = Object.assign(createChildProcess(), {
+      stdin: new EventEmitter(),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      send: vi.fn(),
+    });
+    const tracker = new ChildProcessShutdownTracker();
+    const child = spawnManagedChildProcess(
+      vi.fn(() => supervisor),
+      "agent-cli.cmd",
+      ["--json"],
+      {
+        cwd: "C:\\repo",
+        detached: false,
+        shell: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+      tracker,
+      "win32",
+    );
+    let cleanupErrorAtClose: UnverifiedAgentCleanupError | null = null;
+    child.once("close", () => {
+      cleanupErrorAtClose = tracker.getUnverifiedCleanupError();
+    });
+
+    supervisor.emit("close", 1, null);
+
+    expect(cleanupErrorAtClose).toBeInstanceOf(UnverifiedAgentCleanupError);
+    expect(cleanupErrorAtClose).toHaveProperty(
+      "message",
+      "Could not verify descendant process cleanup for PID 1234 after supervisor-close",
+    );
+  });
+
+  it("accepts an owner-initiated Windows supervisor close", async () => {
+    const supervisor = Object.assign(createChildProcess(), {
+      stdin: new EventEmitter(),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      send: vi.fn(),
+    });
+    const tracker = new ChildProcessShutdownTracker();
+    const child = spawnManagedChildProcess(
+      vi.fn(() => supervisor),
+      "agent-cli.cmd",
+      ["--json"],
+      {
+        cwd: "C:\\repo",
+        detached: false,
+        shell: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+      tracker,
+      "win32",
+    );
+
+    await shutdownWindowsProcessTree(child, {
+      killTree: vi.fn(() => supervisor.emit("close", null, "SIGKILL")),
+    });
+
+    expect(tracker.getUnverifiedCleanupError()).toBeNull();
+  });
+
+  it("preserves a Windows target result when cleanup becomes unverified", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "gnhf-managed-process-"));
+    const logPath = join(tempDir, "gnhf.log");
+    resetDebugLogForTests();
+    initDebugLog(logPath);
+
+    try {
+      const supervisor = Object.assign(createChildProcess(), {
+        stdin: new EventEmitter(),
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        send: vi.fn(),
+      });
+      vi.mocked(supervisor.kill).mockReturnValue(false);
+      const tracker = new ChildProcessShutdownTracker();
+      const child = spawnManagedChildProcess(
+        vi.fn(() => supervisor),
+        "agent-cli.cmd",
+        ["--json"],
+        {
+          cwd: "C:\\repo",
+          detached: false,
+          shell: true,
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+        tracker,
+        "win32",
+      );
+      const errors: Error[] = [];
+      child.on("error", (error: Error) => errors.push(error));
+      const closed = new Promise<{
+        code: number | null;
+        signal: NodeJS.Signals | null;
+      }>((resolve) => {
+        child.once("close", (code, signal) => resolve({ code, signal }));
+      });
+
+      supervisor.emit("message", {
+        type: "target-close",
+        code: 0,
+        signal: null,
+      });
+      await Promise.resolve();
+
+      await expect(closed).resolves.toEqual({ code: 0, signal: null });
+      await expect(tracker.waitForAll()).resolves.toBeUndefined();
+      await expect(tracker.finalize()).rejects.toThrow(
+        "Could not verify descendant process cleanup for PID 1234 after target-close",
+      );
+      expect(errors).toEqual([]);
+
+      const events = readFileSync(logPath, "utf-8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          event: "agent-process:cleanup-unverified",
+          trigger: "target-close",
+          mode: "best-effort",
+          descendantCleanup: "unverified",
+        }),
+      );
+    } finally {
+      resetDebugLogForTests();
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  it("preserves a Windows target error when cleanup becomes unverified", async () => {
+    resetDebugLogForTests();
+    const supervisor = Object.assign(createChildProcess(), {
+      stdin: new EventEmitter(),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      send: vi.fn(),
+    });
+    vi.mocked(supervisor.kill).mockReturnValue(false);
+    const tracker = new ChildProcessShutdownTracker();
+    const child = spawnManagedChildProcess(
+      vi.fn(() => supervisor),
+      "missing-agent.cmd",
+      [],
+      {
+        cwd: "C:\\repo",
+        detached: false,
+        shell: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+      tracker,
+      "win32",
+    );
+    const errors: Error[] = [];
+    const handlerCleanup: Promise<void>[] = [];
+    const closed = new Promise<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>((resolve) => {
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    child.on("error", (error: Error) => {
+      errors.push(error);
+      handlerCleanup.push(shutdownWindowsProcessTree(child));
+    });
+
+    supervisor.emit("message", {
+      type: "target-error",
+      message: "agent executable missing",
+    });
+    await Promise.resolve();
+    await expect(tracker.waitForAll()).resolves.toBeUndefined();
+    await expect(Promise.all(handlerCleanup)).resolves.toEqual([undefined]);
+    await expect(closed).resolves.toEqual({ code: 1, signal: null });
+
+    expect(errors.map((error) => error.message)).toEqual([
+      "agent executable missing",
+    ]);
+    resetDebugLogForTests();
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "settles with the target status after supervised group cleanup",
+    async () => {
+      const child = spawnManagedChildProcess(
+        spawn,
+        process.execPath,
+        ["-e", 'process.stdout.write("supervised")'],
+        {
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let stdout = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+
+      const result = await new Promise<{
+        code: number | null;
+        signal: NodeJS.Signals | null;
+      }>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", (code, signal) => resolve({ code, signal }));
+      });
+
+      expect(result).toEqual({ code: 0, signal: null });
+      expect(stdout).toBe("supervised");
+    },
+    5_000,
+  );
+
+  it.runIf(process.platform === "win32")(
+    "retains the target result after descendant ownership becomes unverified",
+    async () => {
+      const tracker = new ChildProcessShutdownTracker();
+      const targetSource = String.raw`
+const { spawn } = require("node:child_process");
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  stdio: "ignore",
+});
+process.stdout.write(String(descendant.pid));
+descendant.unref();
+`;
+      const child = spawnManagedChildProcess(
+        spawn,
+        process.execPath,
+        ["-e", targetSource],
+        {
+          detached: false,
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+        tracker,
+        "win32",
+      );
+      let descendantPidText = "";
+      let descendantPid: number | null = null;
+      child.stdout?.on("data", (chunk: Buffer) => {
+        descendantPidText += chunk.toString();
+      });
+      const errors: Error[] = [];
+      child.on("error", (error: Error) => errors.push(error));
+
+      try {
+        await new Promise<void>((resolve) => {
+          child.once("close", () => resolve());
+        });
+        await expect(tracker.waitForAll()).resolves.toBeUndefined();
+        expect(errors).toEqual([]);
+
+        const capturedPid = Number(descendantPidText);
+        if (!Number.isInteger(capturedPid)) {
+          throw new Error("Windows descendant PID was not captured");
+        }
+        descendantPid = capturedPid;
+      } finally {
+        if (descendantPid !== null) {
+          try {
+            execFileSync(
+              "taskkill",
+              ["/T", "/F", "/PID", String(descendantPid)],
+              { stdio: "ignore" },
+            );
+          } catch {
+            // The expected path already removed the descendant.
+          }
+        }
+      }
+    },
+    15_000,
+  );
+
+  it("tracks target-close shutdowns until cleanup completes", async () => {
+    vi.useFakeTimers();
+    const supervisor = Object.assign(createChildProcess(), {
+      stdin: new EventEmitter(),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      send: vi.fn(),
+    });
+    const spawnProcess = vi.fn(() => supervisor);
+    const tracker = new ChildProcessShutdownTracker();
+    let groupPresent = true;
+    const processKill = vi
+      .spyOn(process, "kill")
+      .mockImplementation((_pid, signal) => {
+        if (signal === 0 && !groupPresent) {
+          throw Object.assign(new Error("process group exited"), {
+            code: "ESRCH",
+          });
+        }
+        if (signal === "SIGKILL") {
+          queueMicrotask(() => supervisor.emit("close", 0, "SIGKILL"));
+        }
+        return true;
+      });
+
+    try {
+      spawnManagedChildProcess(
+        spawnProcess,
+        "agent-cli",
+        ["--json"],
+        {
+          detached: true,
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+        tracker,
+        "linux",
+      );
+      supervisor.emit("message", {
+        type: "target-close",
+        code: 0,
+        signal: null,
+      });
+
+      let cleanupComplete = false;
+      const cleanup = tracker.waitForAll().then(() => {
+        cleanupComplete = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cleanupComplete).toBe(false);
+
+      groupPresent = false;
+      await vi.advanceTimersByTimeAsync(100);
+      await cleanup;
+      expect(cleanupComplete).toBe(true);
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -108,26 +602,24 @@ describe("shutdownChildProcess", () => {
     vi.useRealTimers();
   });
 
-  it("resolves after a hard deadline if the child never closes", async () => {
+  it("surfaces incomplete cleanup if the child never closes", async () => {
     const child = createChildProcess();
-    let resolved = false;
 
     const closePromise = shutdownChildProcess(child, {
       detached: false,
       timeoutMs: 3_000,
-    }).then(() => {
-      resolved = true;
     });
+    const rejection = expect(closePromise).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
 
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
 
     await vi.advanceTimersByTimeAsync(3_000);
     expect(child.kill).toHaveBeenCalledWith("SIGKILL");
-    expect(resolved).toBe(false);
 
     await vi.advanceTimersByTimeAsync(100);
-    await closePromise;
-    expect(resolved).toBe(true);
+    await rejection;
   });
 
   it("clears the force-kill timer when the child closes first", async () => {
@@ -149,6 +641,158 @@ describe("shutdownChildProcess", () => {
     vi.useRealTimers();
   });
 
+  it("does not escalate an owned group after the leader closes", async () => {
+    const child = createChildProcess();
+    const killProcess = vi.fn(() => true as const);
+
+    const closePromise = shutdownChildProcess(child, {
+      detached: true,
+      killProcess,
+      timeoutMs: 3_000,
+    });
+
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGTERM");
+    const rejection = expect(closePromise).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
+    child.emit("close", 0, null);
+
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    expect(killProcess).not.toHaveBeenCalledWith(-1234, "SIGKILL");
+    vi.useRealTimers();
+  });
+
+  it("stops escalation after the owned process group disappears", async () => {
+    const child = createChildProcess();
+    const killProcess = vi.fn(
+      (_pid: number, signal?: number | NodeJS.Signals) => {
+        if (signal === 0) {
+          throw Object.assign(new Error("process group no longer exists"), {
+            code: "ESRCH",
+          });
+        }
+        return true as const;
+      },
+    );
+
+    const closePromise = shutdownChildProcess(child, {
+      detached: true,
+      killProcess,
+      timeoutMs: 3_000,
+    });
+
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGTERM");
+    child.emit("close", 0, null);
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    await closePromise;
+
+    expect(killProcess).toHaveBeenCalledWith(-1234, 0);
+    expect(killProcess).not.toHaveBeenCalledWith(-1234, "SIGKILL");
+    expect(child.kill).not.toHaveBeenCalledWith("SIGKILL");
+    vi.useRealTimers();
+  });
+
+  it("does not signal a recycled group after the initial group signal fails", async () => {
+    const child = createChildProcess();
+    const killProcess = vi.fn(
+      (_pid: number, signal?: number | NodeJS.Signals) => {
+        if (signal === "SIGTERM") {
+          throw Object.assign(new Error("process group no longer exists"), {
+            code: "ESRCH",
+          });
+        }
+        return true as const;
+      },
+    );
+
+    const closePromise = shutdownChildProcess(child, {
+      detached: true,
+      killProcess,
+      timeoutMs: 3_000,
+    });
+
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+
+    const rejection = expect(closePromise).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
+    await vi.advanceTimersByTimeAsync(3_000);
+    await rejection;
+
+    expect(killProcess).not.toHaveBeenCalledWith(-1234, "SIGKILL");
+    vi.useRealTimers();
+  });
+
+  it("rejects when the group remains after successful SIGKILL delivery", async () => {
+    const child = createChildProcess();
+    const killProcess = vi.fn(
+      (_pid: number, signal?: number | NodeJS.Signals) => {
+        if (signal === "SIGKILL") {
+          queueMicrotask(() => child.emit("close", 0, "SIGKILL"));
+        }
+        return true as const;
+      },
+    );
+
+    const closePromise = shutdownChildProcess(child, {
+      detached: true,
+      killProcess,
+      timeoutMs: 3_000,
+    });
+    const rejection = expect(closePromise).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGKILL");
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    expect(killProcess).toHaveBeenCalledWith(-1234, 0);
+    vi.useRealTimers();
+  });
+
+  it("shares concurrent shutdown supervision", async () => {
+    const child = createChildProcess();
+    let groupPresent = true;
+    const killProcess = vi.fn(
+      (_pid: number, signal?: number | NodeJS.Signals) => {
+        if (signal === "SIGKILL") {
+          groupPresent = false;
+          queueMicrotask(() => child.emit("close", 0, "SIGKILL"));
+        }
+        if (signal === 0 && !groupPresent) {
+          throw Object.assign(new Error("process group exited"), {
+            code: "ESRCH",
+          });
+        }
+        return true as const;
+      },
+    );
+
+    const firstShutdown = shutdownChildProcess(child, {
+      detached: true,
+      killProcess,
+      timeoutMs: 3_000,
+    });
+    const secondShutdown = shutdownChildProcess(child, {
+      detached: true,
+      killProcess,
+      timeoutMs: 3_000,
+    });
+
+    expect(secondShutdown).toBe(firstShutdown);
+    expect(killProcess).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    await Promise.all([firstShutdown, secondShutdown]);
+    expect(killProcess).toHaveBeenCalledTimes(3);
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGKILL");
+    expect(killProcess).toHaveBeenCalledWith(-1234, 0);
+    vi.useRealTimers();
+  });
+
   it("resolves immediately when the child has already exited", async () => {
     const child = Object.assign(createChildProcess(), {
       exitCode: 0,
@@ -163,6 +807,135 @@ describe("shutdownChildProcess", () => {
     await vi.advanceTimersByTimeAsync(3_000);
     expect(child.kill).not.toHaveBeenCalledWith("SIGKILL");
 
+    vi.useRealTimers();
+  });
+});
+
+describe("shutdownWindowsProcessTree", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("waits for the exact child to close after taskkill succeeds", async () => {
+    const child = createChildProcess();
+    const killTree = vi.fn();
+    let cleanupComplete = false;
+
+    const cleanup = shutdownWindowsProcessTree(child, { killTree }).then(() => {
+      cleanupComplete = true;
+    });
+
+    expect(killTree).toHaveBeenCalledWith(1234);
+    await Promise.resolve();
+    expect(cleanupComplete).toBe(false);
+
+    child.emit("close", 0, null);
+    await cleanup;
+    expect(cleanupComplete).toBe(true);
+
+    await shutdownWindowsProcessTree(child, { killTree });
+    expect(killTree).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps explicit live-root shutdown fail-closed", async () => {
+    const child = createChildProcess();
+    const killTree = vi.fn(() => {
+      throw new Error("access denied");
+    });
+
+    await expect(
+      shutdownWindowsProcessTree(child, { killTree }),
+    ).rejects.toThrow("Could not prove process cleanup completed");
+  });
+
+  it("does not treat root close as tree cleanup when taskkill fails", async () => {
+    const child = createChildProcess();
+    const killTree = vi.fn(() => {
+      child.emit("close", 0, null);
+      throw new Error("access denied");
+    });
+
+    await expect(
+      shutdownWindowsProcessTree(child, { killTree }),
+    ).rejects.toThrow("Could not prove process cleanup completed");
+  });
+
+  it("does not claim cleanup after ownership was lost before taskkill", async () => {
+    const child = createChildProcess();
+    const killTree = vi.fn();
+    const cleanup = shutdownWindowsProcessTree(child, {
+      killTree,
+      ownershipLost: true,
+    });
+    const rejection = expect(cleanup).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
+
+    child.emit("close", 0, null);
+
+    await rejection;
+    expect(killTree).toHaveBeenCalledWith(1234);
+  });
+
+  it("rejects when tree ownership was lost before shutdown began", async () => {
+    const child = Object.assign(createChildProcess(), { exitCode: 0 });
+    const killTree = vi.fn();
+
+    await expect(
+      shutdownWindowsProcessTree(child, { killTree }),
+    ).rejects.toThrow("Could not prove process cleanup completed");
+    expect(killTree).not.toHaveBeenCalled();
+  });
+
+  it("shares concurrent Windows tree shutdown supervision", async () => {
+    const child = createChildProcess();
+    const killTree = vi.fn();
+
+    const firstShutdown = shutdownWindowsProcessTree(child, { killTree });
+    const secondShutdown = shutdownWindowsProcessTree(child, { killTree });
+
+    expect(secondShutdown).toBe(firstShutdown);
+    expect(killTree).toHaveBeenCalledTimes(1);
+
+    child.emit("close", 0, null);
+    await Promise.all([firstShutdown, secondShutdown]);
+  });
+
+  it("allows a failed Windows tree shutdown to be retried", async () => {
+    const child = createChildProcess();
+    const failedKillTree = vi.fn(() => {
+      throw new Error("access denied");
+    });
+
+    await expect(
+      shutdownWindowsProcessTree(child, { killTree: failedKillTree }),
+    ).rejects.toThrow("Could not prove process cleanup completed");
+
+    const successfulKillTree = vi.fn();
+    const retry = shutdownWindowsProcessTree(child, {
+      killTree: successfulKillTree,
+    });
+    child.emit("close", 0, null);
+
+    await retry;
+    expect(failedKillTree).toHaveBeenCalledTimes(1);
+    expect(successfulKillTree).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects when taskkill succeeds but the root never closes", async () => {
+    vi.useFakeTimers();
+    const child = createChildProcess();
+    const cleanup = shutdownWindowsProcessTree(child, {
+      killTree: vi.fn(),
+      timeoutMs: 100,
+    });
+    const rejection = expect(cleanup).rejects.toThrow(
+      "Could not prove process cleanup completed",
+    );
+
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
     vi.useRealTimers();
   });
 });

@@ -5,17 +5,25 @@ import {
 } from "node:child_process";
 import { createWriteStream, readFileSync, type WriteStream } from "node:fs";
 import { createServer } from "node:net";
-import type {
-  Agent,
-  AgentOutputSchema,
-  AgentResult,
-  AgentRunOptions,
-  TokenUsage,
+import {
+  isValidTokenCount,
+  type Agent,
+  type AgentOutputSchema,
+  type AgentResult,
+  type AgentRunOptions,
+  type TokenUsage,
 } from "./types.js";
 import { validateAgentOutput } from "./types.js";
 import { appendDebugLog, serializeError } from "../debug-log.js";
 import { parseAgentJson } from "./json-extract.js";
-import { shutdownChildProcess } from "./managed-process.js";
+import {
+  ChildProcessShutdownTracker,
+  IncompleteChildProcessShutdownError,
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+  shutdownWindowsProcessTree,
+  spawnManagedChildProcess,
+} from "./managed-process.js";
 
 interface RovoDevRequestUsageEvent {
   input_tokens?: number;
@@ -36,6 +44,7 @@ interface RovoDevDeps {
   killProcess?: typeof process.kill;
   platform?: NodeJS.Platform;
   spawn?: typeof spawn;
+  supervisedProcessGroup?: boolean;
 }
 
 interface RovoDevServer {
@@ -101,24 +110,6 @@ function shouldUseWindowsShell(
   }
 }
 
-function terminateRovoDevProcess(
-  child: ReturnType<typeof spawn>,
-  platform: NodeJS.Platform,
-): void {
-  if (platform === "win32" && child.pid) {
-    try {
-      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: the process may have already exited.
-    }
-    return;
-  }
-
-  child.kill("SIGTERM");
-}
-
 function getAvailablePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = createServer();
@@ -174,6 +165,7 @@ export class RovoDevAgent implements Agent {
   name = "rovodev";
 
   private bin: string;
+  private detached: boolean;
   private extraArgs?: string[];
   private schemaPath: string;
   private fetchFn: typeof fetch;
@@ -183,6 +175,7 @@ export class RovoDevAgent implements Agent {
   private spawnFn: typeof spawn;
   private server: RovoDevServer | null = null;
   private closingPromise: Promise<void> | null = null;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(schemaPath: string, deps: RovoDevDeps = {}) {
     this.bin = deps.bin ?? "acli";
@@ -192,6 +185,10 @@ export class RovoDevAgent implements Agent {
     this.getPortFn = deps.getPort ?? getAvailablePort;
     this.killProcessFn = deps.killProcess ?? process.kill.bind(process);
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.spawnFn = deps.spawn ?? spawn;
   }
 
@@ -203,6 +200,8 @@ export class RovoDevAgent implements Agent {
     const { onUsage, onMessage, signal, logPath } = options ?? {};
     const logStream = logPath ? createWriteStream(logPath) : null;
     const runController = new AbortController();
+    let runCompleted = false;
+    let runServer: RovoDevServer | null = null;
     let sessionId: string | null = null;
     const runStartedAt = Date.now();
 
@@ -226,6 +225,7 @@ export class RovoDevAgent implements Agent {
 
     try {
       const server = await this.ensureServer(cwd, runController.signal);
+      runServer = server;
       sessionId = await this.createSession(server, runController.signal);
       await this.setInlineSystemPrompt(server, sessionId, runController.signal);
       await this.setChatMessage(
@@ -249,6 +249,7 @@ export class RovoDevAgent implements Agent {
         inputTokens: result.usage.inputTokens,
         outputTokens: result.usage.outputTokens,
       });
+      runCompleted = true;
       return result;
     } catch (error) {
       if (runController.signal.aborted || isAbortError(error)) {
@@ -270,23 +271,37 @@ export class RovoDevAgent implements Agent {
     } finally {
       signal?.removeEventListener("abort", onAbort);
       logStream?.end();
-      if (this.server && sessionId) {
-        if (runController.signal.aborted) {
-          await this.cancelSession(this.server, sessionId);
+      if (runServer && sessionId) {
+        let mayDeleteSession = true;
+        if (!runCompleted || runController.signal.aborted) {
+          mayDeleteSession = await this.cancelSession(runServer, sessionId);
+          if (!mayDeleteSession) {
+            await this.shutdownServer();
+          }
         }
-        await this.deleteSession(this.server, sessionId);
+        if (mayDeleteSession) {
+          await this.deleteSession(runServer, sessionId);
+        }
       }
+      await this.shutdowns.waitForAll();
     }
   }
 
   async close(): Promise<void> {
     await this.shutdownServer();
+    await this.shutdowns.finalize();
+  }
+
+  getUnverifiedCleanupError() {
+    return this.shutdowns.getUnverifiedCleanupError();
   }
 
   private async ensureServer(
     cwd: string,
     signal?: AbortSignal,
   ): Promise<RovoDevServer> {
+    await this.shutdowns.waitForAll();
+
     if (this.server && !this.server.closed && this.server.cwd === cwd) {
       await this.server.readyPromise;
       return this.server;
@@ -297,8 +312,9 @@ export class RovoDevAgent implements Agent {
     }
 
     const port = await this.getPortFn();
-    const detached = this.platform !== "win32";
-    const child = this.spawnFn(
+    const detached = this.detached;
+    const child = spawnManagedChildProcess(
+      this.spawnFn,
       this.bin,
       [
         "rovodev",
@@ -314,6 +330,8 @@ export class RovoDevAgent implements Agent {
         stdio: ["ignore", "pipe", "pipe"],
         env: process.env,
       },
+      this.shutdowns,
+      this.platform,
     ) as unknown as ChildProcessWithoutNullStreams;
 
     const server: RovoDevServer = {
@@ -327,6 +345,13 @@ export class RovoDevAgent implements Agent {
       stdout: "",
       stderr: "",
     };
+    child.on("error", (error) => {
+      if (error instanceof IncompleteChildProcessShutdownError) {
+        void this.shutdowns
+          .start(() => Promise.reject(error))
+          .catch(() => undefined);
+      }
+    });
 
     const MAX_OUTPUT = 64 * 1024;
     child.stdout.on("data", (data: Buffer) => {
@@ -354,7 +379,20 @@ export class RovoDevAgent implements Agent {
         stdout: server.stdout.slice(-2048),
       });
       if (this.server === server) {
-        this.server = null;
+        if (server.detached) {
+          const clearClosedServer = () => {
+            if (this.server === server) {
+              this.server = null;
+            }
+          };
+          void this.shutdowns
+            .finalizeOwnedProcessGroup(server.child, server.detached, () =>
+              this.shutdownServerProcess(server),
+            )
+            .then(clearClosedServer, () => undefined);
+        } else {
+          this.server = null;
+        }
       }
     });
 
@@ -489,7 +527,7 @@ export class RovoDevAgent implements Agent {
   private async cancelSession(
     server: RovoDevServer,
     sessionId: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await this.request(server, "/v3/cancel", {
         method: "POST",
@@ -497,12 +535,13 @@ export class RovoDevAgent implements Agent {
         timeoutMs: 1_000,
       });
       appendDebugLog("rovodev:session:cancel", { sessionId });
+      return true;
     } catch (error) {
       appendDebugLog("rovodev:session:cancel-failed", {
         sessionId,
         error: serializeError(error),
       });
-      // Best effort only.
+      return false;
     }
   }
 
@@ -553,7 +592,10 @@ export class RovoDevAgent implements Agent {
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      tokensAvailable: false,
     };
+    let incompleteUsageObserved = false;
+    let usageEventCount = 0;
     let latestTextSegment = "";
     let currentTextParts: string[] = [];
     let currentTextIndexes = new Map<number, number>();
@@ -575,10 +617,24 @@ export class RovoDevAgent implements Agent {
     };
 
     const handleUsage = (event: RovoDevRequestUsageEvent) => {
-      usage.inputTokens += event.input_tokens ?? 0;
-      usage.outputTokens += event.output_tokens ?? 0;
-      usage.cacheReadTokens += event.cache_read_tokens ?? 0;
-      usage.cacheCreationTokens += event.cache_write_tokens ?? 0;
+      usageEventCount += 1;
+      const eventTokensAvailable =
+        isValidTokenCount(event.input_tokens) &&
+        isValidTokenCount(event.output_tokens);
+      incompleteUsageObserved ||= !eventTokensAvailable;
+      usage.inputTokens += isValidTokenCount(event.input_tokens)
+        ? event.input_tokens
+        : 0;
+      usage.outputTokens += isValidTokenCount(event.output_tokens)
+        ? event.output_tokens
+        : 0;
+      usage.cacheReadTokens += isValidTokenCount(event.cache_read_tokens)
+        ? event.cache_read_tokens
+        : 0;
+      usage.cacheCreationTokens += isValidTokenCount(event.cache_write_tokens)
+        ? event.cache_write_tokens
+        : 0;
+      usage.tokensAvailable = usageEventCount > 0 && !incompleteUsageObserved;
       onUsage?.({ ...usage });
     };
 
@@ -794,8 +850,25 @@ export class RovoDevAgent implements Agent {
   }
 
   private async shutdownServer(): Promise<void> {
-    if (!this.server || this.server.closed) {
-      this.server = null;
+    if (!this.server) {
+      return;
+    }
+
+    const server = this.server;
+    if (server.closed) {
+      try {
+        await this.shutdowns.finalizeOwnedProcessGroup(
+          server.child,
+          server.detached,
+          () => this.shutdownServerProcess(server),
+        );
+      } catch (error) {
+        this.shutdowns.acknowledgeFailure(error);
+        throw error;
+      }
+      if (this.server === server) {
+        this.server = null;
+      }
       return;
     }
 
@@ -804,7 +877,6 @@ export class RovoDevAgent implements Agent {
       return;
     }
 
-    const server = this.server;
     const shutdownStartedAt = Date.now();
     appendDebugLog("rovodev:shutdown", {
       cwd: server.cwd,
@@ -812,47 +884,47 @@ export class RovoDevAgent implements Agent {
       pid: server.child.pid,
     });
 
-    this.closingPromise =
-      this.platform === "win32"
-        ? new Promise<void>((resolve) => {
-            const handleClose = () => {
-              server.child.off("close", handleClose);
-              resolve();
-            };
-
-            server.child.on("close", handleClose);
-
-            try {
-              terminateRovoDevProcess(server.child, this.platform);
-            } catch {
-              server.child.off("close", handleClose);
-              resolve();
-              return;
-            }
-
-            setTimeout(() => {
-              server.child.off("close", handleClose);
-              resolve();
-            }, 100).unref?.();
-          })
-        : shutdownChildProcess(server.child, {
-            detached: server.detached,
-            killProcess: this.killProcessFn,
-            timeoutMs: 3_000,
+    const shutdown = this.shutdowns.start(() =>
+      this.shutdownServerProcess(server),
+    );
+    this.closingPromise = shutdown
+      .then(
+        () => {
+          if (this.server === server) {
+            this.server = null;
+          }
+          appendDebugLog("rovodev:shutdown:done", {
+            port: server.port,
+            elapsedMs: Date.now() - shutdownStartedAt,
           });
-
-    this.closingPromise = this.closingPromise.finally(() => {
-      if (this.server === server) {
-        this.server = null;
-      }
-      this.closingPromise = null;
-      appendDebugLog("rovodev:shutdown:done", {
-        port: server.port,
-        elapsedMs: Date.now() - shutdownStartedAt,
+        },
+        (error) => {
+          this.shutdowns.acknowledgeFailure(error);
+          appendDebugLog("rovodev:shutdown:failed", {
+            port: server.port,
+            elapsedMs: Date.now() - shutdownStartedAt,
+            error: serializeError(error),
+          });
+          throw error;
+        },
+      )
+      .finally(() => {
+        this.closingPromise = null;
       });
-    });
 
     await this.closingPromise;
+  }
+
+  private shutdownServerProcess(server: RovoDevServer): Promise<void> {
+    if (this.platform === "win32") {
+      return shutdownWindowsProcessTree(server.child);
+    }
+
+    return shutdownChildProcess(server.child, {
+      detached: server.detached,
+      killProcess: this.killProcessFn,
+      timeoutMs: 3_000,
+    });
   }
 
   private async requestJSON<T>(

@@ -3,9 +3,11 @@ import {
   createReadStream,
   createWriteStream,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
   rmdirSync,
   writeFileSync,
@@ -42,14 +44,20 @@ import {
 } from "./core/git.js";
 import {
   type RunInfo,
+  type RunRuntimeLimitOverrides,
   type RunSchemaOptions,
   setupRun,
   resumeRun,
+  persistRunEvidence,
   peekRunMetadata,
   getLastIterationNumber,
 } from "./core/run.js";
 import { readStdinText } from "./core/stdin.js";
 import { startSleepPrevention } from "./core/sleep.js";
+import {
+  getWorktreePreservationReason,
+  type WorktreePreservationReason,
+} from "./core/worktree-preservation.js";
 import { createAgent } from "./core/agents/factory.js";
 import { getDefaultTelemetry, initDefaultTelemetry } from "./core/telemetry.js";
 import {
@@ -58,6 +66,7 @@ import {
 } from "./core/commit-message.js";
 import { Orchestrator } from "./core/orchestrator.js";
 import { renderExitSummary } from "./core/exit-summary.js";
+import { writeConfiguredWorktreeReceipt } from "./core/worktree-receipt.js";
 import { MockOrchestrator } from "./mock-orchestrator.js";
 import { Renderer } from "./renderer.js";
 import { slugifyPrompt } from "./utils/slugify.js";
@@ -91,6 +100,15 @@ function parseNonNegativeInteger(value: string): number {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isSafeInteger(parsed)) {
     throw new InvalidArgumentError("must be a safe integer");
+  }
+
+  return parsed;
+}
+
+function parseNonNegativeNumber(value: string): number {
+  const parsed = Number(value);
+  if (value.trim() === "" || !Number.isFinite(parsed) || parsed < 0) {
+    throw new InvalidArgumentError("must be a non-negative finite number");
   }
 
   return parsed;
@@ -180,6 +198,7 @@ function redactDebugArgs(args: string[]): string[] {
 function buildSchemaOptions(
   stopWhen: string | undefined,
   commitMessage: CommitMessageConfig | undefined,
+  runtimeLimits?: RunRuntimeLimitOverrides,
 ): RunSchemaOptions {
   const commitFields = getCommitMessageSchemaFields(commitMessage);
   return {
@@ -187,12 +206,14 @@ function buildSchemaOptions(
     ...(stopWhen === undefined ? {} : { stopWhen }),
     ...(commitMessage === undefined ? {} : { commitMessage }),
     ...(commitFields.length === 0 ? {} : { commitFields }),
+    ...(runtimeLimits === undefined ? {} : { runtimeLimits }),
   };
 }
 
 function buildResumeSchemaOptions(
   stopWhen: string | undefined,
   commitMessage: CommitMessageConfig | undefined,
+  runtimeLimits?: RunRuntimeLimitOverrides,
 ): RunSchemaOptions {
   const commitFields = getCommitMessageSchemaFields(commitMessage);
   if (stopWhen === "") {
@@ -201,9 +222,10 @@ function buildResumeSchemaOptions(
       clearStopWhen: true,
       ...(commitMessage === undefined ? {} : { commitMessage }),
       ...(commitFields.length === 0 ? {} : { commitFields }),
+      ...(runtimeLimits === undefined ? {} : { runtimeLimits }),
     };
   }
-  return buildSchemaOptions(stopWhen, commitMessage);
+  return buildSchemaOptions(stopWhen, commitMessage, runtimeLimits);
 }
 
 function initializeNewBranch(
@@ -286,7 +308,85 @@ interface WorktreeRunResult {
   runInfo: RunInfo;
   worktreePath: string;
   effectiveCwd: string;
+  receiptId?: string;
+  receiptRunId?: string;
   resumed: boolean;
+}
+
+function setupFailureRecordPath(worktreePath: string, runId: string): string {
+  return join(worktreePath, ".gnhf", "setup-failures", `${runId}.json`);
+}
+
+function archiveSetupFailureRecord(
+  worktreePath: string,
+  runInfo: RunInfo,
+): void {
+  const recordPath = setupFailureRecordPath(worktreePath, runInfo.runId);
+  if (!existsSync(recordPath)) {
+    return;
+  }
+
+  for (let suffix = 0; suffix < 100; suffix += 1) {
+    const filename =
+      suffix === 0 ? "setup-failure.json" : `setup-failure-${suffix}.json`;
+    const archivePath = join(runInfo.runDir, filename);
+    if (existsSync(archivePath)) {
+      continue;
+    }
+    renameSync(recordPath, archivePath);
+    return;
+  }
+
+  throw new Error(`Unable to archive setup failure for ${runInfo.runId}`);
+}
+
+function preserveWorktreeAfterSetupFailure(
+  worktreePath: string,
+  runId: string,
+  error: unknown,
+): void {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const recordPath = setupFailureRecordPath(worktreePath, runId);
+  let recordError: string | null = null;
+  try {
+    mkdirSync(dirname(recordPath), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      recordPath,
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          worktreePath,
+          reason: "setup-failed",
+          error: errorMessage,
+          recordedAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      )}\n`,
+      { encoding: "utf-8", mode: 0o600 },
+    );
+  } catch (recordFailure) {
+    recordError =
+      recordFailure instanceof Error
+        ? recordFailure.message
+        : String(recordFailure);
+  }
+
+  appendDebugLog("worktree:preserved", {
+    worktreePath,
+    reason: "setup-failed",
+    error: serializeError(error),
+    recordPath,
+    recordError,
+  });
+  console.error(
+    `\n  gnhf: worktree preserved at ${worktreePath}` +
+      `\n  gnhf: run metadata setup failed: ${errorMessage}` +
+      `\n  gnhf: preservation record: ${
+        recordError === null ? recordPath : `unavailable (${recordError})`
+      }` +
+      `\n  gnhf: remove only after review with: git worktree remove "${worktreePath}"\n`,
+  );
 }
 
 function initializeWorktreeRun(
@@ -319,42 +419,65 @@ function initializeWorktreeRun(
       return null;
     }
 
-    let worktreeBranch: string;
-    try {
-      worktreeBranch = getCurrentBranch(candidateWorktreePath);
-    } catch (error) {
-      throw new Error(
-        `Preserved worktree at ${candidateWorktreePath} is in an unexpected state ` +
-          `(${error instanceof Error ? error.message : String(error)}). ` +
-          `Fix the worktree manually or remove it with ` +
-          `"git worktree remove ${candidateWorktreePath}" before re-running.`,
-      );
-    }
-    if (worktreeBranch !== candidateBranchName) {
-      throw new Error(
-        `Preserved worktree at ${candidateWorktreePath} is on branch ` +
-          `"${worktreeBranch}" rather than "${candidateBranchName}". ` +
-          `Restore it to "${candidateBranchName}" with "git -C ${candidateWorktreePath} ` +
-          `checkout ${candidateBranchName}", or remove the worktree with ` +
-          `"git worktree remove ${candidateWorktreePath}" to start fresh.`,
-      );
-    }
-    const runInfo = resumeRun(
-      candidateRunId,
-      candidateWorktreePath,
-      resumeSchemaOptions,
-    );
-    return {
-      runInfo,
+    const receiptId = writeConfiguredWorktreeReceipt({
+      runId: candidateRunId,
+      state: "created",
       worktreePath: candidateWorktreePath,
-      effectiveCwd: candidateWorktreePath,
-      resumed: true,
-    };
+    });
+    try {
+      let worktreeBranch: string;
+      try {
+        worktreeBranch = getCurrentBranch(candidateWorktreePath);
+      } catch (error) {
+        throw new Error(
+          `Preserved worktree at ${candidateWorktreePath} is in an unexpected state ` +
+            `(${error instanceof Error ? error.message : String(error)}). ` +
+            `Fix the worktree manually or remove it with ` +
+            `"git worktree remove ${candidateWorktreePath}" before re-running.`,
+        );
+      }
+      if (worktreeBranch !== candidateBranchName) {
+        throw new Error(
+          `Preserved worktree at ${candidateWorktreePath} is on branch ` +
+            `"${worktreeBranch}" rather than "${candidateBranchName}". ` +
+            `Restore it to "${candidateBranchName}" with "git -C ${candidateWorktreePath} ` +
+            `checkout ${candidateBranchName}", or remove the worktree with ` +
+            `"git worktree remove ${candidateWorktreePath}" to start fresh.`,
+        );
+      }
+      const runInfo = resumeRun(
+        candidateRunId,
+        candidateWorktreePath,
+        resumeSchemaOptions,
+      );
+      archiveSetupFailureRecord(candidateWorktreePath, runInfo);
+      return {
+        runInfo,
+        worktreePath: candidateWorktreePath,
+        effectiveCwd: candidateWorktreePath,
+        ...(receiptId === undefined ? {} : { receiptId }),
+        ...(receiptId === undefined ? {} : { receiptRunId: candidateRunId }),
+        resumed: true,
+      };
+    } catch (error) {
+      if (receiptId !== undefined) {
+        writeConfiguredWorktreeReceipt({
+          runId: candidateRunId,
+          receiptId,
+          state: "shutdown",
+          disposition: "preserved",
+          preservationReason: "setup-failed",
+          worktreePath: candidateWorktreePath,
+        });
+      }
+      throw error;
+    }
   };
 
   let createdBranchName = branchName;
   let createdRunId = runId;
   let createdWorktreePath = worktreePath;
+  let worktreeReceiptId: string | undefined;
   for (let suffix = 0; suffix < 100; suffix += 1) {
     const candidateBranchName = branchNameWithSuffix(branchName, suffix);
     const candidateRunId = candidateBranchName.split("/")[1]!;
@@ -376,27 +499,97 @@ function initializeWorktreeRun(
       createdWorktreePath,
     );
     if (resumed) return resumed;
+    worktreeReceiptId = writeConfiguredWorktreeReceipt({
+      runId: createdRunId,
+      baseCommit,
+      ...(worktreeReceiptId === undefined
+        ? {}
+        : { receiptId: worktreeReceiptId }),
+      state: "pending",
+      worktreePath: createdWorktreePath,
+    });
     try {
       createWorktree(repoRoot, createdWorktreePath, createdBranchName);
-      break;
     } catch (error) {
-      if (!isCollisionError(error)) throw error;
+      if (!isCollisionError(error)) {
+        if (worktreeReceiptId !== undefined) {
+          const worktreeWasCreated = existsSync(createdWorktreePath);
+          writeConfiguredWorktreeReceipt({
+            runId: createdRunId,
+            baseCommit,
+            receiptId: worktreeReceiptId,
+            state: "shutdown",
+            disposition: worktreeWasCreated ? "preserved" : "removed",
+            ...(worktreeWasCreated
+              ? { preservationReason: "setup-failed" }
+              : {}),
+            worktreePath: createdWorktreePath,
+          });
+        }
+        throw error;
+      }
       if (suffix === 99) {
+        if (worktreeReceiptId !== undefined) {
+          const worktreeWasPreserved = existsSync(createdWorktreePath);
+          writeConfiguredWorktreeReceipt({
+            runId: createdRunId,
+            baseCommit,
+            receiptId: worktreeReceiptId,
+            state: "shutdown",
+            disposition: worktreeWasPreserved ? "preserved" : "removed",
+            ...(worktreeWasPreserved
+              ? { preservationReason: "uncertain" }
+              : {}),
+            worktreePath: createdWorktreePath,
+          });
+        }
         throw new Error(`Unable to create a unique worktree for ${branchName}`);
       }
+      continue;
     }
+    writeConfiguredWorktreeReceipt({
+      runId: createdRunId,
+      baseCommit,
+      ...(worktreeReceiptId === undefined
+        ? {}
+        : { receiptId: worktreeReceiptId }),
+      state: "created",
+      worktreePath: createdWorktreePath,
+    });
+    break;
   }
-  const runInfo = setupRun(
-    createdRunId,
-    prompt,
-    baseCommit,
-    createdWorktreePath,
-    schemaOptions,
-  );
+  let runInfo: RunInfo;
+  try {
+    runInfo = setupRun(
+      createdRunId,
+      prompt,
+      baseCommit,
+      createdWorktreePath,
+      schemaOptions,
+    );
+  } catch (error) {
+    preserveWorktreeAfterSetupFailure(createdWorktreePath, createdRunId, error);
+    if (worktreeReceiptId !== undefined) {
+      writeConfiguredWorktreeReceipt({
+        runId: createdRunId,
+        baseCommit,
+        receiptId: worktreeReceiptId,
+        state: "shutdown",
+        disposition: "preserved",
+        preservationReason: "setup-failed",
+        worktreePath: createdWorktreePath,
+      });
+    }
+    throw error;
+  }
   return {
     runInfo,
     worktreePath: createdWorktreePath,
     effectiveCwd: createdWorktreePath,
+    ...(worktreeReceiptId === undefined
+      ? {}
+      : { receiptId: worktreeReceiptId }),
+    ...(worktreeReceiptId === undefined ? {} : { receiptRunId: createdRunId }),
     resumed: false,
   };
 }
@@ -562,13 +755,25 @@ program
   )
   .option(
     "--max-iterations <n>",
-    "Abort after N total iterations",
+    "Abort after N total iterations; persists for this run",
     parseNonNegativeInteger,
   )
+  .option("--clear-max-iterations", "Clear the persisted iteration cap", false)
   .option(
     "--max-tokens <n>",
-    "Abort after N total input+output tokens",
+    "Abort when the complete provider-reported token total reaches N; persists for this run",
     parseNonNegativeInteger,
+  )
+  .option("--clear-max-tokens", "Clear the persisted token cap", false)
+  .option(
+    "--max-reported-cost-usd <amount>",
+    "Abort after the harness reports this total cost in USD; persists for this run",
+    parseNonNegativeNumber,
+  )
+  .option(
+    "--clear-max-reported-cost-usd",
+    "Clear the persisted reported-cost cap",
+    false,
   )
   .option(
     "--stop-when <condition>",
@@ -585,15 +790,16 @@ program
     false,
   )
   .option(
+    "--preserve-worktree",
+    "Keep the generated worktree after every exit path (requires --worktree)",
+    false,
+  )
+  .option(
     "--current-branch",
     "Run on the current branch instead of creating a gnhf branch",
     false,
   )
-  .option(
-    "--push",
-    "Push the current branch after each successful iteration",
-    false,
-  )
+  .option("--push", "Disabled; gnhf never pushes user work", false)
   .option(
     "--meteor-frequency <n>",
     "Meteor frequency from 0 to 5 (0 disables, 3 is default)",
@@ -608,9 +814,14 @@ program
         agent?: string;
         maxIterations?: number;
         maxTokens?: number;
+        maxReportedCostUsd?: number;
+        clearMaxIterations: boolean;
+        clearMaxTokens: boolean;
+        clearMaxReportedCostUsd: boolean;
         stopWhen?: string;
         preventSleep?: boolean;
         worktree: boolean;
+        preserveWorktree: boolean;
         currentBranch: boolean;
         push: boolean;
         meteorFrequency: number;
@@ -691,10 +902,107 @@ program
         promptFromStdin = true;
       }
 
+      const sleepPreventionState: {
+        cleanup: (() => Promise<void>) | null;
+        started: boolean;
+      } = {
+        cleanup: null,
+        started: false,
+      };
+      const startConfiguredSleepPrevention = async () => {
+        if (sleepPreventionState.started || !config.preventSleep) {
+          return;
+        }
+        sleepPreventionState.started = true;
+
+        const persistedPrompt =
+          promptFromStdin && prompt !== undefined
+            ? persistStdinPromptForReexec(prompt)
+            : null;
+        let reexeced = false;
+        try {
+          const sleepPrevention =
+            initialSleepPrevention ??
+            (await startSleepPrevention(process.argv.slice(2), {
+              reexecEnv: persistedPrompt
+                ? {
+                    [GNHF_REEXEC_STDIN_PROMPT_FILE]: persistedPrompt.path,
+                  }
+                : undefined,
+            }));
+          if (sleepPrevention.type === "reexeced") {
+            reexeced = true;
+            process.exit(sleepPrevention.exitCode);
+          }
+          if (sleepPrevention.type === "active") {
+            sleepPreventionState.cleanup = sleepPrevention.cleanup;
+          }
+        } finally {
+          if (!reexeced) {
+            persistedPrompt?.cleanup();
+          }
+        }
+      };
+
       const cwd = process.cwd();
       let effectiveCwd = cwd;
       let worktreePath: string | null = null;
-      let worktreeCleanup: (() => void) | null = null;
+      let worktreeReceiptId: string | undefined;
+      let worktreeReceiptRunId: string | undefined;
+      let worktreeReceiptBaseCommit: string | undefined;
+      let worktreeReceiptFinalized = false;
+      let worktreeCleanup: (() => boolean) | null = null;
+      let worktreePreservationReason:
+        | WorktreePreservationReason
+        | "requested"
+        | null = null;
+      let worktreePreservationNoticeEmitted = false;
+      let readPendingWorkspaceRecovery = () => false;
+      let forceShutdownRequested = false;
+      const publishWorktreeShutdownReceipt = (
+        disposition: "preserved" | "removed",
+        preservationReason?: string,
+      ) => {
+        if (
+          worktreeReceiptId === undefined ||
+          worktreeReceiptRunId === undefined ||
+          worktreePath === null ||
+          worktreeReceiptFinalized
+        ) {
+          return;
+        }
+        writeConfiguredWorktreeReceipt({
+          runId: worktreeReceiptRunId,
+          ...(worktreeReceiptBaseCommit === undefined
+            ? {}
+            : { baseCommit: worktreeReceiptBaseCommit }),
+          receiptId: worktreeReceiptId,
+          state: "shutdown",
+          disposition,
+          ...(preservationReason === undefined ? {} : { preservationReason }),
+          worktreePath,
+        });
+        worktreeReceiptFinalized = true;
+      };
+      const preserveWorktree = (
+        preservationReason: WorktreePreservationReason | "requested",
+      ) => {
+        if (worktreePath === null || worktreePreservationNoticeEmitted) {
+          return;
+        }
+        worktreeCleanup = null;
+        worktreePreservationReason = preservationReason;
+        publishWorktreeShutdownReceipt("preserved", preservationReason);
+        worktreePreservationNoticeEmitted = true;
+        appendDebugLog("worktree:preserved", {
+          worktreePath,
+          reason: preservationReason,
+        });
+        console.error(
+          `\n  gnhf: worktree preserved at ${worktreePath}` +
+            `\n  gnhf: merge the branch and remove with: git worktree remove "${worktreePath}"\n`,
+        );
+      };
 
       const currentBranch = getCurrentBranch(cwd);
       const onGnhfBranch = currentBranch.startsWith("gnhf/");
@@ -703,6 +1011,53 @@ program
         console.error("Cannot combine --current-branch and --worktree.");
         process.exit(1);
       }
+      if (options.preserveWorktree && !options.worktree) {
+        console.error("Cannot use --preserve-worktree without --worktree.");
+        process.exit(1);
+      }
+      if (options.push) {
+        console.error("--push is disabled; gnhf never pushes user work.");
+        process.exit(1);
+      }
+
+      for (const [value, clear, label] of [
+        [options.maxIterations, options.clearMaxIterations, "max iterations"],
+        [options.maxTokens, options.clearMaxTokens, "max tokens"],
+        [
+          options.maxReportedCostUsd,
+          options.clearMaxReportedCostUsd,
+          "max reported cost",
+        ],
+      ] as const) {
+        if (value !== undefined && clear) {
+          console.error(
+            `Cannot set and clear ${label} in the same invocation.`,
+          );
+          process.exit(1);
+        }
+      }
+
+      const parsedRuntimeLimitOverrides: RunRuntimeLimitOverrides = {
+        ...(options.clearMaxIterations
+          ? { maxIterations: null }
+          : options.maxIterations === undefined
+            ? {}
+            : { maxIterations: options.maxIterations }),
+        ...(options.clearMaxTokens
+          ? { maxTokens: null }
+          : options.maxTokens === undefined
+            ? {}
+            : { maxTokens: options.maxTokens }),
+        ...(options.clearMaxReportedCostUsd
+          ? { maxReportedCostUsd: null }
+          : options.maxReportedCostUsd === undefined
+            ? {}
+            : { maxReportedCostUsd: options.maxReportedCostUsd }),
+      };
+      const runtimeLimitOverrides =
+        Object.keys(parsedRuntimeLimitOverrides).length === 0
+          ? undefined
+          : parsedRuntimeLimitOverrides;
 
       const cliStopWhen =
         options.stopWhen === "" ? undefined : options.stopWhen;
@@ -711,9 +1066,10 @@ program
       let schemaOptions = buildSchemaOptions(
         effectiveStopWhen,
         effectiveCommitMessage,
+        runtimeLimitOverrides,
       );
 
-      let runInfo;
+      let runInfo: RunInfo;
       let startIteration = 0;
 
       if (options.worktree) {
@@ -729,37 +1085,64 @@ program
           process.exit(1);
         }
 
+        await startConfiguredSleepPrevention();
+
         const wt = initializeWorktreeRun(
           prompt,
           cwd,
           schemaOptions,
-          buildResumeSchemaOptions(options.stopWhen, effectiveCommitMessage),
+          buildResumeSchemaOptions(
+            options.stopWhen,
+            effectiveCommitMessage,
+            runtimeLimitOverrides,
+          ),
         );
         runInfo = wt.runInfo;
         effectiveCwd = wt.effectiveCwd;
         worktreePath = wt.worktreePath;
+        worktreeReceiptId = wt.receiptId;
+        worktreeReceiptRunId = wt.receiptRunId;
+        worktreeReceiptBaseCommit = runInfo.baseCommit;
+
+        if (options.preserveWorktree) {
+          worktreePreservationReason = "requested";
+        }
+
+        if (worktreePreservationReason !== null) {
+          const exitPreservationReason = worktreePreservationReason;
+          process.on("exit", () => {
+            preserveWorktree(exitPreservationReason);
+          });
+        }
 
         if (wt.resumed) {
-          // Preserved worktree is always kept on exit regardless of this
-          // invocation's commit count; previous commits are already there.
           effectiveStopWhen = runInfo.stopWhen;
           effectiveCommitMessage = runInfo.commitMessage;
           schemaOptions = buildSchemaOptions(
             effectiveStopWhen,
             effectiveCommitMessage,
+            runtimeLimitOverrides,
           );
           startIteration = getLastIterationNumber(runInfo);
           console.error(
             `\n  gnhf: resuming preserved worktree at ${worktreePath}` +
               `\n  gnhf: continuing run ${runInfo.runId} from iteration ${startIteration}\n`,
           );
-        } else {
+        }
+
+        if (!options.preserveWorktree) {
           worktreeCleanup = () => {
             try {
+              runInfo = persistRunEvidence(runInfo, getRepoRootDir(cwd));
+              initDebugLog(runInfo.logPath);
               removeWorktree(cwd, wt.worktreePath);
             } catch {
-              // Best-effort cleanup
+              preserveWorktree("uncertain");
+              return false;
             }
+            worktreeCleanup = null;
+            publishWorktreeShutdownReceipt("removed");
+            return true;
           };
 
           // Ensure worktree cleanup runs even if die() or process.exit() is
@@ -767,9 +1150,20 @@ program
           // crash to .catch to die to process.exit(1)).
           const exitCleanup = worktreeCleanup;
           process.on("exit", () => {
-            if (worktreeCleanup === exitCleanup) {
-              exitCleanup();
+            if (worktreeCleanup !== exitCleanup) {
+              return;
             }
+            const preservationReason = getWorktreePreservationReason(
+              runInfo.baseCommit,
+              wt.worktreePath,
+              readPendingWorkspaceRecovery(),
+              forceShutdownRequested,
+            );
+            if (preservationReason !== null) {
+              preserveWorktree(preservationReason);
+              return;
+            }
+            exitCleanup();
           });
         }
       } else if (options.currentBranch) {
@@ -781,7 +1175,11 @@ program
         const existing = resumeCurrentBranchRun(
           prompt,
           cwd,
-          buildResumeSchemaOptions(options.stopWhen, effectiveCommitMessage),
+          buildResumeSchemaOptions(
+            options.stopWhen,
+            effectiveCommitMessage,
+            runtimeLimitOverrides,
+          ),
         );
 
         if (existing) {
@@ -791,6 +1189,7 @@ program
           schemaOptions = buildSchemaOptions(
             effectiveStopWhen,
             effectiveCommitMessage,
+            runtimeLimitOverrides,
           );
           startIteration = getLastIterationNumber(existing);
         } else {
@@ -812,12 +1211,14 @@ program
             buildResumeSchemaOptions(
               options.stopWhen,
               existingMetadata.commitMessage,
+              runtimeLimitOverrides,
             ),
           );
           const resumeStopWhen = existing.stopWhen;
           const resumeSchemaOptions = buildSchemaOptions(
             resumeStopWhen,
             existing.commitMessage,
+            runtimeLimitOverrides,
           );
           prompt = existingPrompt;
           runInfo = existing;
@@ -844,12 +1245,14 @@ program
               buildResumeSchemaOptions(
                 options.stopWhen,
                 existingMetadata.commitMessage,
+                runtimeLimitOverrides,
               ),
             );
             const resumeStopWhen = existing.stopWhen;
             const resumeSchemaOptions = buildSchemaOptions(
               resumeStopWhen,
               existing.commitMessage,
+              runtimeLimitOverrides,
             );
             runInfo = setupRun(
               existingRunId,
@@ -868,6 +1271,7 @@ program
             schemaOptions = buildSchemaOptions(
               effectiveStopWhen,
               effectiveCommitMessage,
+              runtimeLimitOverrides,
             );
             runInfo = initializeNewBranch(prompt, cwd, schemaOptions);
           } else {
@@ -883,36 +1287,7 @@ program
         runInfo = initializeNewBranch(prompt, cwd, schemaOptions);
       }
 
-      let sleepPreventionCleanup: (() => Promise<void>) | null = null;
-      if (config.preventSleep) {
-        const persistedPrompt =
-          promptFromStdin && prompt !== undefined
-            ? persistStdinPromptForReexec(prompt)
-            : null;
-        let reexeced = false;
-        try {
-          const sleepPrevention =
-            initialSleepPrevention ??
-            (await startSleepPrevention(process.argv.slice(2), {
-              reexecEnv: persistedPrompt
-                ? {
-                    [GNHF_REEXEC_STDIN_PROMPT_FILE]: persistedPrompt.path,
-                  }
-                : undefined,
-            }));
-          if (sleepPrevention.type === "reexeced") {
-            reexeced = true;
-            process.exit(sleepPrevention.exitCode);
-          }
-          if (sleepPrevention.type === "active") {
-            sleepPreventionCleanup = sleepPrevention.cleanup;
-          }
-        } finally {
-          if (!reexeced) {
-            persistedPrompt?.cleanup();
-          }
-        }
-      }
+      await startConfiguredSleepPrevention();
 
       const runMode: "new" | "resume" | "worktree" | "current-branch" =
         options.worktree
@@ -938,8 +1313,9 @@ program
         promptLength: prompt.length,
         promptFromStdin,
         startIteration,
-        maxIterations: options.maxIterations,
-        maxTokens: options.maxTokens,
+        maxIterations: runInfo.runtimeLimits.maxIterations,
+        maxTokens: runInfo.runtimeLimits.maxTokens,
+        maxReportedCostUsd: runInfo.runtimeLimits.maxReportedCostUsd,
         stopWhen: effectiveStopWhen,
         commitMessage: effectiveCommitMessage,
         preventSleep: config.preventSleep,
@@ -962,7 +1338,7 @@ program
         nativeAgent ? config.agentPathOverride[nativeAgent] : undefined,
         nativeAgent ? config.agentArgsOverride?.[nativeAgent] : undefined,
         {
-          ...schemaOptions,
+          ...buildSchemaOptions(effectiveStopWhen, effectiveCommitMessage),
           acpRegistryOverrides: config.acpRegistryOverrides,
         },
       );
@@ -974,14 +1350,20 @@ program
         effectiveCwd,
         startIteration,
         {
-          maxIterations: options.maxIterations,
-          maxTokens: options.maxTokens,
+          maxIterations: runInfo.runtimeLimits.maxIterations,
+          maxTokens: runInfo.runtimeLimits.maxTokens,
+          ...(runInfo.runtimeLimits.maxReportedCostUsd !== undefined
+            ? {
+                maxReportedCostUsd: runInfo.runtimeLimits.maxReportedCostUsd,
+              }
+            : {}),
           stopWhen: effectiveStopWhen,
-          ...(options.push ? { push: true } : {}),
+          ...(options.worktree ? { preserveWorkspaceOnForceStop: true } : {}),
         },
       );
+      readPendingWorkspaceRecovery = () =>
+        orchestrator.getState().hasPendingWorkspaceRecovery === true;
       let shutdownSignal: NodeJS.Signals | null = null;
-      let forceShutdownRequested = false;
 
       const requestForceShutdown = (signal: NodeJS.Signals) => {
         if (forceShutdownRequested) return;
@@ -1065,12 +1447,18 @@ program
           console.error(
             `\n  gnhf: shutdown timed out after ${FORCE_EXIT_TIMEOUT_MS / 1000}s, forcing exit\n`,
           );
+          if (worktreePath !== null) {
+            preserveWorktree(
+              worktreePreservationReason ??
+                (forceShutdownRequested ? "forced-shutdown" : "uncertain"),
+            );
+          }
           process.exit(getSignalExitCode(shutdownSignal ?? "SIGINT"));
         }
       } finally {
         process.off("SIGINT", handleSigInt);
         process.off("SIGTERM", handleSigTerm);
-        await sleepPreventionCleanup?.();
+        await sleepPreventionState.cleanup?.();
       }
 
       {
@@ -1093,6 +1481,28 @@ program
           });
         }
 
+        if (worktreePath) {
+          const preservationReason =
+            worktreePreservationReason ??
+            getWorktreePreservationReason(
+              runInfo.baseCommit,
+              worktreePath,
+              finalState.hasPendingWorkspaceRecovery === true,
+              forceShutdownRequested,
+            );
+          if (preservationReason !== null) {
+            preserveWorktree(preservationReason);
+          } else {
+            const cleanedUp = worktreeCleanup?.() === true;
+            worktreeCleanup = null;
+            if (cleanedUp) {
+              appendDebugLog("worktree:cleaned-up", {
+                worktreePath,
+              });
+            }
+          }
+        }
+
         const exitSummary = renderExitSummary({
           agentName: redactAgentSpecForLogs(config.agent),
           branchName: finalBranchName,
@@ -1104,6 +1514,7 @@ program
           failCount: finalState.failCount,
           totalInputTokens: finalState.totalInputTokens,
           totalOutputTokens: finalState.totalOutputTokens,
+          tokensAvailable: finalState.tokensAvailable,
           tokensEstimated: finalState.tokensEstimated,
           commitCount: finalState.commitCount,
           notesPath: runInfo.notesPath,
@@ -1121,8 +1532,16 @@ program
           iterations: finalState.currentIteration,
           successCount: finalState.successCount,
           failCount: finalState.failCount,
-          totalInputTokens: finalState.totalInputTokens,
-          totalOutputTokens: finalState.totalOutputTokens,
+          totalInputTokens:
+            finalState.tokensAvailable === false
+              ? null
+              : finalState.totalInputTokens,
+          totalOutputTokens:
+            finalState.tokensAvailable === false
+              ? null
+              : finalState.totalOutputTokens,
+          tokensAvailable: finalState.tokensAvailable !== false,
+          reportedCostUsd: finalState.reportedCostUsd,
           commitCount: finalState.commitCount,
           worktreePath,
         });
@@ -1136,11 +1555,17 @@ program
           success_count: finalState.successCount,
           fail_count: finalState.failCount,
           commit_count: finalState.commitCount,
-          total_input_tokens: finalState.totalInputTokens,
-          total_output_tokens: finalState.totalOutputTokens,
+          total_input_tokens:
+            finalState.tokensAvailable === false
+              ? null
+              : finalState.totalInputTokens,
+          total_output_tokens:
+            finalState.tokensAvailable === false
+              ? null
+              : finalState.totalOutputTokens,
+          tokens_available: finalState.tokensAvailable !== false,
           duration_ms: Date.now() - runStartedAt,
           prevent_sleep: config.preventSleep === true,
-          push_each_iteration: options.push === true,
           commit_message_preset: effectiveCommitMessage?.preset ?? "default",
           stop_when_set: effectiveStopWhen !== undefined,
         });
@@ -1148,25 +1573,6 @@ program
 
         if (finalState.status === "aborted") {
           console.error(`\n  gnhf: Run log: ${runInfo.logPath}\n`);
-        }
-
-        if (worktreePath) {
-          if (
-            finalState.commitCount > 0 ||
-            finalState.hasPendingCommitFailure
-          ) {
-            worktreeCleanup = null;
-            console.error(
-              `\n  gnhf: worktree preserved at ${worktreePath}` +
-                `\n  gnhf: merge the branch and remove with: git worktree remove "${worktreePath}"\n`,
-            );
-          } else {
-            worktreeCleanup?.();
-            worktreeCleanup = null;
-            appendDebugLog("worktree:cleaned-up", {
-              worktreePath,
-            });
-          }
         }
 
         process.stdout.write(exitSummary);
