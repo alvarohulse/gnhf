@@ -220,6 +220,7 @@ export interface AgentRunOptions {
 export interface Agent {
   name: string;
   close?(): Promise<void> | void;
+  getUnverifiedCleanupError?(): UnverifiedAgentCleanupError | null;
   run(
     prompt: string,
     cwd: string,

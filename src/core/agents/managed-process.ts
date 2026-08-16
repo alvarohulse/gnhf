@@ -290,6 +290,10 @@ export class ChildProcessShutdownTracker {
     this.unverifiedCleanup ??= error;
   }
 
+  getUnverifiedCleanupError(): UnverifiedAgentCleanupError | null {
+    return this.unverifiedCleanup;
+  }
+
   async finalize(): Promise<void> {
     await this.waitForAll();
     if (this.unverifiedCleanup !== null) {

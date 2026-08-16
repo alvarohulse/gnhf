@@ -267,4 +267,8 @@ export class CodexAgent implements Agent {
     }
     await this.shutdowns.finalize();
   }
+
+  getUnverifiedCleanupError() {
+    return this.shutdowns.getUnverifiedCleanupError();
+  }
 }

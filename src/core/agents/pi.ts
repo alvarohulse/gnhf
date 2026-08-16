@@ -441,11 +441,7 @@ export class PiAgent implements Agent {
           currentStreamingMessageKey = null;
         }
 
-        if (
-          event.type === "agent_end" &&
-          Array.isArray(event.messages) &&
-          !latestAssistantMessage
-        ) {
+        if (event.type === "agent_end" && Array.isArray(event.messages)) {
           for (const message of event.messages) {
             if (roleOf(message) === "assistant") {
               rememberAssistantMessage(message, false, true);
@@ -511,5 +507,9 @@ export class PiAgent implements Agent {
       );
     }
     await this.shutdowns.finalize();
+  }
+
+  getUnverifiedCleanupError() {
+    return this.shutdowns.getUnverifiedCleanupError();
   }
 }

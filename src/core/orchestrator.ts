@@ -238,7 +238,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         this.pendingWorkspaceRecovery?.kind === "commit-failure",
       hasPendingWorkspaceRecovery:
         this.pendingWorkspaceRecovery !== null ||
-        this.activeWorkspaceRecoveryMarker,
+        this.activeWorkspaceRecoveryMarker ||
+        this.unsafeShutdownDetected,
     };
   }
 
@@ -645,6 +646,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         signal: this.activeAbortController.signal,
         logPath,
       });
+      this.observeUnverifiedAgentCleanup();
 
       if (this.pendingAbortReason !== null && pendingAbortUsage !== null) {
         const terminalTokensCanCorrectAbort = isAuthoritativeTokenUsage(
@@ -716,6 +718,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         shouldFullyStop,
       };
     } catch (err) {
+      this.observeUnverifiedAgentCleanup();
       const elapsedMs = Date.now() - agentStartedAt;
       if (err instanceof IncompleteAgentShutdownError) {
         this.preserveWorkspaceAfterUnsafeShutdown(err);
@@ -1138,8 +1141,18 @@ ${recovery.detail}
   }
 
   private resetWorkspace(): void {
+    if (this.unsafeShutdownDetected) {
+      return;
+    }
     resetHard(this.cwd);
     this.clearWorkspaceRecovery();
+  }
+
+  private observeUnverifiedAgentCleanup(): void {
+    const error = this.agent.getUnverifiedCleanupError?.();
+    if (error !== undefined && error !== null) {
+      this.unsafeShutdownDetected = true;
+    }
   }
 
   private getPreIterationAbortReason(): string | null {

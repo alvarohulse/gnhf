@@ -539,6 +539,10 @@ export class OpenCodeAgent implements Agent {
     await this.shutdowns.finalize();
   }
 
+  getUnverifiedCleanupError() {
+    return this.shutdowns.getUnverifiedCleanupError();
+  }
+
   private async ensureServer(
     cwd: string,
     signal?: AbortSignal,
