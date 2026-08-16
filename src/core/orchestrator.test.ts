@@ -2804,6 +2804,50 @@ describe("Orchestrator backoff behavior", () => {
     });
   });
 
+  it("routes the next iteration through recovery after unverified cleanup", async () => {
+    const cleanupError = new UnverifiedAgentCleanupError(
+      "descendant cleanup was not verified",
+    );
+    const run = vi
+      .fn<Agent["run"]>()
+      .mockResolvedValueOnce({
+        ...createSuccessResult(),
+        output: {
+          success: false,
+          summary: "could not finish",
+          key_changes_made: [],
+          key_learnings: ["provider stopped"],
+        },
+      })
+      .mockResolvedValueOnce(createSuccessResult());
+    const agent: Agent = {
+      name: "claude",
+      run,
+      getUnverifiedCleanupError: vi.fn(() => cleanupError),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 2 },
+    );
+
+    await orchestrator.start();
+
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1]?.[0]).toContain(
+      "## Interrupted Workspace Recovery",
+    );
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "interrupted",
+      detail: cleanupError.message,
+    });
+  });
+
   it("preserves a primary error before finalizing unverified cleanup", async () => {
     const cleanupError = new UnverifiedAgentCleanupError(
       "descendant cleanup was not verified",
