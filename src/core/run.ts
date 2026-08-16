@@ -473,6 +473,26 @@ export function persistRunEvidence(runInfo: RunInfo, cwd: string): RunInfo {
     throw new Error(`Run evidence already exists: ${persistedRunDir}`);
   }
 
+  const worktreeRunsDir = dirname(runInfo.runDir);
+  const additionalRun = readdirSync(worktreeRunsDir).find(
+    (entry) => resolve(worktreeRunsDir, entry) !== resolve(runInfo.runDir),
+  );
+  if (additionalRun !== undefined) {
+    throw new Error(
+      `Additional run evidence remains in worktree: ${join(worktreeRunsDir, additionalRun)}`,
+    );
+  }
+
+  const setupFailuresDir = join(dirname(worktreeRunsDir), "setup-failures");
+  const setupFailure = existsSync(setupFailuresDir)
+    ? readdirSync(setupFailuresDir)[0]
+    : undefined;
+  if (setupFailure !== undefined) {
+    throw new Error(
+      `Setup failure evidence remains in worktree: ${join(setupFailuresDir, setupFailure)}`,
+    );
+  }
+
   mkdirSync(dirname(persistedRunDir), { recursive: true, mode: 0o700 });
   const temporaryPath = join(
     dirname(persistedRunDir),

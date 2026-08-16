@@ -958,6 +958,7 @@ program
         | null = null;
       let worktreePreservationNoticeEmitted = false;
       let readPendingWorkspaceRecovery = () => false;
+      let forceShutdownRequested = false;
       const publishWorktreeShutdownReceipt = (
         disposition: "preserved" | "removed",
         preservationReason?: string,
@@ -1156,6 +1157,7 @@ program
               runInfo.baseCommit,
               wt.worktreePath,
               readPendingWorkspaceRecovery(),
+              forceShutdownRequested,
             );
             if (preservationReason !== null) {
               preserveWorktree(preservationReason);
@@ -1362,7 +1364,6 @@ program
       readPendingWorkspaceRecovery = () =>
         orchestrator.getState().hasPendingWorkspaceRecovery === true;
       let shutdownSignal: NodeJS.Signals | null = null;
-      let forceShutdownRequested = false;
 
       const requestForceShutdown = (signal: NodeJS.Signals) => {
         if (forceShutdownRequested) return;
@@ -1447,7 +1448,10 @@ program
             `\n  gnhf: shutdown timed out after ${FORCE_EXIT_TIMEOUT_MS / 1000}s, forcing exit\n`,
           );
           if (worktreePath !== null) {
-            preserveWorktree(worktreePreservationReason ?? "uncertain");
+            preserveWorktree(
+              worktreePreservationReason ??
+                (forceShutdownRequested ? "forced-shutdown" : "uncertain"),
+            );
           }
           process.exit(getSignalExitCode(shutdownSignal ?? "SIGINT"));
         }
@@ -1484,6 +1488,7 @@ program
               runInfo.baseCommit,
               worktreePath,
               finalState.hasPendingWorkspaceRecovery === true,
+              forceShutdownRequested,
             );
           if (preservationReason !== null) {
             preserveWorktree(preservationReason);

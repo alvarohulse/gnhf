@@ -3,6 +3,7 @@ import { getBranchCommitCount, hasWorkingTreeChanges } from "./git.js";
 export type WorktreePreservationReason =
   | "committed"
   | "dirty"
+  | "forced-shutdown"
   | "pending-recovery"
   | "uncertain";
 
@@ -10,7 +11,11 @@ export function getWorktreePreservationReason(
   baseCommit: string,
   cwd: string,
   hasPendingWorkspaceRecovery: boolean,
+  forceShutdownRequested = false,
 ): WorktreePreservationReason | null {
+  if (forceShutdownRequested) {
+    return "forced-shutdown";
+  }
   if (hasPendingWorkspaceRecovery) {
     return "pending-recovery";
   }
