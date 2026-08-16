@@ -1,4 +1,11 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -34,6 +41,24 @@ describe("writeConfiguredWorktreeReceipt", () => {
     expect(statSync(receiptPath).mode & 0o777).toBe(0o600);
   });
 
+  it("publishes worktree identity without reading optional run metadata", () => {
+    const directory = mkdtempSync(join(tmpdir(), "gnhf-worktree-receipt-"));
+    temporaryDirectories.push(directory);
+    const receiptPath = join(directory, "worktree.json");
+
+    writeConfiguredWorktreeReceipt({
+      runId: "fixture-run",
+      environment: { GNHF_WORKTREE_RECEIPT_PATH: receiptPath },
+      worktreePath: join(directory, "worktree"),
+    });
+
+    expect(JSON.parse(readFileSync(receiptPath, "utf-8"))).toEqual({
+      schemaVersion: 1,
+      runId: "fixture-run",
+      worktreePath: join(directory, "worktree"),
+    });
+  });
+
   it("refuses to replace an existing receipt", () => {
     const directory = mkdtempSync(join(tmpdir(), "gnhf-worktree-receipt-"));
     temporaryDirectories.push(directory);
@@ -45,8 +70,10 @@ describe("writeConfiguredWorktreeReceipt", () => {
       worktreePath: join(directory, "worktree"),
     };
 
-    writeConfiguredWorktreeReceipt(params);
+    writeFileSync(receiptPath, "original\n", { mode: 0o600 });
 
     expect(() => writeConfiguredWorktreeReceipt(params)).toThrow();
+    expect(readFileSync(receiptPath, "utf-8")).toBe("original\n");
+    expect(readdirSync(directory)).toEqual(["worktree.json"]);
   });
 });

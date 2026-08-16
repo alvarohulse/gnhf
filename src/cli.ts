@@ -46,7 +46,6 @@ import {
   type RunSchemaOptions,
   setupRun,
   resumeRun,
-  peekRunBaseCommit,
   peekRunMetadata,
   getLastIterationNumber,
 } from "./core/run.js";
@@ -391,6 +390,10 @@ function initializeWorktreeRun(
       return null;
     }
 
+    writeConfiguredWorktreeReceipt({
+      runId: candidateRunId,
+      worktreePath: candidateWorktreePath,
+    });
     let worktreeBranch: string;
     try {
       worktreeBranch = getCurrentBranch(candidateWorktreePath);
@@ -411,11 +414,6 @@ function initializeWorktreeRun(
           `"git worktree remove ${candidateWorktreePath}" to start fresh.`,
       );
     }
-    writeConfiguredWorktreeReceipt({
-      runId: candidateRunId,
-      baseCommit: peekRunBaseCommit(candidateRunId, candidateWorktreePath),
-      worktreePath: candidateWorktreePath,
-    });
     const runInfo = resumeRun(
       candidateRunId,
       candidateWorktreePath,

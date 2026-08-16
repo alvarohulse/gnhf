@@ -3513,7 +3513,7 @@ describe("cli", () => {
     }
   });
 
-  it("records a preserved worktree before run metadata resume fails", async () => {
+  it("records a preserved worktree before base metadata can be read", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "gnhf-resume-failure-"));
     const repoRoot = join(tempDir, "repo");
     const hash = createHash("sha256")
@@ -3529,6 +3529,12 @@ describe("cli", () => {
     const resumeRun = vi.fn(() => {
       throw new Error("resume metadata unreadable");
     });
+    const peekRunBaseCommit = vi.fn(() => {
+      throw new Error("base metadata unreadable");
+    });
+    const getCurrentBranch = vi.fn((cwd: string) =>
+      cwd === worktreePath ? branch : "main",
+    );
     const writeConfiguredWorktreeReceipt = vi.fn();
 
     try {
@@ -3545,11 +3551,9 @@ describe("cli", () => {
           },
           {
             getRepoRootDir: vi.fn(() => repoRoot),
-            getCurrentBranch: vi.fn((cwd: string) =>
-              cwd === worktreePath ? branch : "main",
-            ),
+            getCurrentBranch,
             listWorktreePaths: vi.fn(() => new Set([worktreePath])),
-            peekRunBaseCommit: vi.fn(() => "b".repeat(40)),
+            peekRunBaseCommit,
             resumeRun,
             writeConfiguredWorktreeReceipt,
           },
@@ -3558,12 +3562,15 @@ describe("cli", () => {
 
       expect(writeConfiguredWorktreeReceipt).toHaveBeenCalledWith({
         runId,
-        baseCommit: "b".repeat(40),
         worktreePath,
       });
       expect(
         writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0],
+      ).toBeLessThan(getCurrentBranch.mock.invocationCallOrder[1]!);
+      expect(
+        writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0],
       ).toBeLessThan(resumeRun.mock.invocationCallOrder[0]!);
+      expect(peekRunBaseCommit).not.toHaveBeenCalled();
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
