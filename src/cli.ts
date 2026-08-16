@@ -734,7 +734,7 @@ program
   .option("--clear-max-iterations", "Clear the persisted iteration cap", false)
   .option(
     "--max-tokens <n>",
-    "Abort after N total input+output tokens; persists for this run",
+    "Abort when the complete provider-reported token total reaches N; persists for this run",
     parseNonNegativeInteger,
   )
   .option("--clear-max-tokens", "Clear the persisted token cap", false)
