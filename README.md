@@ -152,7 +152,7 @@ After installing from npm, the skill is available under the installed package di
 
 - **Incremental commits** - each successful iteration is a separate unsigned git commit, so you can cherry-pick or revert individual changes without GPG or SSH signing prompts blocking the run; if `git commit` fails, gnhf preserves the uncommitted work and asks the next agent iteration to repair it
 - **Failure handling** - failed iterations are rolled back with `git reset --hard` except commit failures, which preserve uncommitted work for repair; agent-reported failures proceed to the next iteration immediately, retryable hard agent errors use exponential backoff, and permanent agent errors such as Claude low credit balance abort immediately and print the run log path. Complete no-op iterations are reported as failures and count toward the consecutive-failure abort limit. If the run exits with a pending commit failure, the exit summary warns that uncommitted changes were left for repair.
-- **Runtime caps** - `--max-iterations` stops before the next iteration begins, `--max-tokens` can abort mid-iteration once reported usage reaches the cap, and `--max-reported-cost-usd` can abort when the harness reports a cumulative cost. A harness that does not report cost continues under the other caps and leaves cost unknown. `--stop-when` ends the loop after an iteration whose agent output reports the natural-language condition is met unless a commit failure needs repair first; resumed runs reuse it unless you pass a new value, or `--stop-when ""` to clear it. Pending commit-failure repair work is preserved and other uncommitted work is rolled back, and in the interactive TUI the final state remains visible until you press Ctrl+C to exit.
+- **Runtime caps** - `--max-iterations` stops before the next iteration begins, `--max-tokens` can abort mid-iteration once the harness reports both input and output token totals, and `--max-reported-cost-usd` can abort when the harness reports a cumulative cost. Missing token totals stay unavailable and do not trigger the token cap; missing cost stays unknown and does not trigger the cost cap. `--stop-when` ends the loop after an iteration whose agent output reports the natural-language condition is met unless a commit failure needs repair first; resumed runs reuse it unless you pass a new value, or `--stop-when ""` to clear it. Pending commit-failure repair work is preserved and other uncommitted work is rolled back, and in the interactive TUI the final state remains visible until you press Ctrl+C to exit.
 - **Iteration finalization** - agents are expected to finish validation, stop any background processes they started, and only then emit the final JSON result for the iteration. Workers must record exact PIDs or process handles when they start processes and stop only those owned identities. Process-name, pattern-wide, and port-wide cleanup, including `pkill`, `killall`, `taskkill`, and `Stop-Process -Name`, is forbidden. This guidance mitigates accidental cross-run cleanup; it is not a process-security boundary.
 - **Graceful interrupts** - in the interactive TUI, the first Ctrl+C requests a graceful stop and lets the current iteration finish (or ends backoff early), the second Ctrl+C force-stops immediately, and `SIGTERM` also force-stops immediately
 - **Exit summary** - after shutdown cleanup, gnhf prints a permanent stdout summary with the final branch, elapsed time, iteration and token totals, branch diff stats, notes/debug-log paths, and review commands
@@ -185,8 +185,7 @@ Pass `--worktree` to run each agent in an isolated [git worktree](https://git-sc
 
 - Worktrees with commits are **preserved** after the run so you can review, merge, or cherry-pick the work. gnhf prints the path and cleanup command.
 - Re-running the same prompt with `--worktree` resumes a preserved matching worktree when possible; otherwise gnhf creates a suffixed worktree such as `<run-slug>-1` if the original name is unavailable.
-- Worktrees with **no commits** are automatically removed on exit unless a pending commit failure left uncommitted work to inspect or repair.
-- Forced shutdown checks Git before cleanup. Committed, dirty, pending-repair, or uninspectable worktrees are preserved; only a verified clean zero-commit worktree is removed.
+- Worktrees are removed only when Git verifies that they are clean and have no commits. Committed, dirty, pending-repair, or uninspectable worktrees are preserved and reported, including during forced shutdown.
 - Add `--preserve-worktree` to keep the worktree on every exit path, including a zero-commit run. This flag requires `--worktree`; gnhf prints and records the retained path.
 - `--worktree` must be run from a non-gnhf branch (typically `main`).
 
@@ -286,7 +285,7 @@ preventSleep: true
 ```
 
 CLI flags override config file values. `--prevent-sleep` accepts `on`/`off` as well as `true`/`false`; the config file always uses a boolean.
-The iteration and token caps are runtime-only flags and are not persisted in `config.yml`; `--stop-when` is persisted per run for resume, but not in config.
+The iteration, token, and reported-cost caps are runtime-only flags and are not persisted in `config.yml`; `--stop-when` is persisted per run for resume, but not in config.
 
 `agentArgsOverride.<name>` lets you pass through extra CLI flags for any native agent in the [Agents](#agents) table.
 ACP targets do not support path or arg overrides in this version.
@@ -321,7 +320,7 @@ When sleep prevention is enabled, `gnhf` uses the native mechanism for your OS: 
 
 ## Debug Logs
 
-Every run writes a JSONL debug log to `.gnhf/runs/<runId>/gnhf.log` alongside `notes.md`. Lifecycle events for the orchestrator, agent, and HTTP requests are captured with elapsed timings and (for failures) the full `error.cause` chain, which is what you need to tell a bare `TypeError: fetch failed` apart from an undici `UND_ERR_HEADERS_TIMEOUT`. The agent's own streaming output still goes to the per-iteration `iteration-<n>.jsonl` file next to it.
+Every run writes a JSONL debug log to `.gnhf/runs/<runId>/gnhf.log` alongside `notes.md`. Lifecycle events for the orchestrator, agent, and HTTP requests are captured with elapsed timings and (for failures) the full `error.cause` chain, which is what you need to tell a bare `TypeError: fetch failed` apart from an undici `UND_ERR_HEADERS_TIMEOUT`. Each agent run ends with a usage receipt; unavailable token totals or cost remain explicit rather than being inferred. The agent's own streaming output still goes to the per-iteration `iteration-<n>.jsonl` file next to it.
 Raw ACP command specs are redacted as `acp:custom`/`custom` in debug logs and related errors, so local paths or secrets in custom commands are not written to `gnhf.log`.
 
 Including a snippet of `gnhf.log` is the single most useful thing you can attach when filing an issue.

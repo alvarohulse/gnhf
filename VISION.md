@@ -9,14 +9,14 @@ It owns exactly one thing: the unattended loop that turns agent iterations into 
 Work that was made is never silently destroyed.
 Every successful iteration is its own commit, so a night's work can be reviewed, cherry-picked, or reverted one change at a time.
 A failed commit preserves the workspace and asks the next iteration to repair it instead of hard-resetting it away.
-A forced shutdown still keeps the final agent output, successful recordings, and any worktree that holds commits.
+A forced shutdown still keeps the final agent output and successful recordings, and preserves any generated worktree unless Git proves removal safe.
 A push failure aborts the run only after the local commit is safe.
 A change that can lose user work in an edge case is a bug of the highest class and gets fixed at the root.
 
 ## The user holds the leash
 
 An unattended loop earns trust through explicit limits, live control, and staying alive until morning.
-Iteration caps, token caps, and natural-language stop conditions bound every run, and stop conditions survive resume.
+Iteration caps, token caps, harness-reported cost caps, and natural-language stop conditions bound every run, and stop conditions survive resume.
 The first interrupt is graceful and lets the iteration finish; the second is immediate.
 Steering a live run and reviewing a finished run's commits are user control, not scope creep.
 The run defends itself against whatever would end the night early: machine sleep, a closed terminal, transient agent failures.

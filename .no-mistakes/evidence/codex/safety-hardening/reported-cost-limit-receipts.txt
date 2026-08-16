@@ -1,0 +1,70 @@
+Scenario: built CLI enforces a cost cap only when Cursor reports concrete harness cost
+
+=== Concrete cost receipt: cap enforced ===
+Command: gnhf ... --max-reported-cost-usd 0.50 --max-iterations 2
+Exit code: 0
+--- CLI permanent stdout summary ---
+╭─────────────────────────────────────────────────────────────────────╮
+│ × gnhf stopped                                                      │
+│   cursor ran for 0s before: max reported cost reached ($1.25/$0.50) │
+╰─────────────────────────────────────────────────────────────────────╯
+
+  iterations      1 total       0 good       0 failed
+  tokens          7 in          4 out        
+  branch diff     0 commits     +0           -0
+  files           0 added       0 updated    0 deleted
+
+  notes           /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-cost-limit.qwogGQ/reported-cost/repo/.gnhf/runs/cost-evidence-report-e8bb36/notes.md
+  debug log       /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-cost-limit.qwogGQ/reported-cost/repo/.gnhf/runs/cost-evidence-report-e8bb36/gnhf.log
+
+  next steps      git log --oneline 3ee5ab931d79..HEAD
+                  git diff --stat 3ee5ab931d79..HEAD
+                  gh pr create
+
+  too much        git push no-mistakes:
+  to review?      https://github.com/kunchenguid/no-mistakes
+--- CLI stderr ---
+
+  gnhf: Run log: /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-cost-limit.qwogGQ/reported-cost/repo/.gnhf/runs/cost-evidence-report-e8bb36/gnhf.log
+
+--- Usage receipts ---
+{"timestamp":"2026-08-16T06:17:43.469Z","pid":2375818,"event":"agent:run:end","iteration":1,"elapsedMs":20,"outcome":"aborted","success":null,"inputTokens":7,"outputTokens":4,"cacheReadTokens":2,"cacheCreationTokens":1,"reportedCostUsd":1.25,"reportedCostAvailable":true,"tokensAvailable":true,"estimated":false}
+{"timestamp":"2026-08-16T06:17:43.474Z","pid":2375818,"event":"orchestrator:end","status":"aborted","iterations":1,"successCount":0,"failCount":0,"totalInputTokens":7,"totalOutputTokens":4,"tokensAvailable":true,"reportedCostUsd":1.25,"reportedCostAvailable":true,"commitCount":0}
+{"timestamp":"2026-08-16T06:17:43.486Z","pid":2375818,"event":"run:complete","signal":null,"status":"aborted","iterations":1,"successCount":0,"failCount":0,"totalInputTokens":7,"totalOutputTokens":4,"tokensAvailable":true,"reportedCostUsd":1.25,"commitCount":0,"worktreePath":null}
+commit count: 1
+working tree status: clean
+
+=== Missing cost receipt: cap not inferred ===
+Command: gnhf ... --max-reported-cost-usd 0 --max-iterations 1
+Exit code: 0
+--- CLI permanent stdout summary ---
+╭────────────────────────────────────────────────────────────╮
+│ × gnhf stopped                                             │
+│   cursor ran for 0s before: max iterations reached (1)     │
+╰────────────────────────────────────────────────────────────╯
+
+  iterations      1 total       1 good       0 failed
+  tokens          7 in          4 out        
+  branch diff     1 commit      +1           -0
+  files           1 added       0 updated    0 deleted
+
+  notes           /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-cost-limit.qwogGQ/missing-cost/repo/.gnhf/runs/cost-evidence-missin-34516d/notes.md
+  debug log       /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-cost-limit.qwogGQ/missing-cost/repo/.gnhf/runs/cost-evidence-missin-34516d/gnhf.log
+
+  next steps      git log --oneline 3ee5ab931d79..HEAD
+                  git diff --stat 3ee5ab931d79..HEAD
+                  gh pr create
+
+  too much        git push no-mistakes:
+  to review?      https://github.com/kunchenguid/no-mistakes
+--- CLI stderr ---
+
+  gnhf: Run log: /home/ubuntu/data/no-mistakes-gnhf-merge/worktrees/2f49efb00016/01M04H8TNW8AW6K10P6GHWQZ9V/.no-mistakes/evidence/codex/safety-hardening/.tmp-cost-limit.qwogGQ/missing-cost/repo/.gnhf/runs/cost-evidence-missin-34516d/gnhf.log
+
+--- Usage receipts ---
+{"timestamp":"2026-08-16T06:17:43.623Z","pid":2375864,"event":"agent:run:end","iteration":1,"elapsedMs":22,"outcome":"completed","success":true,"inputTokens":7,"outputTokens":4,"cacheReadTokens":2,"cacheCreationTokens":1,"reportedCostUsd":null,"reportedCostAvailable":false,"tokensAvailable":true,"estimated":false}
+{"timestamp":"2026-08-16T06:17:43.633Z","pid":2375864,"event":"orchestrator:end","status":"aborted","iterations":1,"successCount":1,"failCount":0,"totalInputTokens":7,"totalOutputTokens":4,"tokensAvailable":true,"reportedCostUsd":null,"reportedCostAvailable":false,"commitCount":1}
+{"timestamp":"2026-08-16T06:17:43.645Z","pid":2375864,"event":"run:complete","signal":null,"status":"aborted","iterations":1,"successCount":1,"failCount":0,"totalInputTokens":7,"totalOutputTokens":4,"tokensAvailable":true,"reportedCostUsd":null,"commitCount":1,"worktreePath":null}
+commit count: 2
+working tree status: clean
+
