@@ -119,6 +119,7 @@ function finalMessageResponse(
       : [
           {
             id: "part-final",
+            messageID: messageId,
             type: "text",
             text: JSON.stringify({
               success: true,
@@ -147,7 +148,7 @@ function finalAnswerEvents(
   sessionId = "session-123",
 ): string {
   return [
-    `data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"${sessionId}","part":{"id":"part-final","type":"text","text":"","metadata":{"openai":{"phase":"final_answer"}}}}}}`,
+    `data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"${sessionId}","part":{"id":"part-final","messageID":"${messageId}","type":"text","text":"","metadata":{"openai":{"phase":"final_answer"}}}}}}`,
     "",
     `data: ${JSON.stringify({
       directory: "/repo",
@@ -360,7 +361,7 @@ describe("OpenCodeAgent", () => {
       .mockResolvedValueOnce(
         sseResponse([
           'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-1","messageID":"msg-123","type":"step-finish","tokens":{"input":10,"output":4,"reasoning":0,"cache":{"read":3,"write":2}}}}}}\n\n',
-          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"part-final","type":"text","text":"{\\"success\\":true,\\"summary\\":\\"done\\",\\"key_changes_made\\":[],\\"key_learnings\\":[]}","metadata":{"openai":{"phase":"final_answer"}}}}}}',
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"part-final","messageID":"msg-123","type":"text","text":"{\\"success\\":true,\\"summary\\":\\"done\\",\\"key_changes_made\\":[],\\"key_learnings\\":[]}","metadata":{"openai":{"phase":"final_answer"}}}}}}',
         ]),
       )
       .mockResolvedValueOnce(
@@ -715,7 +716,9 @@ describe("OpenCodeAgent", () => {
       .mockResolvedValueOnce(jsonResponse(true));
 
     await windowsAgent.run("test", "/repo");
-    await windowsAgent.close();
+    const closePromise = windowsAgent.close();
+    proc.emit("close", 0, null);
+    await closePromise;
 
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
       "taskkill",
@@ -963,6 +966,62 @@ describe("OpenCodeAgent", () => {
         sseResponse([
           'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-1","role":"assistant","tokens":{"input":10,"output":4,"reasoning":0,"cache":{"read":3,"write":2}}}}}}\n\n',
           'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-2","role":"assistant","structured":{"success":true,"summary":"done","key_changes_made":[],"key_learnings":[]}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"session.idle","properties":{"sessionID":"session-123"}}}\n\n',
+        ]),
+      )
+      .mockResolvedValueOnce(promptAsyncResponse())
+      .mockResolvedValueOnce(jsonResponse(true));
+
+    const result = await agent.run("test", "/repo");
+
+    expect(result.usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 4,
+      cacheReadTokens: 3,
+      cacheCreationTokens: 2,
+      tokensAvailable: false,
+    });
+  });
+
+  it("marks terminal usage unavailable when structured output lacks receipt identity", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(
+        sseResponse([
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-1","role":"assistant","cost":0.2,"tokens":{"input":10,"output":4,"reasoning":0,"cache":{"read":3,"write":2}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"role":"assistant","structured":{"success":true,"summary":"done","key_changes_made":[],"key_learnings":[]}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"session.idle","properties":{"sessionID":"session-123"}}}\n\n',
+        ]),
+      )
+      .mockResolvedValueOnce(promptAsyncResponse())
+      .mockResolvedValueOnce(jsonResponse(true));
+
+    const result = await agent.run("test", "/repo");
+
+    expect(result.usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 4,
+      cacheReadTokens: 3,
+      cacheCreationTokens: 2,
+      tokensAvailable: false,
+    });
+  });
+
+  it("marks final-answer usage unavailable when text lacks receipt identity", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(
+        sseResponse([
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-old","role":"assistant","cost":0.2,"tokens":{"input":10,"output":4,"reasoning":0,"cache":{"read":3,"write":2}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"part-final","type":"text","text":"{\\"success\\":true,\\"summary\\":\\"done\\",\\"key_changes_made\\":[],\\"key_learnings\\":[]}","metadata":{"openai":{"phase":"final_answer"}}}}}}\n\n',
           'data: {"directory":"/repo","payload":{"type":"session.idle","properties":{"sessionID":"session-123"}}}\n\n',
         ]),
       )
@@ -1444,6 +1503,65 @@ describe("OpenCodeAgent", () => {
       "http://127.0.0.1:8765/session/session-123",
       expect.objectContaining({ method: "DELETE" }),
     );
+  });
+
+  it("cancels a pending prompt before aborting the session after an SSE failure", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    const streamResponse = new Response(
+      new ReadableStream({
+        start() {
+          // The injected reader below owns the failure timing.
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    );
+    Object.defineProperty(streamResponse.body!, "getReader", {
+      value: () => ({
+        read: vi.fn(() => Promise.reject(new Error("SSE read failed"))),
+        cancel: vi.fn(() => Promise.resolve()),
+      }),
+    });
+
+    const cleanupOrder: string[] = [];
+    let promptSignal = new AbortController().signal;
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(streamResponse)
+      .mockImplementationOnce((_url, options) => {
+        promptSignal = options?.signal as AbortSignal;
+        return new Promise<Response>((_resolve, reject) => {
+          promptSignal.addEventListener(
+            "abort",
+            () => {
+              cleanupOrder.push("prompt-aborted");
+              reject(
+                new DOMException("This operation was aborted", "AbortError"),
+              );
+            },
+            { once: true },
+          );
+        });
+      })
+      .mockImplementationOnce(() => {
+        cleanupOrder.push("session-aborted");
+        return Promise.resolve(jsonResponse(true));
+      })
+      .mockImplementationOnce(() => {
+        cleanupOrder.push("session-deleted");
+        return Promise.resolve(jsonResponse(true));
+      });
+
+    await expect(agent.run("test", "/repo")).rejects.toThrow("SSE read failed");
+
+    expect(promptSignal.aborted).toBe(true);
+    expect(cleanupOrder).toEqual([
+      "prompt-aborted",
+      "session-aborted",
+      "session-deleted",
+    ]);
   });
 
   it("aborts the active turn before deleting a session after an error", async () => {
