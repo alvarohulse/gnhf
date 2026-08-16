@@ -364,6 +364,8 @@ describe("Orchestrator stop limits", () => {
 
   it("restores cumulative usage before enforcing resumed caps", async () => {
     mockReadRunUsageState.mockReturnValueOnce({
+      generation: 2,
+      phase: "terminal",
       totalInputTokens: 4,
       totalOutputTokens: 2,
       totalTokens: 12,
@@ -400,6 +402,99 @@ describe("Orchestrator stop limits", () => {
     });
   });
 
+  it.each([
+    { generation: 2, phase: "in-progress" as const },
+    { generation: 1, phase: "terminal" as const },
+  ])(
+    "marks $phase usage generation $generation unavailable when resuming iteration 2",
+    async ({ generation, phase }) => {
+      mockReadRunUsageState.mockReturnValueOnce({
+        generation,
+        phase,
+        totalInputTokens: 4,
+        totalOutputTokens: 2,
+        totalTokens: 12,
+        reportedCostUsd: 0.4,
+        tokensUnavailable: false,
+        reportedCostUnavailable: false,
+        tokensEstimated: false,
+        hasAuthoritativeTokenReceipt: true,
+      });
+      const agent: Agent = {
+        name: "pi",
+        run: vi.fn(async () => createSuccessResult()),
+      };
+      const orchestrator = new Orchestrator(
+        config,
+        agent,
+        runInfo,
+        "ship it",
+        "/repo",
+        2,
+        {
+          maxIterations: 3,
+          maxTokens: 10,
+          maxReportedCostUsd: 0.3,
+        },
+      );
+
+      expect(orchestrator.getState()).toMatchObject({
+        totalInputTokens: 4,
+        totalOutputTokens: 2,
+        reportedCostUsd: null,
+        tokensAvailable: false,
+      });
+
+      await orchestrator.start();
+
+      expect(agent.run).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("persists an in-progress usage generation before invoking the agent", async () => {
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => {
+        expect(mockWriteRunUsageState).toHaveBeenCalledWith(
+          runInfo,
+          expect.objectContaining({
+            generation: 1,
+            phase: "in-progress",
+          }),
+        );
+        return createSuccessResult();
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockWriteRunUsageState).toHaveBeenNthCalledWith(
+      1,
+      runInfo,
+      expect.objectContaining({
+        generation: 1,
+        phase: "in-progress",
+      }),
+    );
+    expect(mockWriteRunUsageState).toHaveBeenNthCalledWith(
+      2,
+      runInfo,
+      expect.objectContaining({
+        generation: 1,
+        phase: "terminal",
+      }),
+    );
+  });
+
   it("persists cumulative authoritative usage after a completed turn", async () => {
     const agent: Agent = {
       name: "pi",
@@ -429,6 +524,8 @@ describe("Orchestrator stop limits", () => {
     await orchestrator.start();
 
     expect(mockWriteRunUsageState).toHaveBeenCalledWith(runInfo, {
+      generation: 1,
+      phase: "terminal",
       totalInputTokens: 4,
       totalOutputTokens: 2,
       totalTokens: 12,

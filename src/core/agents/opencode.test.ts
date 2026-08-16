@@ -92,6 +92,7 @@ function finalMessageResponse(
       tokens: {
         input: usage.input,
         output: usage.output,
+        reasoning: 0,
         cache: {
           read: usage.read,
           write: usage.write,
@@ -169,6 +170,7 @@ function finalAnswerEvents(
             tokens: {
               input: usage.input,
               output: usage.output,
+              reasoning: 0,
               cache: { read: usage.read, write: usage.write },
             },
           },
@@ -189,6 +191,7 @@ function finalAnswerEvents(
             tokens: {
               input: usage.input,
               output: usage.output,
+              reasoning: 0,
               cache: { read: usage.read, write: usage.write },
             },
           },
@@ -317,6 +320,7 @@ describe("OpenCodeAgent", () => {
       outputTokens: 4,
       cacheReadTokens: 3,
       cacheCreationTokens: 2,
+      totalTokens: 19,
       tokensAvailable: true,
     });
     await vi.waitFor(() => {
@@ -340,7 +344,7 @@ describe("OpenCodeAgent", () => {
       .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
       .mockResolvedValueOnce(
         sseResponse([
-          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-1","messageID":"msg-123","type":"step-finish","tokens":{"input":10,"output":4,"cache":{"read":3,"write":2}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-1","messageID":"msg-123","type":"step-finish","tokens":{"input":10,"output":4,"reasoning":0,"cache":{"read":3,"write":2}}}}}}\n\n',
           'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"part-final","type":"text","text":"{\\"success\\":true,\\"summary\\":\\"done\\",\\"key_changes_made\\":[],\\"key_learnings\\":[]}","metadata":{"openai":{"phase":"final_answer"}}}}}}',
         ]),
       )
@@ -353,6 +357,7 @@ describe("OpenCodeAgent", () => {
             tokens: {
               input: 10,
               output: 4,
+              reasoning: 0,
               cache: { read: 3, write: 2 },
             },
           },
@@ -373,6 +378,7 @@ describe("OpenCodeAgent", () => {
         outputTokens: 4,
         cacheReadTokens: 3,
         cacheCreationTokens: 2,
+        totalTokens: 19,
         tokensAvailable: true,
       },
     });
@@ -484,6 +490,7 @@ describe("OpenCodeAgent", () => {
         outputTokens: 20,
         cacheReadTokens: 7,
         cacheCreationTokens: 3,
+        totalTokens: 130,
         tokensAvailable: true,
       },
     });
@@ -492,6 +499,7 @@ describe("OpenCodeAgent", () => {
       outputTokens: 20,
       cacheReadTokens: 7,
       cacheCreationTokens: 3,
+      totalTokens: 130,
       tokensAvailable: true,
     });
     expect(onMessage).toHaveBeenNthCalledWith(
@@ -796,12 +804,12 @@ describe("OpenCodeAgent", () => {
       .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
       .mockResolvedValueOnce(
         sseResponse([
-          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-1","role":"assistant","tokens":{"input":0,"output":0,"cache":{"read":0,"write":0}}}}}}\n\n',
-          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-1","messageID":"msg-1","type":"step-finish","tokens":{"input":10,"output":4,"cache":{"read":3,"write":2}}}}}}\n\n',
-          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-2","role":"assistant","tokens":{"input":0,"output":0,"cache":{"read":0,"write":0}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-1","role":"assistant","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-1","messageID":"msg-1","type":"step-finish","tokens":{"input":10,"output":4,"reasoning":0,"cache":{"read":3,"write":2}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-2","role":"assistant","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}}}\n\n',
           'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"part-final","type":"text","text":"{\\"success\\":true,\\"summary\\":\\"done\\",\\"key_changes_made\\":[],\\"key_learnings\\":[]}","metadata":{"openai":{"phase":"final_answer"}}}}}}\n\n',
-          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-2","role":"assistant","structured":{"success":true,"summary":"done","key_changes_made":[],"key_learnings":[]},"tokens":{"input":20,"output":6,"cache":{"read":5,"write":1}}}}}}\n\n',
-          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-2","messageID":"msg-2","type":"step-finish","tokens":{"input":20,"output":6,"cache":{"read":5,"write":1}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-2","role":"assistant","structured":{"success":true,"summary":"done","key_changes_made":[],"key_learnings":[]},"tokens":{"input":20,"output":6,"reasoning":0,"cache":{"read":5,"write":1}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-2","messageID":"msg-2","type":"step-finish","tokens":{"input":20,"output":6,"reasoning":0,"cache":{"read":5,"write":1}}}}}}\n\n',
           'data: {"directory":"/repo","payload":{"type":"session.idle","properties":{"sessionID":"session-123"}}}\n\n',
         ]),
       )
@@ -817,6 +825,7 @@ describe("OpenCodeAgent", () => {
       outputTokens: 4,
       cacheReadTokens: 3,
       cacheCreationTokens: 2,
+      totalTokens: 19,
       tokensAvailable: true,
     });
     expect(onUsage).toHaveBeenNthCalledWith(2, {
@@ -824,6 +833,7 @@ describe("OpenCodeAgent", () => {
       outputTokens: 10,
       cacheReadTokens: 8,
       cacheCreationTokens: 3,
+      totalTokens: 51,
       tokensAvailable: true,
     });
     expect(result.usage).toEqual({
@@ -831,6 +841,7 @@ describe("OpenCodeAgent", () => {
       outputTokens: 10,
       cacheReadTokens: 8,
       cacheCreationTokens: 3,
+      totalTokens: 51,
       tokensAvailable: true,
     });
   });
@@ -874,6 +885,58 @@ describe("OpenCodeAgent", () => {
     });
   });
 
+  it("derives an exact total from every OpenCode token component", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(
+        sseResponse([
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"part-final","type":"text","text":"{\\"success\\":true,\\"summary\\":\\"done\\",\\"key_changes_made\\":[],\\"key_learnings\\":[]}","metadata":{"openai":{"phase":"final_answer"}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-1","role":"assistant","structured":{"success":true,"summary":"done","key_changes_made":[],"key_learnings":[]},"tokens":{"input":10,"output":4,"reasoning":5,"cache":{"read":3,"write":2}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"session.idle","properties":{"sessionID":"session-123"}}}\n\n',
+        ]),
+      )
+      .mockResolvedValueOnce(promptAsyncResponse())
+      .mockResolvedValueOnce(jsonResponse(true));
+
+    await expect(agent.run("test", "/repo")).resolves.toMatchObject({
+      usage: {
+        inputTokens: 10,
+        outputTokens: 4,
+        cacheReadTokens: 3,
+        cacheCreationTokens: 2,
+        totalTokens: 24,
+        tokensAvailable: true,
+      },
+    });
+  });
+
+  it("marks OpenCode usage unavailable when an exact total cannot be derived", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(
+        sseResponse([
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"part-final","type":"text","text":"{\\"success\\":true,\\"summary\\":\\"done\\",\\"key_changes_made\\":[],\\"key_learnings\\":[]}","metadata":{"openai":{"phase":"final_answer"}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-1","role":"assistant","structured":{"success":true,"summary":"done","key_changes_made":[],"key_learnings":[]},"tokens":{"input":10,"output":4,"cache":{"read":3,"write":2}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"session.idle","properties":{"sessionID":"session-123"}}}\n\n',
+        ]),
+      )
+      .mockResolvedValueOnce(promptAsyncResponse())
+      .mockResolvedValueOnce(jsonResponse(true));
+
+    const result = await agent.run("test", "/repo");
+
+    expect(result.usage.tokensAvailable).toBe(false);
+    expect(result.usage.totalTokens).toBeUndefined();
+  });
+
   it("marks usage unavailable when an assistant message omits tokens", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
@@ -883,7 +946,7 @@ describe("OpenCodeAgent", () => {
       .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
       .mockResolvedValueOnce(
         sseResponse([
-          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-1","role":"assistant","tokens":{"input":10,"output":4,"cache":{"read":3,"write":2}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-1","role":"assistant","tokens":{"input":10,"output":4,"reasoning":0,"cache":{"read":3,"write":2}}}}}}\n\n',
           'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-2","role":"assistant","structured":{"success":true,"summary":"done","key_changes_made":[],"key_learnings":[]}}}}}\n\n',
           'data: {"directory":"/repo","payload":{"type":"session.idle","properties":{"sessionID":"session-123"}}}\n\n',
         ]),
@@ -989,14 +1052,19 @@ describe("OpenCodeAgent", () => {
       .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
       .mockResolvedValueOnce(
         sseResponse([
-          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-1","type":"step-finish","tokens":{"input":1,"output":1,"cache":{"read":0,"write":0}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-1","type":"step-finish","tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}}}}\n\n',
           'data: {"directory":"/repo","payload":{"type":"session.idle","properties":{"sessionID":"session-123"}}}\n\n',
         ]),
       )
       .mockResolvedValueOnce(
         jsonResponse({
           info: {
-            tokens: { input: 1, output: 1, cache: { read: 0, write: 0 } },
+            tokens: {
+              input: 1,
+              output: 1,
+              reasoning: 0,
+              cache: { read: 0, write: 0 },
+            },
           },
           parts: [{ type: "step-start" }],
         }),

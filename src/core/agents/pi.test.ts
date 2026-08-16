@@ -355,6 +355,99 @@ describe("PiAgent", () => {
     );
   });
 
+  it("applies top-level live usage to the active assistant message", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const onUsage = vi.fn();
+    const agent = new PiAgent();
+    const usage = {
+      input: 4,
+      output: 2,
+      cacheRead: 3,
+      cacheWrite: 1,
+      totalTokens: 12,
+      cost: { total: 0.4 },
+    };
+
+    const promise = agent.run("test prompt", "/work/dir", { onUsage });
+    emitJson(proc, {
+      type: "message_start",
+      message: { role: "assistant", responseId: "r1" },
+    });
+    emitJson(proc, {
+      type: "message_update",
+      usage,
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: finalOutput(),
+      },
+    });
+
+    expect(onUsage).toHaveBeenLastCalledWith({
+      inputTokens: 4,
+      outputTokens: 2,
+      cacheReadTokens: 3,
+      cacheCreationTokens: 1,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      tokensAvailable: true,
+    });
+
+    emitJson(proc, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        responseId: "r1",
+        usage,
+        content: [{ type: "text", text: finalOutput() }],
+      },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      output: { success: true },
+      usage: { totalTokens: 12, reportedCostUsd: 0.4 },
+    });
+  });
+
+  it("replaces anonymous live usage when the terminal message adds an id", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent();
+    const usage = { input: 4, output: 2, totalTokens: 6 };
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "message_update",
+      usage,
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: finalOutput(),
+      },
+    });
+    emitJson(proc, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        responseId: "r1",
+        usage,
+        content: [{ type: "text", text: finalOutput() }],
+      },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      output: { success: true },
+      usage: {
+        inputTokens: 4,
+        outputTokens: 2,
+        totalTokens: 6,
+      },
+    });
+  });
+
   it("marks aggregate usage unavailable when a completed message omits usage", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);

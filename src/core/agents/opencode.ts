@@ -36,6 +36,7 @@ interface OpenCodeMessagePart {
 interface OpenCodeTokens {
   input?: number;
   output?: number;
+  reasoning?: number;
   total?: number;
   cache?: {
     read?: number;
@@ -307,15 +308,35 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
 function toUsage(tokens?: OpenCodeTokens, cost?: number): TokenUsage {
   const inputTokens = tokens?.input;
   const outputTokens = tokens?.output;
+  const reasoningTokens = tokens?.reasoning;
+  const cacheReadTokens = tokens?.cache?.read;
+  const cacheCreationTokens = tokens?.cache?.write;
+  const componentTotal =
+    isValidTokenCount(inputTokens) &&
+    isValidTokenCount(outputTokens) &&
+    isValidTokenCount(reasoningTokens) &&
+    isValidTokenCount(cacheReadTokens) &&
+    isValidTokenCount(cacheCreationTokens)
+      ? inputTokens +
+        outputTokens +
+        reasoningTokens +
+        cacheReadTokens +
+        cacheCreationTokens
+      : undefined;
+  const totalTokens = isValidTokenCount(tokens?.total)
+    ? tokens.total
+    : componentTotal;
   return {
     inputTokens: inputTokens ?? 0,
     outputTokens: outputTokens ?? 0,
-    cacheReadTokens: tokens?.cache?.read ?? 0,
-    cacheCreationTokens: tokens?.cache?.write ?? 0,
-    ...(isValidTokenCount(tokens?.total) ? { totalTokens: tokens.total } : {}),
+    cacheReadTokens: cacheReadTokens ?? 0,
+    cacheCreationTokens: cacheCreationTokens ?? 0,
+    ...(isValidTokenCount(totalTokens) ? { totalTokens } : {}),
     ...(isValidTokenCount(cost) ? { reportedCostUsd: cost } : {}),
     tokensAvailable:
-      isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
+      isValidTokenCount(inputTokens) &&
+      isValidTokenCount(outputTokens) &&
+      isValidTokenCount(totalTokens),
   };
 }
 
@@ -366,16 +387,8 @@ function mergeMessageUsage(
   if (stepUsage === undefined) {
     return assistantUsage;
   }
-  const assistantTotal = isValidTokenCount(assistantUsage.totalTokens)
-    ? assistantUsage.totalTokens
-    : assistantUsage.inputTokens +
-      assistantUsage.outputTokens +
-      assistantUsage.cacheCreationTokens;
-  const stepTotal = isValidTokenCount(stepUsage.totalTokens)
-    ? stepUsage.totalTokens
-    : stepUsage.inputTokens +
-      stepUsage.outputTokens +
-      stepUsage.cacheCreationTokens;
+  const assistantTotal = assistantUsage.totalTokens ?? -1;
+  const stepTotal = stepUsage.totalTokens ?? -1;
   const merged =
     assistantTotal >= stepTotal ? { ...assistantUsage } : { ...stepUsage };
   const reportedCostUsd = isValidTokenCount(assistantUsage.reportedCostUsd)
@@ -798,7 +811,7 @@ export class OpenCodeAgent implements Agent {
     const stepUsageByMessageId = new Map<string, Map<string, TokenUsage>>();
     const textParts = new Map<string, OpenCodeTextPartState>();
     let lastFinalAnswerText: string | null = null;
-    let lastUsageSignature = "0:0:0:0:na:na:true";
+    let lastUsageSignature = "0:0:0:0:0:na:true";
     let structuredOutputFromSSE: AgentOutput | null = null;
     let streamErrorInfo: OpenCodeStreamErrorInfo | null = null;
 

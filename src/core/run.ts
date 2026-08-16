@@ -52,6 +52,8 @@ export type WorkspaceRecovery = {
 };
 
 export interface RunUsageState {
+  generation?: number;
+  phase?: "in-progress" | "terminal";
   totalInputTokens: number;
   totalOutputTokens: number;
   totalTokens: number;
@@ -61,6 +63,11 @@ export interface RunUsageState {
   tokensEstimated: boolean;
   hasAuthoritativeTokenReceipt: boolean;
 }
+
+type WritableRunUsageState = RunUsageState & {
+  generation: number;
+  phase: "in-progress" | "terminal";
+};
 
 const LOG_FILENAME = "gnhf.log";
 const STOP_WHEN_FILENAME = "stop-when";
@@ -446,7 +453,7 @@ export function readRunUsageState(
 
 export function writeRunUsageState(
   runInfo: Pick<RunInfo, "runDir">,
-  usageState: RunUsageState,
+  usageState: WritableRunUsageState,
 ): void {
   const usagePath = join(runInfo.runDir, USAGE_STATE_FILENAME);
   const temporaryPath = join(
@@ -471,6 +478,7 @@ function isRunUsageState(value: unknown): value is RunUsageState {
   }
   const state = value as Record<string, unknown>;
   return (
+    hasValidUsageGeneration(state) &&
     isNonNegativeFiniteNumber(state.totalInputTokens) &&
     isNonNegativeFiniteNumber(state.totalOutputTokens) &&
     isNonNegativeFiniteNumber(state.totalTokens) &&
@@ -480,6 +488,18 @@ function isRunUsageState(value: unknown): value is RunUsageState {
     typeof state.reportedCostUnavailable === "boolean" &&
     typeof state.tokensEstimated === "boolean" &&
     typeof state.hasAuthoritativeTokenReceipt === "boolean"
+  );
+}
+
+function hasValidUsageGeneration(state: Record<string, unknown>): boolean {
+  if (state.generation === undefined && state.phase === undefined) {
+    return true;
+  }
+
+  return (
+    isNonNegativeFiniteNumber(state.generation) &&
+    Number.isInteger(state.generation) &&
+    (state.phase === "in-progress" || state.phase === "terminal")
   );
 }
 

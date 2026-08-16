@@ -614,6 +614,25 @@ describe("run usage state", () => {
 
   it("reads persisted cumulative usage", () => {
     const usageState = {
+      generation: 2,
+      phase: "terminal",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    };
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(JSON.stringify(usageState));
+
+    expect(readRunUsageState({ runDir: "/run" })).toEqual(usageState);
+  });
+
+  it("reads legacy cumulative usage as an unverified generation", () => {
+    const usageState = {
       totalInputTokens: 4,
       totalOutputTokens: 2,
       totalTokens: 12,
@@ -640,8 +659,31 @@ describe("run usage state", () => {
     );
   });
 
+  it("rejects incomplete usage generation metadata", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({
+        generation: 2,
+        totalInputTokens: 4,
+        totalOutputTokens: 2,
+        totalTokens: 12,
+        reportedCostUsd: 0.4,
+        tokensUnavailable: false,
+        reportedCostUnavailable: false,
+        tokensEstimated: false,
+        hasAuthoritativeTokenReceipt: true,
+      }),
+    );
+
+    expect(() => readRunUsageState({ runDir: "/run" })).toThrow(
+      "Invalid run usage metadata",
+    );
+  });
+
   it("publishes cumulative usage atomically", () => {
     const usageState = {
+      generation: 2,
+      phase: "terminal" as const,
       totalInputTokens: 4,
       totalOutputTokens: 2,
       totalTokens: 12,

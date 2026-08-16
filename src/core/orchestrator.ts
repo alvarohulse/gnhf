@@ -184,12 +184,19 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     this.pendingWorkspaceRecovery = readWorkspaceRecovery(this.runInfo);
     const usageState = readRunUsageState(this.runInfo);
     if (usageState !== null) {
+      const usageGenerationComplete =
+        usageState.phase === "terminal" &&
+        usageState.generation === startIteration;
       this.state.totalInputTokens = usageState.totalInputTokens;
       this.state.totalOutputTokens = usageState.totalOutputTokens;
       this.totalTokens = usageState.totalTokens;
-      this.state.reportedCostUsd = usageState.reportedCostUsd;
-      this.tokensUnavailable = usageState.tokensUnavailable;
-      this.reportedCostUnavailable = usageState.reportedCostUnavailable;
+      this.state.reportedCostUsd = usageGenerationComplete
+        ? usageState.reportedCostUsd
+        : null;
+      this.tokensUnavailable =
+        usageState.tokensUnavailable || !usageGenerationComplete;
+      this.reportedCostUnavailable =
+        usageState.reportedCostUnavailable || !usageGenerationComplete;
       this.state.tokensEstimated = usageState.tokensEstimated;
       this.hasAuthoritativeTokenReceipt =
         usageState.hasAuthoritativeTokenReceipt;
@@ -578,6 +585,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     );
 
     const agentStartedAt = Date.now();
+    this.writeUsageState(this.state.currentIteration, "in-progress");
     appendDebugLog("agent:run:start", {
       iteration: this.state.currentIteration,
       agent: redactAgentSpecForLogs(this.agent.name),
@@ -764,16 +772,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     if (!tokensAvailable) {
       this.tokensUnavailable = true;
     }
-    writeRunUsageState(this.runInfo, {
-      totalInputTokens: this.state.totalInputTokens,
-      totalOutputTokens: this.state.totalOutputTokens,
-      totalTokens: this.totalTokens,
-      reportedCostUsd: this.state.reportedCostUsd,
-      tokensUnavailable: this.tokensUnavailable,
-      reportedCostUnavailable: this.reportedCostUnavailable,
-      tokensEstimated: this.state.tokensEstimated,
-      hasAuthoritativeTokenReceipt: this.hasAuthoritativeTokenReceipt,
-    });
+    this.writeUsageState(iteration, "terminal");
     appendDebugLog("agent:run:end", {
       iteration,
       elapsedMs: Date.now() - startedAt,
@@ -787,6 +786,24 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       reportedCostAvailable: usage?.reportedCostUsd !== undefined,
       tokensAvailable,
       estimated: usage?.estimated ?? false,
+    });
+  }
+
+  private writeUsageState(
+    generation: number,
+    phase: "in-progress" | "terminal",
+  ): void {
+    writeRunUsageState(this.runInfo, {
+      generation,
+      phase,
+      totalInputTokens: this.state.totalInputTokens,
+      totalOutputTokens: this.state.totalOutputTokens,
+      totalTokens: this.totalTokens,
+      reportedCostUsd: this.state.reportedCostUsd,
+      tokensUnavailable: this.tokensUnavailable,
+      reportedCostUnavailable: this.reportedCostUnavailable,
+      tokensEstimated: this.state.tokensEstimated,
+      hasAuthoritativeTokenReceipt: this.hasAuthoritativeTokenReceipt,
     });
   }
 

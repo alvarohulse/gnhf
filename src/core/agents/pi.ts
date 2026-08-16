@@ -306,26 +306,27 @@ export class PiAgent implements Agent {
       let currentStreamingMessageKey: string | null = null;
 
       const updateUsage = (
-        message: JsonRecord,
+        message: JsonRecord | null,
         streaming = false,
         requireReceipt = false,
         usageOverride?: JsonRecord,
       ) => {
         const usage = toTokenUsage(
           usageOverride ??
-            (isRecord(message.usage) ? message.usage : undefined),
+            (message !== null && isRecord(message.usage)
+              ? message.usage
+              : undefined),
         );
         if (!usage && !requireReceipt) return;
 
-        let key = messageKey(message);
-        if (key === null) {
-          if (streaming && currentStreamingMessageKey !== null) {
-            key = currentStreamingMessageKey;
-          } else {
-            key = `assistant-anonymous-${anonymousKeySeq++}`;
-            if (streaming) currentStreamingMessageKey = key;
-          }
+        let key = streaming ? currentStreamingMessageKey : null;
+        if (key === null && message !== null) {
+          key = messageKey(message);
         }
+        if (key === null) {
+          key = `assistant-anonymous-${anonymousKeySeq++}`;
+        }
+        if (streaming) currentStreamingMessageKey = key;
         usageByMessageKey.set(
           key,
           usage ?? {
@@ -389,19 +390,38 @@ export class PiAgent implements Agent {
       ) => {
         if (!isRecord(message) || roleOf(message) !== "assistant") return;
         latestAssistantMessage = message;
+        if (streaming) {
+          currentStreamingMessageKey =
+            currentStreamingMessageKey ??
+            messageKey(message) ??
+            `assistant-anonymous-${anonymousKeySeq++}`;
+        }
         updateUsage(message, streaming, requireReceipt, usageOverride);
       };
 
       parseJSONLStream<JsonRecord>(child.stdout!, logStream, (event) => {
         if (!isRecord(event)) return;
 
+        if (event.type === "message_start") {
+          if (
+            isRecord(event.message) &&
+            roleOf(event.message) === "assistant"
+          ) {
+            currentStreamingMessageKey =
+              messageKey(event.message) ??
+              currentStreamingMessageKey ??
+              `assistant-anonymous-${anonymousKeySeq++}`;
+            updateUsage(event.message, true);
+          }
+        }
+
         if (event.type === "message_update") {
-          rememberAssistantMessage(
-            event.message,
-            true,
-            false,
-            isRecord(event.usage) ? event.usage : undefined,
-          );
+          const liveUsage = isRecord(event.usage) ? event.usage : undefined;
+          if (isRecord(event.message)) {
+            rememberAssistantMessage(event.message, true, false, liveUsage);
+          } else if (liveUsage !== undefined) {
+            updateUsage(null, true, false, liveUsage);
+          }
 
           if (isRecord(event.assistantMessageEvent)) {
             const assistantEvent = event.assistantMessageEvent;
