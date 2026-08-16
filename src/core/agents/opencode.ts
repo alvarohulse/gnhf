@@ -1,8 +1,4 @@
-import {
-  execFileSync,
-  spawn,
-  type ChildProcessWithoutNullStreams,
-} from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createWriteStream, type WriteStream } from "node:fs";
 import { createServer } from "node:net";
 import {
@@ -22,10 +18,12 @@ import {
   IncompleteChildProcessShutdownError,
   shouldDetachAgentProcess,
   shutdownChildProcess,
+  shutdownWindowsProcessTree,
   spawnManagedChildProcess,
 } from "./managed-process.js";
 
 interface OpenCodeMessagePart {
+  messageID?: string;
   type?: string;
   text?: string;
   metadata?: {
@@ -176,6 +174,7 @@ interface RequestOptions {
 }
 
 interface OpenCodeTextPartState {
+  messageId?: string;
   phase?: string;
   text: string;
 }
@@ -223,21 +222,6 @@ function buildPrompt(prompt: string, schema: AgentOutputSchema): string {
     "Do not include any prose before or after the JSON.",
     `The JSON must match this schema exactly: ${JSON.stringify(schema)}`,
   ].join("\n");
-}
-
-/**
- * On Windows with `shell: true`, `child.pid` is the `cmd.exe` wrapper, not
- * the actual server process.  `taskkill /T` terminates the entire process
- * tree rooted at that PID so the real server doesn't survive shutdown.
- */
-async function killWindowsProcessTree(pid: number): Promise<void> {
-  try {
-    execFileSync("taskkill", ["/T", "/F", "/PID", String(pid)], {
-      stdio: "ignore",
-    });
-  } catch {
-    // Best-effort: the process may have already exited.
-  }
 }
 
 function createAbortError(): Error {
@@ -579,6 +563,7 @@ export class OpenCodeAgent implements Agent {
         stdio: ["ignore", "pipe", "pipe"],
         env: buildOpencodeChildEnv(),
       },
+      this.shutdowns,
     ) as unknown as ChildProcessWithoutNullStreams;
 
     const server: OpenCodeServer = {
@@ -800,9 +785,14 @@ export class OpenCodeAgent implements Agent {
     onMessage?: (text: string) => void,
   ): Promise<AgentResult> {
     const streamAbortController = new AbortController();
+    const messageAbortController = new AbortController();
     const streamSignal = AbortSignal.any([
       signal,
       streamAbortController.signal,
+    ]);
+    const messageSignal = AbortSignal.any([
+      signal,
+      messageAbortController.signal,
     ]);
     const streamStartedAt = Date.now();
     appendDebugLog("opencode:stream:start", { sessionId });
@@ -829,6 +819,7 @@ export class OpenCodeAgent implements Agent {
     const stepUsageByMessageId = new Map<string, Map<string, TokenUsage>>();
     const textParts = new Map<string, OpenCodeTextPartState>();
     let lastFinalAnswerText: string | null = null;
+    let lastFinalAnswerMessageId: string | null = null;
     let lastUsageSignature = "0:0:0:0:0:na:true";
     let structuredOutputFromSSE: AgentOutput | null = null;
     let streamErrorInfo: OpenCodeStreamErrorInfo | null = null;
@@ -893,7 +884,7 @@ export class OpenCodeAgent implements Agent {
             parts: [{ type: "text", text: prompt }],
             format: buildStructuredOutputFormat(this.schema),
           },
-          signal,
+          signal: messageSignal,
         });
         appendDebugLog("opencode:message-post:end", {
           sessionId,
@@ -941,6 +932,29 @@ export class OpenCodeAgent implements Agent {
     }, 15_000);
     stallTimer.unref?.();
 
+    const emitUsage = () => {
+      const signature = [
+        usage.inputTokens,
+        usage.outputTokens,
+        usage.cacheReadTokens,
+        usage.cacheCreationTokens,
+        usage.totalTokens ?? "na",
+        usage.reportedCostUsd ?? "na",
+        usage.tokensAvailable,
+      ].join(":");
+      if (signature !== lastUsageSignature) {
+        lastUsageSignature = signature;
+        onUsage?.({ ...usage });
+      }
+    };
+
+    const markUsageUnavailable = () => {
+      usage.tokensAvailable = false;
+      delete usage.totalTokens;
+      delete usage.reportedCostUsd;
+      emitUsage();
+    };
+
     const updateUsage = (
       messageId: string | undefined,
       tokens?: OpenCodeTokens,
@@ -948,7 +962,13 @@ export class OpenCodeAgent implements Agent {
       requireReceipt = false,
       stepId?: string,
     ) => {
-      if (!messageId || (!tokens && cost === undefined && !requireReceipt)) {
+      if (!messageId) {
+        if (requireReceipt) {
+          markUsageUnavailable();
+        }
+        return;
+      }
+      if (!tokens && cost === undefined && !requireReceipt) {
         return;
       }
       const nextUsage = toUsage(tokens, cost);
@@ -993,24 +1013,25 @@ export class OpenCodeAgent implements Agent {
       } else {
         usage.reportedCostUsd = combined.reportedCostUsd;
       }
-      const signature = [
-        usage.inputTokens,
-        usage.outputTokens,
-        usage.cacheReadTokens,
-        usage.cacheCreationTokens,
-        usage.totalTokens ?? "na",
-        usage.reportedCostUsd ?? "na",
-        usage.tokensAvailable,
-      ].join(":");
-      if (signature !== lastUsageSignature) {
-        lastUsageSignature = signature;
-        onUsage?.({ ...usage });
-      }
+      emitUsage();
     };
 
-    const emitText = (partId: string, nextText: string, phase?: string) => {
+    const emitText = (
+      partId: string,
+      nextText: string,
+      phase?: string,
+      messageId?: string,
+    ) => {
+      const current = textParts.get(partId);
+      const resolvedMessageId = messageId ?? current?.messageId;
       const trimmed = nextText.trim();
-      textParts.set(partId, { text: nextText, phase });
+      textParts.set(partId, {
+        text: nextText,
+        phase,
+        ...(resolvedMessageId === undefined
+          ? {}
+          : { messageId: resolvedMessageId }),
+      });
       notePhase(phase);
       if (!trimmed) return;
       // Reasoning-phase text and echoed user-prompt text used to leak into
@@ -1019,6 +1040,7 @@ export class OpenCodeAgent implements Agent {
       // structured output - everything else is just transcript noise.
       if (phase === "final_answer") {
         lastFinalAnswerText = nextText;
+        lastFinalAnswerMessageId = resolvedMessageId ?? null;
       }
       onMessage?.(trimmed);
     };
@@ -1061,7 +1083,12 @@ export class OpenCodeAgent implements Agent {
         if (!part) return false;
 
         if (part.type === "text" && typeof part.id === "string") {
-          emitText(part.id, part.text ?? "", part.metadata?.openai?.phase);
+          emitText(
+            part.id,
+            part.text ?? "",
+            part.metadata?.openai?.phase,
+            part.messageID,
+          );
           return false;
         }
 
@@ -1203,6 +1230,10 @@ export class OpenCodeAgent implements Agent {
         bytesRead += chunk.length;
         processBufferedEvents();
       }
+    } catch (error) {
+      messageAbortController.abort();
+      await messageRequest;
+      throw error;
     } finally {
       clearInterval(stallTimer);
       streamAbortController.abort();
@@ -1265,6 +1296,13 @@ export class OpenCodeAgent implements Agent {
         hasStructuredOutput: structuredOutputFromSSE !== null,
       });
       throw new Error("OpenCode produced no final answer");
+    }
+
+    if (
+      lastFinalAnswerMessageId === null ||
+      !usageByMessageId.has(lastFinalAnswerMessageId)
+    ) {
+      markUsageUnavailable();
     }
 
     try {
@@ -1370,8 +1408,8 @@ export class OpenCodeAgent implements Agent {
   }
 
   private shutdownServerProcess(server: OpenCodeServer): Promise<void> {
-    if (this.platform === "win32" && server.child.pid) {
-      return killWindowsProcessTree(server.child.pid);
+    if (this.platform === "win32") {
+      return shutdownWindowsProcessTree(server.child);
     }
 
     return shutdownChildProcess(server.child, {
