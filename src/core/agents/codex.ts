@@ -13,7 +13,11 @@ import {
   setupAbortHandler,
   setupChildProcessHandlers,
 } from "./stream-utils.js";
-import { shutdownChildProcess } from "./managed-process.js";
+import {
+  ChildProcessShutdownTracker,
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+} from "./managed-process.js";
 
 interface CodexItemCompleted {
   type: "item.completed";
@@ -35,6 +39,7 @@ interface CodexAgentDeps {
   bin?: string;
   extraArgs?: string[];
   platform?: NodeJS.Platform;
+  supervisedProcessGroup?: boolean;
 }
 
 function shouldUseWindowsShell(
@@ -89,13 +94,14 @@ function terminateCodexProcess(
 async function shutdownCodexProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
+  detached: boolean,
 ): Promise<void> {
   if (platform === "win32") {
     terminateCodexProcess(child, platform);
     return;
   }
 
-  await shutdownChildProcess(child, { detached: false });
+  await shutdownChildProcess(child, { detached });
 }
 
 function buildCodexArgs(
@@ -136,15 +142,21 @@ export class CodexAgent implements Agent {
 
   private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
+  private detached: boolean;
   private extraArgs?: string[];
   private platform: NodeJS.Platform;
   private schemaPath: string;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(schemaPath: string, binOrDeps: string | CodexAgentDeps = {}) {
     const deps = typeof binOrDeps === "string" ? { bin: binOrDeps } : binOrDeps;
     this.bin = deps.bin ?? "codex";
     this.extraArgs = deps.extraArgs;
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.schemaPath = schemaPath;
   }
 
@@ -163,6 +175,7 @@ export class CodexAgent implements Agent {
         buildCodexArgs(prompt, this.schemaPath, this.extraArgs),
         {
           cwd,
+          detached: this.detached,
           shell: shouldUseWindowsShell(this.bin, this.platform),
           stdio: ["ignore", "pipe", "pipe"],
           env: process.env,
@@ -176,9 +189,11 @@ export class CodexAgent implements Agent {
       });
 
       if (
-        setupAbortHandler(signal, child, reject, () =>
-          terminateCodexProcess(child, this.platform),
-        )
+        setupAbortHandler(signal, child, reject, () => {
+          void this.shutdowns.start(() =>
+            shutdownCodexProcess(child, this.platform, this.detached),
+          );
+        })
       ) {
         return;
       }
@@ -247,7 +262,12 @@ export class CodexAgent implements Agent {
   }
 
   async close(): Promise<void> {
-    if (this.activeChild === null) return;
-    await shutdownCodexProcess(this.activeChild, this.platform);
+    const activeChild = this.activeChild;
+    if (activeChild !== null) {
+      this.shutdowns.start(() =>
+        shutdownCodexProcess(activeChild, this.platform, this.detached),
+      );
+    }
+    await this.shutdowns.waitForAll();
   }
 }

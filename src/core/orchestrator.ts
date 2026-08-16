@@ -55,8 +55,7 @@ export interface OrchestratorState {
   totalOutputTokens: number;
   reportedCostUsd: number | null;
   tokensAvailable?: boolean;
-  // Sticky diagnostic flag: true when at least one iteration's usage was
-  // estimated (e.g. an ACP adapter that doesn't emit usage_update).
+  // Sticky diagnostic flag for completed iterations that returned estimates.
   tokensEstimated: boolean;
   commitCount: number;
   iterations: IterationRecord[];
@@ -125,6 +124,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private pendingAbortReason: string | null = null;
   private pendingWorkspaceRecovery: WorkspaceRecovery | null = null;
   private activeWorkspaceRecoveryMarker = false;
+  private closePromise: Promise<void> | null = null;
   private activeIterationTokensAvailable: boolean | null = null;
   private activeIterationTokensEstimated = false;
   private hasAuthoritativeTokenReceipt = false;
@@ -280,6 +280,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   async start(): Promise<void> {
     this.state.startTime = new Date();
     this.state.status = "running";
+    this.activeIterationTokensAvailable = false;
     // Preserve a pre-start graceful-stop request. ctrl+c can land after the
     // renderer starts listening but before the orchestrator loop begins.
     this.emit("state", this.getState());
@@ -310,6 +311,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
         this.state.currentIteration++;
         this.state.status = "running";
+        this.activeIterationTokensAvailable = false;
+        this.activeIterationTokensEstimated = false;
         this.emit("iteration:start", this.state.currentIteration);
         this.emit("state", this.getState());
 
@@ -488,9 +491,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private async runIteration(prompt: string): Promise<RunIterationResult> {
     const baseInputTokens = this.state.totalInputTokens;
     const baseOutputTokens = this.state.totalOutputTokens;
-    const baseReportedCostUsd = this.state.reportedCostUsd ?? 0;
-    let iterationReportedCostAvailable = false;
-    let latestUsage: TokenUsage | null = null;
+    const baseReportedCostUsd = this.state.reportedCostUsd;
     let agentRunReceiptWritten = false;
 
     if (
@@ -507,32 +508,32 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
     this.activeAbortController = new AbortController();
     this.pendingAbortReason = null;
-    this.activeIterationTokensAvailable = null;
-    this.activeIterationTokensEstimated = false;
 
     const onUsage = (usage: TokenUsage) => {
-      latestUsage = { ...usage };
       const tokensAvailable = hasCompleteTokenUsage(usage);
       const tokensAuthoritative = tokensAvailable && usage.estimated !== true;
       this.activeIterationTokensAvailable = tokensAvailable;
       if (tokensAvailable) {
-        this.hasAuthoritativeTokenReceipt ||= tokensAuthoritative;
         this.state.totalInputTokens = baseInputTokens + usage.inputTokens;
         this.state.totalOutputTokens = baseOutputTokens + usage.outputTokens;
+      } else {
+        this.state.totalInputTokens = baseInputTokens;
+        this.state.totalOutputTokens = baseOutputTokens;
       }
       if (
         usage.reportedCostUsd !== undefined &&
         !this.reportedCostUnavailable
       ) {
-        iterationReportedCostAvailable = true;
         this.state.reportedCostUsd =
-          baseReportedCostUsd + usage.reportedCostUsd;
+          (baseReportedCostUsd ?? 0) + usage.reportedCostUsd;
+      } else {
+        this.state.reportedCostUsd = baseReportedCostUsd;
       }
       this.activeIterationTokensEstimated = usage.estimated === true;
       this.emit("state", this.getState());
 
       const reason =
-        (tokensAvailable ? this.getTokenAbortReason() : null) ??
+        (tokensAuthoritative ? this.getTokenAbortReason(true) : null) ??
         this.getReportedCostAbortReason();
       if (
         reason &&
@@ -569,7 +570,21 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         logPath,
       });
 
-      latestUsage = result.usage;
+      if (this.stopRequested) {
+        restoreLiveUsage(this);
+        this.reportedCostUnavailable = true;
+        this.state.reportedCostUsd = null;
+        this.appendAgentRunReceipt({
+          iteration: this.state.currentIteration,
+          startedAt: agentStartedAt,
+          outcome: "stopped",
+          success: null,
+          usage: null,
+        });
+        agentRunReceiptWritten = true;
+        return { type: "stopped" };
+      }
+
       this.activeIterationTokensAvailable = hasCompleteTokenUsage(result.usage);
       this.activeIterationTokensEstimated = false;
       if (hasCompleteTokenUsage(result.usage)) {
@@ -578,15 +593,19 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           baseInputTokens + result.usage.inputTokens;
         this.state.totalOutputTokens =
           baseOutputTokens + result.usage.outputTokens;
+      } else {
+        this.state.totalInputTokens = baseInputTokens;
+        this.state.totalOutputTokens = baseOutputTokens;
       }
-      if (result.usage.estimated) this.state.tokensEstimated = true;
+      if (result.usage.estimated) {
+        this.state.tokensEstimated = true;
+      }
       if (result.usage.reportedCostUsd === undefined) {
         this.reportedCostUnavailable = true;
         this.state.reportedCostUsd = null;
       } else if (!this.reportedCostUnavailable) {
-        iterationReportedCostAvailable = true;
         this.state.reportedCostUsd =
-          baseReportedCostUsd + result.usage.reportedCostUsd;
+          (baseReportedCostUsd ?? 0) + result.usage.reportedCostUsd;
       }
 
       this.appendAgentRunReceipt({
@@ -597,10 +616,6 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         usage: result.usage,
       });
       agentRunReceiptWritten = true;
-
-      if (this.stopRequested) {
-        return { type: "stopped" };
-      }
 
       const shouldFullyStop = result.output.should_fully_stop === true;
 
@@ -629,16 +644,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       };
     } catch (err) {
       const elapsedMs = Date.now() - agentStartedAt;
-      if (!iterationReportedCostAvailable) {
+      if (!agentRunReceiptWritten) {
+        restoreLiveUsage(this);
         this.reportedCostUnavailable = true;
         this.state.reportedCostUsd = null;
-      }
-      if (this.activeIterationTokensEstimated) {
-        this.state.tokensEstimated = true;
-        this.activeIterationTokensEstimated = false;
-      }
-
-      if (!agentRunReceiptWritten) {
         const outcome: AgentRunOutcome =
           this.pendingAbortReason !== null || err instanceof PermanentAgentError
             ? "aborted"
@@ -650,7 +659,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           startedAt: agentStartedAt,
           outcome,
           success: null,
-          usage: latestUsage,
+          usage: null,
         });
       }
 
@@ -664,6 +673,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           elapsedMs,
           reason: this.pendingAbortReason,
         });
+        await this.closeAgent();
         if (this.pendingWorkspaceRecovery === null) {
           this.resetWorkspace();
         }
@@ -705,7 +715,16 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     } finally {
       this.activeAbortController = null;
       this.activeIterationTokensAvailable = null;
+      this.activeIterationTokensEstimated = false;
       this.pendingAbortReason = null;
+    }
+
+    function restoreLiveUsage(orchestrator: Orchestrator): void {
+      orchestrator.state.totalInputTokens = baseInputTokens;
+      orchestrator.state.totalOutputTokens = baseOutputTokens;
+      orchestrator.state.reportedCostUsd = baseReportedCostUsd;
+      orchestrator.activeIterationTokensAvailable = false;
+      orchestrator.activeIterationTokensEstimated = false;
     }
   }
 
@@ -943,11 +962,14 @@ ${recovery.detail}
     return this.getTokenAbortReason() ?? this.getReportedCostAbortReason();
   }
 
-  private getTokenAbortReason(): string | null {
+  private getTokenAbortReason(
+    hasAuthoritativeReceipt = this.hasAuthoritativeTokenReceipt,
+  ): string | null {
     if (
       this.limits.maxTokens === undefined ||
       this.tokensUnavailable ||
-      !this.hasAuthoritativeTokenReceipt
+      this.state.tokensEstimated ||
+      !hasAuthoritativeReceipt
     ) {
       return null;
     }
@@ -1009,14 +1031,19 @@ ${recovery.detail}
   }
 
   private async closeAgent(): Promise<void> {
-    try {
-      await this.agent.close?.();
-    } catch (err) {
-      appendDebugLog("agent:close:error", {
-        error: serializeError(err),
-      });
-      // Best-effort cleanup only.
+    if (this.closePromise === null) {
+      this.closePromise = (async () => {
+        try {
+          await this.agent.close?.();
+        } catch (err) {
+          appendDebugLog("agent:close:error", {
+            error: serializeError(err),
+          });
+          // Best-effort cleanup only.
+        }
+      })();
     }
+    await this.closePromise;
   }
 
   private emitStopped(): void {

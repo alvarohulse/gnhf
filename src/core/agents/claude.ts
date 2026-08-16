@@ -12,6 +12,7 @@ import {
   PermanentAgentError,
 } from "./types.js";
 import {
+  ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
 } from "./managed-process.js";
@@ -350,6 +351,7 @@ export class ClaudeAgent implements Agent {
   private detached: boolean;
   private platform: NodeJS.Platform;
   private schema: AgentOutputSchema;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(binOrDeps: string | ClaudeAgentDeps = {}) {
     const deps = typeof binOrDeps === "string" ? { bin: binOrDeps } : binOrDeps;
@@ -395,9 +397,11 @@ export class ClaudeAgent implements Agent {
       });
 
       if (
-        setupAbortHandler(signal, child, reject, () =>
-          terminateClaudeProcess(child, this.platform, this.detached),
-        )
+        setupAbortHandler(signal, child, reject, () => {
+          void this.shutdowns.start(() =>
+            shutdownClaudeProcess(child, this.platform, this.detached),
+          );
+        })
       ) {
         return;
       }
@@ -559,7 +563,9 @@ export class ClaudeAgent implements Agent {
             }
             finalResultCleanupTimer = setTimeout(() => {
               closedAfterFinalCleanup = true;
-              void shutdownClaudeProcess(child, this.platform, this.detached);
+              void this.shutdowns.start(() =>
+                shutdownClaudeProcess(child, this.platform, this.detached),
+              );
             }, this.finalResultGraceMs);
           } else if (
             !finalStructuredResultEvent &&
@@ -573,11 +579,14 @@ export class ClaudeAgent implements Agent {
         }
       });
 
-      child.on("close", (code) => {
+      child.on("close", async (code) => {
         if (finalResultCleanupTimer) {
           clearTimeout(finalResultCleanupTimer);
         }
         logStream?.end();
+        if (closedAfterFinalCleanup) {
+          await this.shutdowns.waitForAll();
+        }
         const terminalUsage = getResultUsage();
         if (code !== 0 && !closedAfterFinalCleanup) {
           const failure = describeExitFailure(code, stdoutTail, stderr);
@@ -623,7 +632,12 @@ export class ClaudeAgent implements Agent {
   }
 
   async close(): Promise<void> {
-    if (this.activeChild === null) return;
-    await shutdownClaudeProcess(this.activeChild, this.platform, this.detached);
+    const activeChild = this.activeChild;
+    if (activeChild !== null) {
+      this.shutdowns.start(() =>
+        shutdownClaudeProcess(activeChild, this.platform, this.detached),
+      );
+    }
+    await this.shutdowns.waitForAll();
   }
 }

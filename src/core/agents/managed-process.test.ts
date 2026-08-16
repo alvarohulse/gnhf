@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
   signalChildProcess,
@@ -30,6 +31,28 @@ describe("shouldDetachAgentProcess", () => {
 
   it("does not detach Windows agents", () => {
     expect(shouldDetachAgentProcess("win32", false)).toBe(false);
+  });
+});
+
+describe("ChildProcessShutdownTracker", () => {
+  it("waits for retained shutdowns", async () => {
+    let resolveShutdown!: () => void;
+    const shutdown = new Promise<void>((resolve) => {
+      resolveShutdown = resolve;
+    });
+    const tracker = new ChildProcessShutdownTracker();
+    let finished = false;
+
+    tracker.start(() => shutdown);
+    const wait = tracker.waitForAll().then(() => {
+      finished = true;
+    });
+    await Promise.resolve();
+    expect(finished).toBe(false);
+
+    resolveShutdown();
+    await wait;
+    expect(finished).toBe(true);
   });
 });
 
@@ -164,6 +187,51 @@ describe("shutdownChildProcess", () => {
     await vi.advanceTimersByTimeAsync(3_000);
     expect(child.kill).not.toHaveBeenCalledWith("SIGKILL");
 
+    vi.useRealTimers();
+  });
+
+  it("continues owned-group escalation after the leader closes", async () => {
+    const child = createChildProcess();
+    const killProcess = vi.fn(() => true as const);
+
+    const closePromise = shutdownChildProcess(child, {
+      detached: true,
+      killProcess,
+      timeoutMs: 3_000,
+    });
+
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGTERM");
+    child.emit("close", 0, null);
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGKILL");
+
+    await vi.advanceTimersByTimeAsync(100);
+    await closePromise;
+    vi.useRealTimers();
+  });
+
+  it("shares concurrent shutdown supervision", async () => {
+    const child = createChildProcess();
+    const killProcess = vi.fn(() => true as const);
+
+    const firstShutdown = shutdownChildProcess(child, {
+      detached: true,
+      killProcess,
+      timeoutMs: 3_000,
+    });
+    const secondShutdown = shutdownChildProcess(child, {
+      detached: true,
+      killProcess,
+      timeoutMs: 3_000,
+    });
+
+    expect(secondShutdown).toBe(firstShutdown);
+    expect(killProcess).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(3_100);
+    await Promise.all([firstShutdown, secondShutdown]);
+    expect(killProcess).toHaveBeenCalledTimes(2);
     vi.useRealTimers();
   });
 

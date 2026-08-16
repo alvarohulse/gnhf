@@ -270,12 +270,7 @@ describe("ClaudeAgent", () => {
     mockSpawn.mockReturnValue(proc);
     const processKill = vi
       .spyOn(process, "kill")
-      .mockImplementation((pid, signal) => {
-        if (pid === -4321 && signal === "SIGKILL") {
-          queueMicrotask(() => proc.emit("close", null));
-        }
-        return true;
-      });
+      .mockImplementation(() => true);
     const controller = new AbortController();
     const unixAgent = new ClaudeAgent({ platform: "linux" });
 
@@ -285,11 +280,13 @@ describe("ClaudeAgent", () => {
       });
       controller.abort();
       await expect(runPromise).rejects.toThrow("Agent was aborted");
+      proc.emit("close", null);
 
       const closePromise = unixAgent.close();
       await vi.advanceTimersByTimeAsync(3_000);
 
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
+      await vi.advanceTimersByTimeAsync(100);
       await closePromise;
     } finally {
       processKill.mockRestore();
@@ -312,6 +309,10 @@ describe("ClaudeAgent", () => {
       });
 
       const promise = configuredAgent.run("prompt", "/cwd");
+      let resolved = false;
+      void promise.then(() => {
+        resolved = true;
+      });
 
       emitLine(proc, {
         type: "result",
@@ -338,6 +339,12 @@ describe("ClaudeAgent", () => {
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
 
       proc.emit("close", null);
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
+      await vi.advanceTimersByTimeAsync(100);
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "done" },
       });
@@ -397,6 +404,7 @@ describe("ClaudeAgent", () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
 
+      await vi.advanceTimersByTimeAsync(100);
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "done" },
       });
@@ -473,6 +481,7 @@ describe("ClaudeAgent", () => {
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
 
       proc.emit("close", null);
+      await vi.advanceTimersByTimeAsync(3_100);
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "second turn" },
       });
@@ -522,6 +531,7 @@ describe("ClaudeAgent", () => {
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
 
       proc.emit("close", null);
+      await vi.advanceTimersByTimeAsync(3_100);
       await promise;
     } finally {
       processKill.mockRestore();

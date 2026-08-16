@@ -159,6 +159,38 @@ describe("PiAgent", () => {
     expect(proc.kill).not.toHaveBeenCalled();
   });
 
+  it("finishes owned-group shutdown after the leader closes on abort", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 4321 });
+    mockSpawn.mockReturnValue(proc);
+    const processKill = vi
+      .spyOn(process, "kill")
+      .mockImplementation(() => true);
+    const controller = new AbortController();
+    const agent = new PiAgent({ platform: "linux" });
+
+    try {
+      const runPromise = agent.run("test prompt", "/work/dir", {
+        signal: controller.signal,
+      });
+      controller.abort();
+      await expect(runPromise).rejects.toThrow("Agent was aborted");
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
+
+      proc.emit("close", null);
+      const closePromise = agent.close();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
+
+      await vi.advanceTimersByTimeAsync(100);
+      await closePromise;
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("streams text deltas to onMessage", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);

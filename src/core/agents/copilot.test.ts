@@ -41,6 +41,7 @@ describe("CopilotAgent", () => {
     const args = mockSpawn.mock.calls[0]![1] as string[];
     expect(mockSpawn).toHaveBeenCalledWith("copilot", args, {
       cwd: "/work/dir",
+      detached: false,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
@@ -113,6 +114,72 @@ describe("CopilotAgent", () => {
       "--allow-all-tools",
     ]);
     expect(args).not.toContain("--allow-all");
+  });
+
+  it("creates an owned process group for unsupervised Unix runs", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CopilotAgent({
+      platform: "linux",
+      supervisedProcessGroup: false,
+    });
+
+    agent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "copilot",
+      expect.any(Array),
+      expect.objectContaining({ detached: true }),
+    );
+  });
+
+  it("stays inside an external supervisor process group", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new CopilotAgent({
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+
+    agent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "copilot",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
+    );
+  });
+
+  it("finishes owned-group shutdown after the leader closes on abort", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 4321 });
+    mockSpawn.mockReturnValue(proc);
+    const processKill = vi
+      .spyOn(process, "kill")
+      .mockImplementation(() => true);
+    const controller = new AbortController();
+    const agent = new CopilotAgent({ platform: "linux" });
+
+    try {
+      const runPromise = agent.run("test prompt", "/work/dir", {
+        signal: controller.signal,
+      });
+      controller.abort();
+      await expect(runPromise).rejects.toThrow("Agent was aborted");
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
+
+      proc.emit("close", null);
+      const closePromise = agent.close();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
+
+      await vi.advanceTimersByTimeAsync(100);
+      await closePromise;
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("kills the full process tree on Windows when aborted", async () => {

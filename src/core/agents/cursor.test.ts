@@ -680,6 +680,10 @@ describe("CursorAgent", () => {
       });
 
       const promise = agent.run("test prompt", "/work/dir");
+      let resolved = false;
+      void promise.then(() => {
+        resolved = true;
+      });
       emitJson(proc, {
         type: "result",
         subtype: "success",
@@ -694,6 +698,12 @@ describe("CursorAgent", () => {
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
 
       proc.emit("close", null);
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
+      await vi.advanceTimersByTimeAsync(100);
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "done" },
       });
@@ -747,6 +757,7 @@ describe("CursorAgent", () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
 
+      await vi.advanceTimersByTimeAsync(100);
       await expect(promise).resolves.toMatchObject({
         output: { success: true, summary: "done" },
       });

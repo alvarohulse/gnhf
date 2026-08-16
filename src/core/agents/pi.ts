@@ -17,6 +17,7 @@ import {
   setupChildProcessHandlers,
 } from "./stream-utils.js";
 import {
+  ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
 } from "./managed-process.js";
@@ -231,6 +232,7 @@ export class PiAgent implements Agent {
   private extraArgs?: string[];
   private platform: NodeJS.Platform;
   private schema: AgentOutputSchema;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(deps: PiAgentDeps = {}) {
     this.bin = deps.bin ?? "pi";
@@ -271,9 +273,11 @@ export class PiAgent implements Agent {
       child.stdin?.end();
 
       if (
-        setupAbortHandler(signal, child, reject, () =>
-          terminatePiProcess(child, this.platform, this.detached),
-        )
+        setupAbortHandler(signal, child, reject, () => {
+          void this.shutdowns.start(() =>
+            shutdownPiProcess(child, this.platform, this.detached),
+          );
+        })
       ) {
         return;
       }
@@ -455,7 +459,12 @@ export class PiAgent implements Agent {
   }
 
   async close(): Promise<void> {
-    if (this.activeChild === null) return;
-    await shutdownPiProcess(this.activeChild, this.platform, this.detached);
+    const activeChild = this.activeChild;
+    if (activeChild !== null) {
+      this.shutdowns.start(() =>
+        shutdownPiProcess(activeChild, this.platform, this.detached),
+      );
+    }
+    await this.shutdowns.waitForAll();
   }
 }

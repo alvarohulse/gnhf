@@ -15,7 +15,11 @@ import {
   setupAbortHandler,
   setupChildProcessHandlers,
 } from "./stream-utils.js";
-import { shutdownChildProcess } from "./managed-process.js";
+import {
+  ChildProcessShutdownTracker,
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+} from "./managed-process.js";
 
 interface CopilotAssistantMessageEvent {
   type: "assistant.message";
@@ -38,6 +42,7 @@ interface CopilotAgentDeps {
   extraArgs?: string[];
   platform?: NodeJS.Platform;
   schema?: AgentOutputSchema;
+  supervisedProcessGroup?: boolean;
 }
 
 function shouldUseWindowsShell(
@@ -92,13 +97,14 @@ function terminateCopilotProcess(
 async function shutdownCopilotProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
+  detached: boolean,
 ): Promise<void> {
   if (platform === "win32") {
     terminateCopilotProcess(child, platform);
     return;
   }
 
-  await shutdownChildProcess(child, { detached: false });
+  await shutdownChildProcess(child, { detached });
 }
 
 function userSpecifiedPermissionMode(userArgs: string[]): boolean {
@@ -211,15 +217,21 @@ export class CopilotAgent implements Agent {
 
   private activeChild: ReturnType<typeof spawn> | null = null;
   private bin: string;
+  private detached: boolean;
   private extraArgs?: string[];
   private platform: NodeJS.Platform;
   private schema: AgentOutputSchema;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(binOrDeps: string | CopilotAgentDeps = {}) {
     const deps = typeof binOrDeps === "string" ? { bin: binOrDeps } : binOrDeps;
     this.bin = deps.bin ?? "copilot";
     this.extraArgs = deps.extraArgs;
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.schema =
       deps.schema ?? buildAgentOutputSchema({ includeStopField: false });
   }
@@ -239,6 +251,7 @@ export class CopilotAgent implements Agent {
         buildCopilotArgs(prompt, this.schema, this.extraArgs),
         {
           cwd,
+          detached: this.detached,
           shell: shouldUseWindowsShell(this.bin, this.platform),
           stdio: ["ignore", "pipe", "pipe"],
           env: process.env,
@@ -252,9 +265,11 @@ export class CopilotAgent implements Agent {
       });
 
       if (
-        setupAbortHandler(signal, child, reject, () =>
-          terminateCopilotProcess(child, this.platform),
-        )
+        setupAbortHandler(signal, child, reject, () => {
+          void this.shutdowns.start(() =>
+            shutdownCopilotProcess(child, this.platform, this.detached),
+          );
+        })
       ) {
         return;
       }
@@ -322,7 +337,12 @@ export class CopilotAgent implements Agent {
   }
 
   async close(): Promise<void> {
-    if (this.activeChild === null) return;
-    await shutdownCopilotProcess(this.activeChild, this.platform);
+    const activeChild = this.activeChild;
+    if (activeChild !== null) {
+      this.shutdowns.start(() =>
+        shutdownCopilotProcess(activeChild, this.platform, this.detached),
+      );
+    }
+    await this.shutdowns.waitForAll();
   }
 }

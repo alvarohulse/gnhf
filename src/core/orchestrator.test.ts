@@ -56,6 +56,7 @@ import {
   PermanentAgentError,
   type Agent,
   type AgentResult,
+  type TokenUsage,
 } from "./agents/types.js";
 import { CONVENTIONAL_COMMIT_MESSAGE } from "./commit-message.js";
 import type { Config } from "./config.js";
@@ -500,9 +501,15 @@ describe("Orchestrator stop limits", () => {
     expect(orchestrator.getState().status).toBe("aborted");
   });
 
-  it("aborts when reported token usage reaches the configured cap", async () => {
+  it("does not promote live token usage after a cap abort", async () => {
+    let resolveClose!: () => void;
+    const closePromise = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    const close = vi.fn(() => closePromise);
     const agent: Agent = {
       name: "claude",
+      close,
       run: vi.fn(
         (_prompt, _cwd, options) =>
           new Promise<AgentResult>((_resolve, reject) => {
@@ -532,16 +539,24 @@ describe("Orchestrator stop limits", () => {
     const abort = vi.fn();
     orchestrator.on("abort", abort);
 
-    await orchestrator.start();
+    const startPromise = orchestrator.start();
+    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+    expect(mockResetHard).not.toHaveBeenCalled();
+
+    resolveClose();
+    await startPromise;
 
     expect(agent.run).toHaveBeenCalledTimes(1);
     expect(mockAppendNotes).not.toHaveBeenCalled();
     expect(mockCommitAll).not.toHaveBeenCalled();
+    expect(mockResetHard).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
     expect(abort).toHaveBeenCalledWith("max tokens reached (11/10)");
     expect(orchestrator.getState()).toMatchObject({
       status: "aborted",
-      totalInputTokens: 7,
-      totalOutputTokens: 4,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      tokensAvailable: false,
     });
   });
 
@@ -662,8 +677,48 @@ describe("Orchestrator stop limits", () => {
     );
   });
 
-  it("exposes unavailable token usage while an iteration is active", async () => {
+  it("keeps token caps disabled after an estimated terminal receipt", async () => {
+    let callCount = 0;
+    const agent: Agent = {
+      name: "test",
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        callCount++;
+        const usage: TokenUsage = {
+          inputTokens: callCount === 1 ? 4 : callCount === 2 ? 7 : 1,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: true,
+          ...(callCount === 2 ? { estimated: true } : {}),
+        };
+        options?.onUsage?.(usage);
+        return { ...createSuccessResult(), usage };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 3, maxTokens: 10 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(3);
+    expect(abort).toHaveBeenCalledWith("max iterations reached (3)");
+    expect(abort).not.toHaveBeenCalledWith(
+      expect.stringContaining("max tokens"),
+    );
+  });
+
+  it("publishes unavailable usage before the first agent usage callback", async () => {
     let resolveRun!: (result: AgentResult) => void;
+    let reportUsage!: () => void;
     const unavailableUsage = {
       inputTokens: 0,
       outputTokens: 0,
@@ -677,7 +732,7 @@ describe("Orchestrator stop limits", () => {
         (_prompt, _cwd, options) =>
           new Promise<AgentResult>((resolve) => {
             resolveRun = resolve;
-            options?.onUsage?.(unavailableUsage);
+            reportUsage = () => options?.onUsage?.(unavailableUsage);
           }),
       ),
     };
@@ -690,12 +745,19 @@ describe("Orchestrator stop limits", () => {
       0,
       { maxIterations: 1 },
     );
+    const observedAvailability: Array<boolean | undefined> = [];
+    orchestrator.on("state", (state) => {
+      observedAvailability.push(state.tokensAvailable);
+    });
 
     const startPromise = orchestrator.start();
     await vi.waitFor(() => {
+      expect(agent.run).toHaveBeenCalledTimes(1);
       expect(orchestrator.getState().tokensAvailable).toBe(false);
     });
+    expect(observedAvailability[0]).toBe(false);
 
+    reportUsage();
     resolveRun({ ...createSuccessResult(), usage: unavailableUsage });
     await startPromise;
   });
@@ -742,22 +804,60 @@ describe("Orchestrator stop limits", () => {
     );
     expect(orchestrator.getState()).toMatchObject({
       status: "aborted",
-      reportedCostUsd: 1.25,
+      reportedCostUsd: null,
     });
     expect(mockAppendDebugLog).toHaveBeenCalledWith("agent:run:end", {
       iteration: 1,
       elapsedMs: expect.any(Number),
       outcome: "aborted",
       success: null,
-      inputTokens: 7,
-      outputTokens: 4,
-      cacheReadTokens: 0,
-      cacheCreationTokens: 0,
-      reportedCostUsd: 1.25,
-      reportedCostAvailable: true,
-      tokensAvailable: true,
+      inputTokens: null,
+      outputTokens: null,
+      cacheReadTokens: null,
+      cacheCreationTokens: null,
+      reportedCostUsd: null,
+      reportedCostAvailable: false,
+      tokensAvailable: false,
       estimated: false,
     });
+  });
+
+  it("clears stale live cost when a later update omits cost", async () => {
+    let reportUsage!: (usage: TokenUsage) => void;
+    let resolveRun!: (result: AgentResult) => void;
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(
+        (_prompt, _cwd, options) =>
+          new Promise<AgentResult>((resolve) => {
+            reportUsage = (usage) => options?.onUsage?.(usage);
+            resolveRun = resolve;
+          }),
+      ),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+    const startPromise = orchestrator.start();
+    await vi.waitFor(() => expect(agent.run).toHaveBeenCalledTimes(1));
+
+    reportUsage({
+      ...createSuccessResult().usage,
+      reportedCostUsd: 1.25,
+    });
+    expect(orchestrator.getState().reportedCostUsd).toBe(1.25);
+
+    reportUsage(createSuccessResult().usage);
+    expect(orchestrator.getState().reportedCostUsd).toBeNull();
+
+    resolveRun(createSuccessResult());
+    await startPromise;
   });
 
   it("continues under other limits when the harness reports no cost", async () => {
@@ -960,7 +1060,7 @@ describe("Orchestrator stop limits", () => {
     expect(orchestrator.getState().tokensEstimated).toBe(false);
   });
 
-  it("keeps usage estimated when estimated tokens are followed by an agent error", async () => {
+  it("does not promote live usage after an agent error", async () => {
     vi.useFakeTimers();
 
     let callCount = 0;
@@ -1024,9 +1124,10 @@ describe("Orchestrator stop limits", () => {
     await startPromise;
 
     expect(orchestrator.getState()).toMatchObject({
-      totalInputTokens: 9,
-      totalOutputTokens: 5,
-      tokensEstimated: true,
+      totalInputTokens: 5,
+      totalOutputTokens: 3,
+      tokensAvailable: false,
+      tokensEstimated: false,
     });
   });
 
@@ -1225,10 +1326,7 @@ describe("Orchestrator stop limits", () => {
     expect(stopped).not.toHaveBeenCalled();
 
     resolveClose();
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(stopped).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(stopped).toHaveBeenCalledTimes(1));
   });
 
   it("does not re-emit stopped when stop is called after the loop is done", async () => {
@@ -1361,7 +1459,7 @@ describe("Orchestrator stop limits", () => {
     await startPromise;
   });
 
-  it("does not record or commit a late successful result after stop is requested", async () => {
+  it("does not promote a late successful result or live usage after forced stop", async () => {
     vi.useFakeTimers();
 
     let resolveRun!: (result: AgentResult) => void;
@@ -1372,6 +1470,14 @@ describe("Orchestrator stop limits", () => {
         (_prompt, _cwd, options) =>
           new Promise<AgentResult>((resolve) => {
             resolveRun = resolve;
+            options?.onUsage?.({
+              inputTokens: 9,
+              outputTokens: 5,
+              cacheReadTokens: 0,
+              cacheCreationTokens: 0,
+              reportedCostUsd: 1.25,
+              tokensAvailable: true,
+            });
             options?.signal?.addEventListener("abort", () => {
               setTimeout(() => {
                 resolve(createSuccessResult("late success"));
@@ -1402,8 +1508,14 @@ describe("Orchestrator stop limits", () => {
     expect(resolveRun).toBeTypeOf("function");
     expect(mockAppendNotes).not.toHaveBeenCalled();
     expect(mockCommitAll).not.toHaveBeenCalled();
-    expect(orchestrator.getState().iterations).toEqual([]);
-    expect(orchestrator.getState().status).toBe("stopped");
+    expect(orchestrator.getState()).toMatchObject({
+      iterations: [],
+      reportedCostUsd: null,
+      status: "stopped",
+      tokensAvailable: false,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+    });
     expect(close).toHaveBeenCalledTimes(1);
   });
 

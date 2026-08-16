@@ -565,12 +565,16 @@ describe("startSleepPrevention", () => {
     });
 
     await vi.advanceTimersByTimeAsync(5_000);
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGTERM");
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGKILL");
+    await vi.advanceTimersByTimeAsync(100);
 
     await expect(resultPromise).resolves.toEqual({
       type: "skipped",
       reason: "unavailable",
     });
-    expect(killProcess).toHaveBeenCalledWith(-1234, "SIGTERM");
   });
 
   it("starts a PowerShell helper on Windows", async () => {

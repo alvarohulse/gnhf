@@ -19,6 +19,7 @@ import {
   type TokenUsage,
 } from "./types.js";
 import {
+  ChildProcessShutdownTracker,
   shouldDetachAgentProcess,
   shutdownChildProcess,
 } from "./managed-process.js";
@@ -349,6 +350,7 @@ export class CursorAgent implements Agent {
   private detached: boolean;
   private platform: NodeJS.Platform;
   private schema: AgentOutputSchema;
+  private shutdowns = new ChildProcessShutdownTracker();
 
   constructor(deps: CursorAgentDeps = {}) {
     this.extraArgs = deps.extraArgs;
@@ -391,9 +393,11 @@ export class CursorAgent implements Agent {
       child.stdin?.end();
 
       if (
-        setupAbortHandler(signal, child, reject, () =>
-          terminateCursorProcess(child, this.platform, this.detached),
-        )
+        setupAbortHandler(signal, child, reject, () => {
+          void this.shutdowns.start(() =>
+            shutdownCursorProcess(child, this.platform, this.detached),
+          );
+        })
       ) {
         return;
       }
@@ -461,16 +465,21 @@ export class CursorAgent implements Agent {
           }
           finalResultCleanupTimer = setTimeout(() => {
             closedAfterFinalCleanup = true;
-            void shutdownCursorProcess(child, this.platform, this.detached);
+            void this.shutdowns.start(() =>
+              shutdownCursorProcess(child, this.platform, this.detached),
+            );
           }, this.finalResultGraceMs);
         }
       });
 
-      child.on("close", (code) => {
+      child.on("close", async (code) => {
         if (finalResultCleanupTimer) {
           clearTimeout(finalResultCleanupTimer);
         }
         logStream?.end();
+        if (closedAfterFinalCleanup) {
+          await this.shutdowns.waitForAll();
+        }
         if (code !== 0 && !closedAfterFinalCleanup) {
           const detail = `cursor exited with code ${code}: ${stderr}`;
           reject(
@@ -517,7 +526,12 @@ export class CursorAgent implements Agent {
   }
 
   async close(): Promise<void> {
-    if (this.activeChild === null) return;
-    await shutdownCursorProcess(this.activeChild, this.platform, this.detached);
+    const activeChild = this.activeChild;
+    if (activeChild !== null) {
+      this.shutdowns.start(() =>
+        shutdownCursorProcess(activeChild, this.platform, this.detached),
+      );
+    }
+    await this.shutdowns.waitForAll();
   }
 }
