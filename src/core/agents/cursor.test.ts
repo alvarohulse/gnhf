@@ -731,6 +731,46 @@ describe("CursorAgent", () => {
     }
   });
 
+  it("starts Windows tree cleanup before a successful target can exit", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 5678 });
+    mockSpawn.mockReturnValue(proc);
+    const windowsAgent = new CursorAgent({
+      finalResultGraceMs: 25,
+      platform: "win32",
+    });
+    const content = JSON.stringify({
+      success: true,
+      summary: "done",
+      key_changes_made: [],
+      key_learnings: [],
+    });
+
+    try {
+      const promise = windowsAgent.run("test prompt", "/work/dir");
+      emitJson(proc, {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: content,
+      });
+
+      expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
+        "taskkill",
+        ["/T", "/F", "/PID", "5678"],
+        { stdio: "ignore", timeout: 3_000 },
+      );
+
+      proc.emit("close", null);
+      await expect(promise).resolves.toMatchObject({
+        output: { success: true, summary: "done" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("force kills cursor if it ignores the final-result shutdown signal", async () => {
     vi.useFakeTimers();
     let groupPresent = true;

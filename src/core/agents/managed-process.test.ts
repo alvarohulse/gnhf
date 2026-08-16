@@ -319,6 +319,7 @@ descendant.unref();
           stdio: ["pipe", "pipe", "pipe"],
         },
         tracker,
+        "linux",
       );
       supervisor.emit("message", {
         type: "target-close",

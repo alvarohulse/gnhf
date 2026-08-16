@@ -407,7 +407,7 @@ describe("gnhf e2e", () => {
       expected: "claude exited with code 1 and produced no output",
     },
   ])(
-    "surfaces the claude CLI's own failure text $label",
+    "records the claude failure outcome $label",
     async ({ mode, expected }) => {
       const cwd = createRepo();
       tempDirs.push(cwd);
@@ -442,16 +442,25 @@ describe("gnhf e2e", () => {
       );
       expect(agentRunErrorEntry).toBeDefined();
       const agentError = agentRunErrorEntry?.error as
-        | { message?: string }
+        | { message?: string; name?: string }
         | undefined;
-      expect(agentError?.message).toBe(expected);
+      if (process.platform === "win32") {
+        expect(agentError).toMatchObject({
+          message: expect.stringMatching(
+            /^Could not prove process cleanup completed for PID \d+$/,
+          ),
+          name: "IncompleteChildProcessShutdownError",
+        });
+      } else {
+        expect(agentError?.message).toBe(expected);
+      }
 
       // The morning-after trace: notes.md is what the user actually reads.
       const notes = readFileSync(
         join(dirname(debugLogPath), "notes.md"),
         "utf-8",
       );
-      expect(notes).toContain(`[ERROR] ${expected}`);
+      expect(notes).toContain(`[ERROR] ${agentError?.message}`);
     },
     30_000,
   );

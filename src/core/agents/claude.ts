@@ -585,10 +585,18 @@ export class ClaudeAgent implements Agent {
             if (finalResultCleanupTimer) {
               clearTimeout(finalResultCleanupTimer);
             }
-            finalResultCleanupTimer = setTimeout(() => {
+            const cleanupFinalResult = () => {
               closedAfterFinalCleanup = true;
               void shutdownRun().catch(rejectCleanupFailure);
-            }, this.finalResultGraceMs);
+            };
+            if (this.platform === "win32") {
+              cleanupFinalResult();
+            } else {
+              finalResultCleanupTimer = setTimeout(
+                cleanupFinalResult,
+                this.finalResultGraceMs,
+              );
+            }
           } else if (
             !finalStructuredResultEvent &&
             (next.is_error ||
