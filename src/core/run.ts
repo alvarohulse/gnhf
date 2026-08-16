@@ -605,7 +605,7 @@ export function readWorkspaceRecovery(
     cleanupUncertain:
       "cleanupUncertain" in value && typeof value.cleanupUncertain === "boolean"
         ? value.cleanupUncertain
-        : true,
+        : value.kind === "interrupted",
   };
 }
 
