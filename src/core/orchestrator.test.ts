@@ -532,6 +532,48 @@ describe("Orchestrator stop limits", () => {
     });
   });
 
+  it("does not enforce token caps from an incomplete usage receipt", async () => {
+    const incompleteUsage = {
+      inputTokens: 7,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      tokensAvailable: false,
+    };
+    const agent: Agent = {
+      name: "cursor",
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.onUsage?.(incompleteUsage);
+        return {
+          ...createSuccessResult(),
+          usage: incompleteUsage,
+        };
+      }),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1, maxTokens: 1 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(abort).toHaveBeenCalledWith("max iterations reached (1)");
+    expect(abort).not.toHaveBeenCalledWith(
+      expect.stringContaining("max tokens"),
+    );
+    expect(orchestrator.getState()).toMatchObject({
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+    });
+  });
+
   it("aborts when harness-reported cost reaches the configured cap", async () => {
     const agent: Agent = {
       name: "claude",
@@ -575,6 +617,20 @@ describe("Orchestrator stop limits", () => {
       status: "aborted",
       reportedCostUsd: 1.25,
     });
+    expect(mockAppendDebugLog).toHaveBeenCalledWith("agent:run:end", {
+      iteration: 1,
+      elapsedMs: expect.any(Number),
+      outcome: "aborted",
+      success: null,
+      inputTokens: 7,
+      outputTokens: 4,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      reportedCostUsd: 1.25,
+      reportedCostAvailable: true,
+      tokensAvailable: true,
+      estimated: false,
+    });
   });
 
   it("continues under other limits when the harness reports no cost", async () => {
@@ -601,6 +657,56 @@ describe("Orchestrator stop limits", () => {
       lastMessage: "max iterations reached (1)",
       reportedCostUsd: null,
     });
+  });
+
+  it("keeps unavailable token totals out of iteration and run receipts", async () => {
+    const agent: Agent = {
+      name: "cursor",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: {
+          ...createSuccessResult().usage,
+          reportedCostUsd: 0.25,
+          tokensAvailable: false,
+        },
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockAppendDebugLog).toHaveBeenCalledWith("agent:run:end", {
+      iteration: 1,
+      elapsedMs: expect.any(Number),
+      outcome: "completed",
+      success: true,
+      inputTokens: null,
+      outputTokens: null,
+      cacheReadTokens: null,
+      cacheCreationTokens: null,
+      reportedCostUsd: 0.25,
+      reportedCostAvailable: true,
+      tokensAvailable: false,
+      estimated: false,
+    });
+    expect(mockAppendDebugLog).toHaveBeenCalledWith(
+      "orchestrator:end",
+      expect.objectContaining({
+        totalInputTokens: null,
+        totalOutputTokens: null,
+        tokensAvailable: false,
+        reportedCostUsd: 0.25,
+        reportedCostAvailable: true,
+      }),
+    );
   });
 
   it("sums final harness-reported cost across iterations", async () => {

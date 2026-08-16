@@ -93,6 +93,16 @@ type RunIterationResult =
   | { type: "stopped" }
   | { type: "aborted"; reason: string };
 
+type AgentRunOutcome = "aborted" | "completed" | "error" | "stopped";
+
+type AppendAgentRunReceiptParams = {
+  iteration: number;
+  startedAt: number;
+  outcome: AgentRunOutcome;
+  success: boolean | null;
+  usage: TokenUsage | null;
+};
+
 export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private config: Config;
   private agent: Agent;
@@ -107,6 +117,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private pendingAbortReason: string | null = null;
   private pendingCommitFailure: string | null = null;
   private activeIterationTokensEstimated = false;
+  private tokensUnavailable = false;
   private reportedCostUnavailable = false;
   private loopDone = false;
   private stoppedEventEmitted = false;
@@ -428,9 +439,16 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         iterations: this.state.currentIteration,
         successCount: this.state.successCount,
         failCount: this.state.failCount,
-        totalInputTokens: this.state.totalInputTokens,
-        totalOutputTokens: this.state.totalOutputTokens,
+        totalInputTokens: this.tokensUnavailable
+          ? null
+          : this.state.totalInputTokens,
+        totalOutputTokens: this.tokensUnavailable
+          ? null
+          : this.state.totalOutputTokens,
+        tokensAvailable: !this.tokensUnavailable,
         reportedCostUsd: this.state.reportedCostUsd,
+        reportedCostAvailable:
+          !this.reportedCostUnavailable && this.state.reportedCostUsd !== null,
         commitCount: this.state.commitCount,
       });
     }
@@ -441,14 +459,20 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     const baseOutputTokens = this.state.totalOutputTokens;
     const baseReportedCostUsd = this.state.reportedCostUsd ?? 0;
     let iterationReportedCostAvailable = false;
+    let latestUsage: TokenUsage | null = null;
+    let agentRunReceiptWritten = false;
 
     this.activeAbortController = new AbortController();
     this.pendingAbortReason = null;
     this.activeIterationTokensEstimated = false;
 
     const onUsage = (usage: TokenUsage) => {
-      this.state.totalInputTokens = baseInputTokens + usage.inputTokens;
-      this.state.totalOutputTokens = baseOutputTokens + usage.outputTokens;
+      latestUsage = { ...usage };
+      const tokensAvailable = usage.tokensAvailable !== false;
+      if (tokensAvailable) {
+        this.state.totalInputTokens = baseInputTokens + usage.inputTokens;
+        this.state.totalOutputTokens = baseOutputTokens + usage.outputTokens;
+      }
       if (
         usage.reportedCostUsd !== undefined &&
         !this.reportedCostUnavailable
@@ -461,7 +485,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       this.emit("state", this.getState());
 
       const reason =
-        this.getTokenAbortReason() ?? this.getReportedCostAbortReason();
+        (tokensAvailable ? this.getTokenAbortReason() : null) ??
+        this.getReportedCostAbortReason();
       if (
         reason &&
         this.activeAbortController &&
@@ -497,6 +522,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         logPath,
       });
 
+      latestUsage = result.usage;
       this.activeIterationTokensEstimated = false;
       if (result.usage.estimated) this.state.tokensEstimated = true;
       if (result.usage.reportedCostUsd === undefined) {
@@ -508,18 +534,14 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           baseReportedCostUsd + result.usage.reportedCostUsd;
       }
 
-      appendDebugLog("agent:run:end", {
+      this.appendAgentRunReceipt({
         iteration: this.state.currentIteration,
-        elapsedMs: Date.now() - agentStartedAt,
+        startedAt: agentStartedAt,
+        outcome: "completed",
         success: result.output.success,
-        inputTokens: result.usage.inputTokens,
-        outputTokens: result.usage.outputTokens,
-        cacheReadTokens: result.usage.cacheReadTokens,
-        cacheCreationTokens: result.usage.cacheCreationTokens,
-        reportedCostUsd: result.usage.reportedCostUsd ?? null,
-        tokensAvailable: result.usage.tokensAvailable !== false,
-        estimated: result.usage.estimated ?? false,
+        usage: result.usage,
       });
+      agentRunReceiptWritten = true;
 
       if (this.stopRequested) {
         return { type: "stopped" };
@@ -559,6 +581,22 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       if (this.activeIterationTokensEstimated) {
         this.state.tokensEstimated = true;
         this.activeIterationTokensEstimated = false;
+      }
+
+      if (!agentRunReceiptWritten) {
+        const outcome: AgentRunOutcome =
+          this.pendingAbortReason !== null || err instanceof PermanentAgentError
+            ? "aborted"
+            : this.stopRequested
+              ? "stopped"
+              : "error";
+        this.appendAgentRunReceipt({
+          iteration: this.state.currentIteration,
+          startedAt: agentStartedAt,
+          outcome,
+          success: null,
+          usage: latestUsage,
+        });
       }
 
       if (
@@ -613,6 +651,33 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       this.activeAbortController = null;
       this.pendingAbortReason = null;
     }
+  }
+
+  private appendAgentRunReceipt({
+    iteration,
+    startedAt,
+    outcome,
+    success,
+    usage,
+  }: AppendAgentRunReceiptParams): void {
+    const tokensAvailable = usage !== null && usage.tokensAvailable !== false;
+    if (!tokensAvailable) {
+      this.tokensUnavailable = true;
+    }
+    appendDebugLog("agent:run:end", {
+      iteration,
+      elapsedMs: Date.now() - startedAt,
+      outcome,
+      success,
+      inputTokens: tokensAvailable ? usage.inputTokens : null,
+      outputTokens: tokensAvailable ? usage.outputTokens : null,
+      cacheReadTokens: tokensAvailable ? usage.cacheReadTokens : null,
+      cacheCreationTokens: tokensAvailable ? usage.cacheCreationTokens : null,
+      reportedCostUsd: usage?.reportedCostUsd ?? null,
+      reportedCostAvailable: usage?.reportedCostUsd !== undefined,
+      tokensAvailable,
+      estimated: usage?.estimated ?? false,
+    });
   }
 
   private recordSuccess(output: AgentOutput): IterationRecord {
@@ -794,7 +859,9 @@ ${this.pendingCommitFailure}
   }
 
   private getTokenAbortReason(): string | null {
-    if (this.limits.maxTokens === undefined) return null;
+    if (this.limits.maxTokens === undefined || this.tokensUnavailable) {
+      return null;
+    }
 
     const totalTokens =
       this.state.totalInputTokens + this.state.totalOutputTokens;
