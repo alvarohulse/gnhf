@@ -366,6 +366,7 @@ describe("Orchestrator stop limits", () => {
       totalOutputTokens: 2,
       totalTokens: 12,
       reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: 0.4,
       tokensUnavailable: false,
       reportedCostUnavailable: false,
       tokensEstimated: false,
@@ -444,57 +445,165 @@ describe("Orchestrator stop limits", () => {
     },
   );
 
-  it.each([
-    {
-      limit: { maxTokens: 10 },
-      reason: "max tokens reached (12/10)",
-    },
-    {
-      limit: { maxReportedCostUsd: 0.3 },
-      reason: "max reported cost reached ($0.40/$0.30)",
-    },
-  ])(
-    "enforces a lowered cap against an incomplete persisted usage lower bound",
-    async ({ limit, reason }) => {
-      mockReadRunUsageState.mockReturnValueOnce({
-        generation: 2,
-        phase: "in-progress",
-        totalInputTokens: 4,
-        totalOutputTokens: 2,
-        totalTokens: 12,
-        reportedCostUsd: 0.4,
-        tokensUnavailable: false,
-        reportedCostUnavailable: false,
-        tokensEstimated: false,
-        hasAuthoritativeTokenReceipt: true,
-      });
-      const agent: Agent = {
-        name: "pi",
-        run: vi.fn(async () => createSuccessResult()),
-      };
-      const orchestrator = new Orchestrator(
-        config,
-        agent,
-        runInfo,
-        "ship it",
-        "/repo",
-        2,
-        { maxIterations: 3, ...limit },
-      );
-      const abort = vi.fn();
-      orchestrator.on("abort", abort);
+  it("does not enforce legacy terminal cost without an authority marker", async () => {
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 2,
+      phase: "terminal",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: {
+          ...createSuccessResult().usage,
+          reportedCostUsd: 0.05,
+        },
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      2,
+      { maxIterations: 3, maxReportedCostUsd: 0.3 },
+    );
 
-      expect(orchestrator.getState()).toMatchObject({
-        reportedCostUsd: null,
-        tokensAvailable: false,
-      });
+    await orchestrator.start();
 
-      await orchestrator.start();
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(orchestrator.getState()).toMatchObject({
+      lastMessage: "max iterations reached (3)",
+      reportedCostUsd: null,
+    });
+  });
 
-      expect(agent.run).not.toHaveBeenCalled();
-      expect(abort).toHaveBeenCalledWith(reason);
-    },
-  );
+  it("enforces a lowered token cap against an incomplete persisted lower bound", async () => {
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 2,
+      phase: "in-progress",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: 0.2,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => createSuccessResult()),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      2,
+      { maxIterations: 3, maxTokens: 10 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(agent.run).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith("max tokens reached (12/10)");
+  });
+
+  it("does not enforce a cost cap against provisional persisted cost", async () => {
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 2,
+      phase: "in-progress",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: 0.2,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: {
+          ...createSuccessResult().usage,
+          reportedCostUsd: 0.05,
+        },
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      2,
+      { maxIterations: 3, maxReportedCostUsd: 0.3 },
+    );
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledTimes(1);
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
+    expect(orchestrator.getState()).toMatchObject({
+      lastMessage: "max iterations reached (3)",
+      reportedCostUsd: null,
+    });
+  });
+
+  it("enforces a cost cap against a persisted terminal lower bound", async () => {
+    mockReadRunUsageState.mockReturnValueOnce({
+      generation: 2,
+      phase: "in-progress",
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.25,
+      reportedCostLowerBoundUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => createSuccessResult()),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      2,
+      { maxIterations: 3, maxReportedCostUsd: 0.3 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(agent.run).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith(
+      "max reported cost reached ($0.40/$0.30)",
+    );
+  });
 
   it("persists an in-progress usage generation before invoking the agent", async () => {
     const agent: Agent = {
@@ -575,6 +684,7 @@ describe("Orchestrator stop limits", () => {
       totalOutputTokens: 2,
       totalTokens: 12,
       reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: 0.4,
       tokensUnavailable: false,
       reportedCostUnavailable: false,
       tokensEstimated: false,
@@ -582,7 +692,7 @@ describe("Orchestrator stop limits", () => {
     });
   });
 
-  it("persists monotonic live usage lower bounds after provider failure", async () => {
+  it("persists token lower bounds and provisional cost after provider failure", async () => {
     const agent: Agent = {
       name: "opencode",
       run: vi.fn(async (_prompt, _cwd, options) => {
@@ -622,6 +732,7 @@ describe("Orchestrator stop limits", () => {
       totalOutputTokens: 2,
       totalTokens: 12,
       reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: null,
       tokensUnavailable: false,
       reportedCostUnavailable: false,
       tokensEstimated: false,
@@ -634,6 +745,7 @@ describe("Orchestrator stop limits", () => {
       totalOutputTokens: 2,
       totalTokens: 12,
       reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: null,
       tokensUnavailable: true,
       reportedCostUnavailable: true,
       tokensEstimated: false,
@@ -648,9 +760,11 @@ describe("Orchestrator stop limits", () => {
   });
 
   it("accepts a lower authoritative cost correction within one generation", async () => {
+    const signalAborted = vi.fn();
     const agent: Agent = {
       name: "opencode",
       run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.signal?.addEventListener("abort", signalAborted);
         options?.onUsage?.({
           inputTokens: 4,
           outputTokens: 2,
@@ -686,6 +800,7 @@ describe("Orchestrator stop limits", () => {
 
     await orchestrator.start();
 
+    expect(signalAborted).not.toHaveBeenCalled();
     expect(mockCommitAll).toHaveBeenCalledTimes(1);
     expect(orchestrator.getState().reportedCostUsd).toBe(0.25);
     expect(orchestrator.getState().lastMessage).toBe(
@@ -910,6 +1025,7 @@ describe("Orchestrator stop limits", () => {
       totalOutputTokens: 2,
       totalTokens: 11,
       reportedCostUsd: null,
+      reportedCostLowerBoundUsd: null,
       tokensUnavailable: false,
       reportedCostUnavailable: true,
       tokensEstimated: false,
@@ -923,6 +1039,7 @@ describe("Orchestrator stop limits", () => {
       totalOutputTokens: 2,
       totalTokens: 11,
       reportedCostUsd: null,
+      reportedCostLowerBoundUsd: null,
       tokensUnavailable: false,
       reportedCostUnavailable: true,
       tokensEstimated: false,
@@ -1281,25 +1398,23 @@ describe("Orchestrator stop limits", () => {
     await startPromise;
   });
 
-  it("aborts when harness-reported cost reaches the configured cap", async () => {
+  it("aborts when terminal harness-reported cost reaches the configured cap", async () => {
+    const signalAborted = vi.fn();
+    const usage: TokenUsage = {
+      inputTokens: 7,
+      outputTokens: 4,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      reportedCostUsd: 1.25,
+      tokensAvailable: true,
+    };
     const agent: Agent = {
       name: "claude",
-      run: vi.fn(
-        (_prompt, _cwd, options) =>
-          new Promise<AgentResult>((_resolve, reject) => {
-            options?.signal?.addEventListener("abort", () => {
-              reject(new Error("Agent was aborted"));
-            });
-            options?.onUsage?.({
-              inputTokens: 7,
-              outputTokens: 4,
-              cacheReadTokens: 0,
-              cacheCreationTokens: 0,
-              reportedCostUsd: 1.25,
-              tokensAvailable: true,
-            });
-          }),
-      ),
+      run: vi.fn(async (_prompt, _cwd, options) => {
+        options?.signal?.addEventListener("abort", signalAborted);
+        options?.onUsage?.(usage);
+        return { ...createSuccessResult(), usage };
+      }),
     };
     const orchestrator = new Orchestrator(
       config,
@@ -1316,6 +1431,7 @@ describe("Orchestrator stop limits", () => {
 
     await orchestrator.start();
 
+    expect(signalAborted).not.toHaveBeenCalled();
     expect(agent.run).toHaveBeenCalledTimes(1);
     expect(mockCommitAll).not.toHaveBeenCalled();
     expect(abort).toHaveBeenCalledWith(
@@ -1332,6 +1448,7 @@ describe("Orchestrator stop limits", () => {
       totalOutputTokens: 4,
       totalTokens: 11,
       reportedCostUsd: 1.25,
+      reportedCostLowerBoundUsd: 1.25,
       tokensUnavailable: false,
       reportedCostUnavailable: false,
       tokensEstimated: false,
@@ -1356,11 +1473,13 @@ describe("Orchestrator stop limits", () => {
   it("clears stale live cost when a later update omits cost", async () => {
     let reportUsage!: (usage: TokenUsage) => void;
     let resolveRun!: (result: AgentResult) => void;
+    const signalAborted = vi.fn();
     const agent: Agent = {
       name: "claude",
       run: vi.fn(
         (_prompt, _cwd, options) =>
           new Promise<AgentResult>((resolve) => {
+            options?.signal?.addEventListener("abort", signalAborted);
             reportUsage = (usage) => options?.onUsage?.(usage);
             resolveRun = resolve;
           }),
@@ -1373,7 +1492,7 @@ describe("Orchestrator stop limits", () => {
       "ship it",
       "/repo",
       0,
-      { maxIterations: 1 },
+      { maxIterations: 1, maxReportedCostUsd: 1 },
     );
     const startPromise = orchestrator.start();
     await vi.waitFor(() => expect(agent.run).toHaveBeenCalledTimes(1));
@@ -1389,6 +1508,18 @@ describe("Orchestrator stop limits", () => {
 
     resolveRun(createSuccessResult());
     await startPromise;
+
+    expect(signalAborted).not.toHaveBeenCalled();
+    expect(mockCommitAll).toHaveBeenCalledTimes(1);
+    expect(mockWriteRunUsageState).toHaveBeenLastCalledWith(
+      runInfo,
+      expect.objectContaining({
+        phase: "terminal",
+        reportedCostUsd: 1.25,
+        reportedCostLowerBoundUsd: null,
+        reportedCostUnavailable: true,
+      }),
+    );
   });
 
   it("continues under other limits when the harness reports no cost", async () => {
@@ -1462,6 +1593,7 @@ describe("Orchestrator stop limits", () => {
         totalOutputTokens: null,
         tokensAvailable: false,
         reportedCostUsd: 0.25,
+        reportedCostLowerBoundUsd: 0.25,
         reportedCostAvailable: true,
       }),
     );

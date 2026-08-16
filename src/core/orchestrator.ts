@@ -139,6 +139,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private totalTokens = 0;
   private tokensUnavailable = false;
   private reportedCostUnavailable = false;
+  private persistedReportedCostUsd: number | null = null;
   private reportedCostLowerBoundUsd: number | null = null;
   private unsafeShutdownDetected = false;
   private loopDone = false;
@@ -194,18 +195,26 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       const usageGenerationComplete =
         usageState.phase === "terminal" &&
         usageState.generation === startIteration;
+      const hasReportedCostAuthority =
+        usageState.reportedCostLowerBoundUsd !== undefined;
       this.state.totalInputTokens = usageState.totalInputTokens;
       this.state.totalOutputTokens = usageState.totalOutputTokens;
       this.totalTokens = usageState.totalTokens;
-      this.reportedCostLowerBoundUsd = usageState.reportedCostUsd;
+      this.persistedReportedCostUsd = usageState.reportedCostUsd;
+      this.reportedCostLowerBoundUsd =
+        usageState.reportedCostLowerBoundUsd ?? null;
       this.state.reportedCostUsd =
-        usageGenerationComplete && !usageState.reportedCostUnavailable
+        usageGenerationComplete &&
+        hasReportedCostAuthority &&
+        !usageState.reportedCostUnavailable
           ? usageState.reportedCostUsd
           : null;
       this.tokensUnavailable =
         usageState.tokensUnavailable || !usageGenerationComplete;
       this.reportedCostUnavailable =
-        usageState.reportedCostUnavailable || !usageGenerationComplete;
+        usageState.reportedCostUnavailable ||
+        !usageGenerationComplete ||
+        !hasReportedCostAuthority;
       this.state.tokensEstimated = usageState.tokensEstimated;
       this.hasAuthoritativeTokenReceipt =
         usageState.hasAuthoritativeTokenReceipt;
@@ -520,6 +529,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           : this.state.totalOutputTokens,
         tokensAvailable: !this.tokensUnavailable,
         reportedCostUsd: this.state.reportedCostUsd,
+        reportedCostLowerBoundUsd: this.reportedCostLowerBoundUsd,
         reportedCostAvailable:
           !this.reportedCostUnavailable && this.state.reportedCostUsd !== null,
         commitCount: this.state.commitCount,
@@ -538,7 +548,6 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     let totalTokenLowerBound = baseTotalTokens;
     let agentRunReceiptWritten = false;
     let pendingAbortUsage: TokenUsage | null = null;
-    let pendingAbortLimit: "tokens" | "reported-cost" | null = null;
 
     if (
       this.limits.preserveWorkspaceOnForceStop === true &&
@@ -572,12 +581,13 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         this.state.totalOutputTokens = outputTokenLowerBound;
         this.totalTokens = totalTokenLowerBound;
       }
-      if (usage.reportedCostUsd !== undefined) {
-        this.reportedCostLowerBoundUsd =
-          (baseReportedCostLowerBoundUsd ?? 0) + usage.reportedCostUsd;
-        this.state.reportedCostUsd = !this.reportedCostUnavailable
-          ? this.reportedCostLowerBoundUsd
-          : null;
+      if (
+        usage.reportedCostUsd !== undefined &&
+        !this.reportedCostUnavailable
+      ) {
+        this.persistedReportedCostUsd =
+          (baseReportedCostUsd ?? 0) + usage.reportedCostUsd;
+        this.state.reportedCostUsd = this.persistedReportedCostUsd;
       } else {
         this.state.reportedCostUsd = baseReportedCostUsd;
       }
@@ -592,16 +602,12 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       const tokenAbortReason = tokensAuthoritative
         ? this.getTokenAbortReason(true)
         : null;
-      const reportedCostAbortReason = this.getReportedCostAbortReason();
-      const reason = tokenAbortReason ?? reportedCostAbortReason;
       if (this.pendingAbortReason !== null) {
-        if (isAuthoritativeAbortUsage(usage)) {
+        if (isAuthoritativeTokenUsage(usage)) {
           pendingAbortUsage = { ...usage };
         }
-      } else if (reason !== null) {
-        this.pendingAbortReason = reason;
-        pendingAbortLimit =
-          tokenAbortReason !== null ? "tokens" : "reported-cost";
+      } else if (tokenAbortReason !== null) {
+        this.pendingAbortReason = tokenAbortReason;
         pendingAbortUsage = { ...usage };
         if (
           this.activeAbortController &&
@@ -639,7 +645,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       });
 
       if (this.pendingAbortReason !== null && pendingAbortUsage !== null) {
-        const terminalUsageCanCorrectAbort = isAuthoritativeAbortUsage(
+        const terminalUsageCanCorrectAbort = isAuthoritativeTokenUsage(
           result.usage,
         );
         const abortUsage = terminalUsageCanCorrectAbort
@@ -647,7 +653,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           : pendingAbortUsage;
         if (terminalUsageCanCorrectAbort) {
           applyTerminalUsage(this, abortUsage);
-          this.pendingAbortReason = getPendingAbortReason(this);
+          this.pendingAbortReason = this.getTokenAbortReason(true);
         }
         if (this.pendingAbortReason !== null) {
           return await settleRuntimeLimitAbort(this, abortUsage);
@@ -670,6 +676,12 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       }
 
       applyTerminalUsage(this, result.usage);
+
+      const reportedCostAbortReason = this.getReportedCostAbortReason();
+      if (reportedCostAbortReason !== null) {
+        this.pendingAbortReason = reportedCostAbortReason;
+        return await settleRuntimeLimitAbort(this, result.usage);
+      }
 
       this.appendAgentRunReceipt({
         iteration: this.state.currentIteration,
@@ -812,13 +824,17 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       if (usage.reportedCostUsd === undefined) {
         orchestrator.reportedCostUnavailable = true;
         orchestrator.state.reportedCostUsd = null;
-      } else {
+      } else if (orchestrator.reportedCostUnavailable) {
         orchestrator.reportedCostLowerBoundUsd =
           (baseReportedCostLowerBoundUsd ?? 0) + usage.reportedCostUsd;
+        orchestrator.state.reportedCostUsd = null;
+      } else {
+        orchestrator.persistedReportedCostUsd =
+          (baseReportedCostUsd ?? 0) + usage.reportedCostUsd;
+        orchestrator.reportedCostLowerBoundUsd =
+          orchestrator.persistedReportedCostUsd;
         orchestrator.state.reportedCostUsd =
-          !orchestrator.reportedCostUnavailable
-            ? orchestrator.reportedCostLowerBoundUsd
-            : null;
+          orchestrator.persistedReportedCostUsd;
       }
     }
 
@@ -843,28 +859,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       orchestrator.totalTokens = totalTokenLowerBound;
     }
 
-    function isAuthoritativeAbortUsage(usage: TokenUsage): boolean {
-      if (pendingAbortLimit === "tokens") {
-        return hasCompleteTokenUsage(usage) && usage.estimated !== true;
-      }
-      if (pendingAbortLimit === "reported-cost") {
-        return (
-          usage.reportedCostUsd !== undefined &&
-          Number.isFinite(usage.reportedCostUsd) &&
-          usage.reportedCostUsd >= 0
-        );
-      }
-      return false;
-    }
-
-    function getPendingAbortReason(orchestrator: Orchestrator): string | null {
-      if (pendingAbortLimit === "tokens") {
-        return orchestrator.getTokenAbortReason(true);
-      }
-      if (pendingAbortLimit === "reported-cost") {
-        return orchestrator.getReportedCostAbortReason();
-      }
-      return null;
+    function isAuthoritativeTokenUsage(usage: TokenUsage): boolean {
+      return hasCompleteTokenUsage(usage) && usage.estimated !== true;
     }
 
     async function settleRuntimeLimitAbort(
@@ -951,7 +947,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       totalInputTokens: persistedTokens.totalInputTokens,
       totalOutputTokens: persistedTokens.totalOutputTokens,
       totalTokens: persistedTokens.totalTokens,
-      reportedCostUsd: this.reportedCostLowerBoundUsd,
+      reportedCostUsd: this.persistedReportedCostUsd,
+      reportedCostLowerBoundUsd: this.reportedCostLowerBoundUsd,
       tokensUnavailable: this.tokensUnavailable,
       reportedCostUnavailable: this.reportedCostUnavailable,
       tokensEstimated: this.state.tokensEstimated,

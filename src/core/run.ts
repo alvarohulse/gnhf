@@ -71,6 +71,9 @@ export interface RunUsageState {
   totalOutputTokens: number;
   totalTokens: number;
   reportedCostUsd: number | null;
+  // Presence marks cost authority written after provisional and terminal
+  // receipts were separated. Legacy state without it cannot enforce cost.
+  reportedCostLowerBoundUsd?: number | null;
   tokensUnavailable: boolean;
   reportedCostUnavailable: boolean;
   tokensEstimated: boolean;
@@ -80,6 +83,7 @@ export interface RunUsageState {
 type WritableRunUsageState = RunUsageState & {
   generation: number;
   phase: "in-progress" | "terminal";
+  reportedCostLowerBoundUsd: number | null;
 };
 
 const LOG_FILENAME = "gnhf.log";
@@ -649,6 +653,9 @@ function isRunUsageState(value: unknown): value is RunUsageState {
     isNonNegativeFiniteNumber(state.totalTokens) &&
     (state.reportedCostUsd === null ||
       isNonNegativeFiniteNumber(state.reportedCostUsd)) &&
+    (state.reportedCostLowerBoundUsd === undefined ||
+      state.reportedCostLowerBoundUsd === null ||
+      isNonNegativeFiniteNumber(state.reportedCostLowerBoundUsd)) &&
     typeof state.tokensUnavailable === "boolean" &&
     typeof state.reportedCostUnavailable === "boolean" &&
     typeof state.tokensEstimated === "boolean" &&

@@ -788,6 +788,7 @@ describe("run usage state", () => {
       totalOutputTokens: 2,
       totalTokens: 12,
       reportedCostUsd: 0.4,
+      reportedCostLowerBoundUsd: 0.4,
       tokensUnavailable: false,
       reportedCostUnavailable: false,
       tokensEstimated: false,
@@ -848,6 +849,29 @@ describe("run usage state", () => {
     );
   });
 
+  it("rejects an invalid reported cost lower bound", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({
+        generation: 2,
+        phase: "terminal",
+        totalInputTokens: 4,
+        totalOutputTokens: 2,
+        totalTokens: 12,
+        reportedCostUsd: 0.4,
+        reportedCostLowerBoundUsd: -1,
+        tokensUnavailable: false,
+        reportedCostUnavailable: false,
+        tokensEstimated: false,
+        hasAuthoritativeTokenReceipt: true,
+      }),
+    );
+
+    expect(() => readRunUsageState({ runDir: "/run" })).toThrow(
+      "Invalid run usage metadata",
+    );
+  });
+
   it("publishes cumulative usage atomically", () => {
     const usageState = {
       generation: 2,
@@ -856,6 +880,7 @@ describe("run usage state", () => {
       totalOutputTokens: 2,
       totalTokens: 12,
       reportedCostUsd: null,
+      reportedCostLowerBoundUsd: 0.4,
       tokensUnavailable: false,
       reportedCostUnavailable: true,
       tokensEstimated: false,
