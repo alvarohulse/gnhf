@@ -2,6 +2,11 @@ import type { ChildProcess } from "node:child_process";
 import type { Readable } from "node:stream";
 import type { WriteStream } from "node:fs";
 
+interface ChildProcessCleanup {
+  finalize: () => Promise<void>;
+  shutdown: () => Promise<void>;
+}
+
 /**
  * Wire stderr collection, spawn-error handling, and the common close-handler
  * prefix (logStream.end + non-zero exit code rejection) for a child process.
@@ -13,7 +18,7 @@ export function setupChildProcessHandlers(
   logStream: WriteStream | null,
   reject: (err: Error) => void,
   onSuccess: () => void,
-  finalize?: () => Promise<void>,
+  cleanup?: ChildProcessCleanup,
 ): void {
   let stderr = "";
 
@@ -21,12 +26,15 @@ export function setupChildProcessHandlers(
     stderr += data.toString();
   });
 
-  const settleAfterFinalize = (settle: () => void) => {
-    if (finalize === undefined) {
+  const settleAfterCleanup = (
+    cleanupProcess: (() => Promise<void>) | undefined,
+    settle: () => void,
+  ) => {
+    if (cleanupProcess === undefined) {
       settle();
       return;
     }
-    void finalize().then(settle, (error: unknown) => {
+    void cleanupProcess().then(settle, (error: unknown) => {
       reject(
         error instanceof Error
           ? error
@@ -36,14 +44,14 @@ export function setupChildProcessHandlers(
   };
 
   child.on("error", (err) => {
-    settleAfterFinalize(() => {
+    settleAfterCleanup(cleanup?.shutdown, () => {
       reject(new Error(`Failed to spawn ${agentName}: ${err.message}`));
     });
   });
 
   child.on("close", (code) => {
     logStream?.end();
-    settleAfterFinalize(() => {
+    settleAfterCleanup(cleanup?.finalize, () => {
       if (code !== 0) {
         reject(new Error(`${agentName} exited with code ${code}: ${stderr}`));
         return;

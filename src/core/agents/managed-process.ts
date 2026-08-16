@@ -1,4 +1,8 @@
-import type { ChildProcess, SpawnOptions } from "node:child_process";
+import {
+  execFileSync,
+  type ChildProcess,
+  type SpawnOptions,
+} from "node:child_process";
 import { EventEmitter } from "node:events";
 
 interface SignalChildProcessOptions {
@@ -10,6 +14,11 @@ interface SignalChildProcessOptions {
 interface ShutdownChildProcessOptions {
   detached: boolean;
   killProcess?: typeof process.kill;
+  timeoutMs?: number;
+}
+
+interface ShutdownWindowsProcessTreeOptions {
+  killTree?: (pid: number) => void;
   timeoutMs?: number;
 }
 
@@ -82,6 +91,7 @@ export function spawnManagedChildProcess(
   command: string,
   args: readonly string[],
   options: SpawnOptions,
+  shutdownTracker?: ChildProcessShutdownTracker,
 ): ChildProcess {
   if (options.detached !== true) {
     return spawnProcess(command, args, options);
@@ -122,19 +132,33 @@ export function spawnManagedChildProcess(
   } | null = null;
   let settled = false;
 
+  const startManagedShutdown = () => {
+    const startShutdown = () =>
+      shutdownChildProcess(managed as unknown as ChildProcess, {
+        detached: true,
+        timeoutMs: 0,
+      });
+    return shutdownTracker?.start(startShutdown) ?? startShutdown();
+  };
+
   supervisor.on("message", (message: unknown) => {
     if (!isSupervisorMessage(message)) {
       return;
     }
     if (message.type === "target-error") {
+      void startManagedShutdown().catch((error: unknown) => {
+        managed.emit(
+          "error",
+          error instanceof Error
+            ? error
+            : new IncompleteChildProcessShutdownError(managed.pid),
+        );
+      });
       managed.emit("error", new Error(message.message));
       return;
     }
     targetStatus = { code: message.code, signal: message.signal };
-    void shutdownChildProcess(managed as unknown as ChildProcess, {
-      detached: true,
-      timeoutMs: 0,
-    }).catch((error: unknown) => {
+    void startManagedShutdown().catch((error: unknown) => {
       managed.emit(
         "error",
         error instanceof Error
@@ -194,6 +218,7 @@ export class ChildProcessShutdownTracker {
     startShutdown: () => Promise<void>,
   ): Promise<void> {
     if (!detached || child.pid === undefined) {
+      await this.waitForAll();
       return;
     }
     closedOwnedProcessGroupLeaders.add(child);
@@ -230,6 +255,66 @@ export function signalChildProcess(
   }
 
   child.kill(options.signal);
+}
+
+export function shutdownWindowsProcessTree(
+  child: ChildProcess,
+  options: ShutdownWindowsProcessTreeOptions = {},
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  if (child.pid === undefined) {
+    return Promise.reject(new IncompleteChildProcessShutdownError(undefined));
+  }
+
+  const pid = child.pid;
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      settle(new IncompleteChildProcessShutdownError(pid));
+    }, options.timeoutMs ?? 3_000);
+    timeout.unref?.();
+
+    const handleClose = () => settle();
+    child.once("close", handleClose);
+
+    try {
+      const killTree =
+        options.killTree ??
+        ((processId: number) => {
+          execFileSync("taskkill", ["/T", "/F", "/PID", String(processId)], {
+            stdio: "ignore",
+          });
+        });
+      killTree(pid);
+    } catch {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        settle();
+      } else {
+        settle(new IncompleteChildProcessShutdownError(pid));
+      }
+      return;
+    }
+
+    if (child.exitCode !== null || child.signalCode !== null) {
+      settle();
+    }
+
+    function settle(error?: Error): void {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      child.off("close", handleClose);
+      if (error === undefined) {
+        resolve();
+      } else {
+        reject(error);
+      }
+    }
+  });
 }
 
 export function shutdownChildProcess(
@@ -270,7 +355,6 @@ export function shutdownChildProcess(
     return new Promise<void>((resolve, reject) => {
       let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
       let hardDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
-      let terminalGroupSignalDelivered = false;
       let settled = false;
 
       const settle = (error?: Error) => {
@@ -300,7 +384,7 @@ export function shutdownChildProcess(
           settle();
           return;
         }
-        if (terminalGroupSignalDelivered || !isProcessGroupPresent()) {
+        if (!isProcessGroupPresent()) {
           settle();
           return;
         }
@@ -352,15 +436,16 @@ export function shutdownChildProcess(
         }
 
         try {
-          terminalGroupSignalDelivered = signalShutdownTarget(
-            "SIGKILL",
-            ownedProcessGroupId === null,
-          );
+          signalShutdownTarget("SIGKILL", ownedProcessGroupId === null);
         } catch {
           // Best-effort cleanup only.
         }
 
         hardDeadlineTimer = setTimeout(() => {
+          if (ownedProcessGroupId !== null && !isProcessGroupPresent()) {
+            settle();
+            return;
+          }
           settle(new IncompleteChildProcessShutdownError(child.pid));
         }, SHUTDOWN_CONFIRMATION_GRACE_MS);
         if (ownedProcessGroupId === null) {
