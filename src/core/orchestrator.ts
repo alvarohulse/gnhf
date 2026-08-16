@@ -314,7 +314,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       }
       if (
         this.limits.preserveWorkspaceOnForceStop !== true &&
-        !this.unsafeShutdownDetected
+        !this.unsafeShutdownDetected &&
+        this.pendingWorkspaceRecovery === null
       ) {
         this.resetWorkspace();
       }

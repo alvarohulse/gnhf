@@ -387,6 +387,20 @@ function mergeMessageUsage(
   return merged;
 }
 
+function mergeTerminalMessageUsage(
+  assistantUsage: TokenUsage | undefined,
+  stepUsage: TokenUsage | undefined,
+): TokenUsage {
+  const merged = mergeMessageUsage(assistantUsage, stepUsage);
+  const terminalCost = assistantUsage?.reportedCostUsd;
+  if (isValidTokenCount(terminalCost)) {
+    merged.reportedCostUsd = terminalCost;
+  } else {
+    delete merged.reportedCostUsd;
+  }
+  return merged;
+}
+
 function withTimeoutSignal(
   signal: AbortSignal | undefined,
   timeoutMs: number | undefined,
@@ -1340,6 +1354,18 @@ export class OpenCodeAgent implements Agent {
       );
     }
 
+    const terminalUsage = combineUsage(
+      [...usageByMessageId.keys()].map((messageId) => {
+        const stepUsage = stepUsageByMessageId.get(messageId);
+        return mergeTerminalMessageUsage(
+          assistantUsageByMessageId.get(messageId),
+          stepUsage === undefined
+            ? undefined
+            : combineUsage([...stepUsage.values()]),
+        );
+      }),
+    );
+
     if (structuredOutput !== undefined) {
       const output = validateAgentOutput(structuredOutput, this.schema);
       appendDebugLog("opencode:output:structured", {
@@ -1349,7 +1375,7 @@ export class OpenCodeAgent implements Agent {
       });
       return {
         output,
-        usage,
+        usage: terminalUsage,
         sawSessionIdle,
       };
     }
@@ -1370,7 +1396,7 @@ export class OpenCodeAgent implements Agent {
       });
       return {
         output,
-        usage,
+        usage: terminalUsage,
         sawSessionIdle,
       };
     } catch (error) {
