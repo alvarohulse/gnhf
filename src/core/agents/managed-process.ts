@@ -237,6 +237,27 @@ export function spawnManagedChildProcess(
   });
   supervisor.on("error", (error) => managed.emit("error", error));
   supervisor.on("close", (code, signal) => {
+    const ownerInitiatedWindowsShutdown =
+      platform === "win32" &&
+      activeWindowsTreeShutdowns.has(managed as unknown as ChildProcess);
+    if (
+      platform === "win32" &&
+      targetStatus === null &&
+      !ownerInitiatedWindowsShutdown
+    ) {
+      shutdownTracker?.recordUnverifiedCleanup(
+        new UnverifiedAgentCleanupError(
+          `Could not verify descendant process cleanup${managed.pid === undefined ? "" : ` for PID ${managed.pid}`} after supervisor-close`,
+        ),
+      );
+      appendDebugLog("agent-process:cleanup-unverified", {
+        platform: "win32",
+        pid: managed.pid ?? null,
+        trigger: "supervisor-close",
+        mode: "unavailable",
+        descendantCleanup: "unverified",
+      });
+    }
     settleManagedProcess(
       targetStatus !== null ? targetStatus.code : code,
       targetStatus !== null ? targetStatus.signal : signal,

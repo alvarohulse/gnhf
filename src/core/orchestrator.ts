@@ -1135,6 +1135,9 @@ ${recovery.detail}
   }
 
   private clearWorkspaceRecovery(): void {
+    if (this.unsafeShutdownDetected) {
+      return;
+    }
     clearWorkspaceRecovery(this.runInfo);
     this.pendingWorkspaceRecovery = null;
     this.activeWorkspaceRecoveryMarker = false;
