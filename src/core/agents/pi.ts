@@ -442,6 +442,8 @@ export class PiAgent implements Agent {
         }
 
         if (event.type === "agent_end" && Array.isArray(event.messages)) {
+          usageByMessageKey.clear();
+          currentStreamingMessageKey = null;
           for (const message of event.messages) {
             if (roleOf(message) === "assistant") {
               rememberAssistantMessage(message, false, true);
