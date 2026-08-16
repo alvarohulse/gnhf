@@ -857,7 +857,7 @@ program
         | "resumed"
         | null = null;
       let worktreePreservationNoticeEmitted = false;
-      let readPendingWorkspaceRecovery = () => false;
+      let readPendingCommitFailure = () => false;
       const preserveWorktree = (
         preservationReason:
           | WorktreePreservationReason
@@ -978,7 +978,7 @@ program
             const preservationReason = getWorktreePreservationReason(
               runInfo.baseCommit,
               wt.worktreePath,
-              readPendingWorkspaceRecovery(),
+              readPendingCommitFailure(),
             );
             if (preservationReason !== null) {
               preserveWorktree(preservationReason);
@@ -1171,8 +1171,8 @@ program
           ...(options.worktree ? { preserveWorkspaceOnForceStop: true } : {}),
         },
       );
-      readPendingWorkspaceRecovery = () =>
-        orchestrator.getState().hasPendingWorkspaceRecovery === true;
+      readPendingCommitFailure = () =>
+        orchestrator.getState().hasPendingCommitFailure === true;
       let shutdownSignal: NodeJS.Signals | null = null;
       let forceShutdownRequested = false;
 
@@ -1368,7 +1368,7 @@ program
             getWorktreePreservationReason(
               runInfo.baseCommit,
               worktreePath,
-              finalState.hasPendingWorkspaceRecovery === true,
+              finalState.hasPendingCommitFailure === true,
             );
           if (preservationReason !== null) {
             preserveWorktree(preservationReason);
