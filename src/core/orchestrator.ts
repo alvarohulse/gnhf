@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import {
+  getTokenUsageTotal,
   hasCompleteTokenUsage,
   PermanentAgentError,
   type Agent,
@@ -12,8 +13,10 @@ import type { RunInfo, WorkspaceRecovery } from "./run.js";
 import {
   appendNotes,
   clearWorkspaceRecovery,
+  readRunUsageState,
   readWorkspaceRecovery,
   toStringArray,
+  writeRunUsageState,
   writeWorkspaceRecovery,
 } from "./run.js";
 import { appendDebugLog, serializeError } from "./debug-log.js";
@@ -128,6 +131,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private activeIterationTokensAvailable: boolean | null = null;
   private activeIterationTokensEstimated = false;
   private hasAuthoritativeTokenReceipt = false;
+  private totalTokens = 0;
   private tokensUnavailable = false;
   private reportedCostUnavailable = false;
   private loopDone = false;
@@ -178,6 +182,21 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       this.cwd,
     );
     this.pendingWorkspaceRecovery = readWorkspaceRecovery(this.runInfo);
+    const usageState = readRunUsageState(this.runInfo);
+    if (usageState !== null) {
+      this.state.totalInputTokens = usageState.totalInputTokens;
+      this.state.totalOutputTokens = usageState.totalOutputTokens;
+      this.totalTokens = usageState.totalTokens;
+      this.state.reportedCostUsd = usageState.reportedCostUsd;
+      this.tokensUnavailable = usageState.tokensUnavailable;
+      this.reportedCostUnavailable = usageState.reportedCostUnavailable;
+      this.state.tokensEstimated = usageState.tokensEstimated;
+      this.hasAuthoritativeTokenReceipt =
+        usageState.hasAuthoritativeTokenReceipt;
+    } else if (startIteration > 0) {
+      this.tokensUnavailable = true;
+      this.reportedCostUnavailable = true;
+    }
   }
 
   getState(): OrchestratorState {
@@ -491,6 +510,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private async runIteration(prompt: string): Promise<RunIterationResult> {
     const baseInputTokens = this.state.totalInputTokens;
     const baseOutputTokens = this.state.totalOutputTokens;
+    const baseTotalTokens = this.totalTokens;
     const baseReportedCostUsd = this.state.reportedCostUsd;
     let agentRunReceiptWritten = false;
 
@@ -516,9 +536,11 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       if (tokensAvailable) {
         this.state.totalInputTokens = baseInputTokens + usage.inputTokens;
         this.state.totalOutputTokens = baseOutputTokens + usage.outputTokens;
+        this.totalTokens = baseTotalTokens + getTokenUsageTotal(usage);
       } else {
         this.state.totalInputTokens = baseInputTokens;
         this.state.totalOutputTokens = baseOutputTokens;
+        this.totalTokens = baseTotalTokens;
       }
       if (
         usage.reportedCostUsd !== undefined &&
@@ -593,9 +615,11 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           baseInputTokens + result.usage.inputTokens;
         this.state.totalOutputTokens =
           baseOutputTokens + result.usage.outputTokens;
+        this.totalTokens = baseTotalTokens + getTokenUsageTotal(result.usage);
       } else {
         this.state.totalInputTokens = baseInputTokens;
         this.state.totalOutputTokens = baseOutputTokens;
+        this.totalTokens = baseTotalTokens;
       }
       if (result.usage.estimated) {
         this.state.tokensEstimated = true;
@@ -722,6 +746,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     function restoreLiveUsage(orchestrator: Orchestrator): void {
       orchestrator.state.totalInputTokens = baseInputTokens;
       orchestrator.state.totalOutputTokens = baseOutputTokens;
+      orchestrator.totalTokens = baseTotalTokens;
       orchestrator.state.reportedCostUsd = baseReportedCostUsd;
       orchestrator.activeIterationTokensAvailable = false;
       orchestrator.activeIterationTokensEstimated = false;
@@ -739,6 +764,16 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     if (!tokensAvailable) {
       this.tokensUnavailable = true;
     }
+    writeRunUsageState(this.runInfo, {
+      totalInputTokens: this.state.totalInputTokens,
+      totalOutputTokens: this.state.totalOutputTokens,
+      totalTokens: this.totalTokens,
+      reportedCostUsd: this.state.reportedCostUsd,
+      tokensUnavailable: this.tokensUnavailable,
+      reportedCostUnavailable: this.reportedCostUnavailable,
+      tokensEstimated: this.state.tokensEstimated,
+      hasAuthoritativeTokenReceipt: this.hasAuthoritativeTokenReceipt,
+    });
     appendDebugLog("agent:run:end", {
       iteration,
       elapsedMs: Date.now() - startedAt,
@@ -974,16 +1009,15 @@ ${recovery.detail}
       return null;
     }
 
-    const totalTokens =
-      this.state.totalInputTokens + this.state.totalOutputTokens;
-    if (totalTokens < this.limits.maxTokens) return null;
+    if (this.totalTokens < this.limits.maxTokens) return null;
 
-    return `max tokens reached (${totalTokens}/${this.limits.maxTokens})`;
+    return `max tokens reached (${this.totalTokens}/${this.limits.maxTokens})`;
   }
 
   private getReportedCostAbortReason(): string | null {
     if (
       this.limits.maxReportedCostUsd === undefined ||
+      this.reportedCostUnavailable ||
       this.state.reportedCostUsd === null ||
       this.state.reportedCostUsd < this.limits.maxReportedCostUsd
     ) {

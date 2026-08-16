@@ -208,17 +208,61 @@ describe("CodexAgent", () => {
       const runPromise = agent.run("test prompt", "/work/dir", {
         signal: controller.signal,
       });
+      const rejection = expect(runPromise).rejects.toThrow("Agent was aborted");
       controller.abort();
-      await expect(runPromise).rejects.toThrow("Agent was aborted");
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
 
       proc.emit("close", null);
-      const closePromise = agent.close();
       await vi.advanceTimersByTimeAsync(3_000);
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
 
       await vi.advanceTimersByTimeAsync(100);
-      await closePromise;
+      await rejection;
+      await agent.close();
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("finishes owned-group shutdown before a successful run settles", async () => {
+    vi.useFakeTimers();
+    const proc = createMockProcess();
+    Object.defineProperty(proc, "pid", { value: 4321 });
+    mockSpawn.mockReturnValue(proc);
+    const processKill = vi
+      .spyOn(process, "kill")
+      .mockImplementation(() => true);
+    const agent = new CodexAgent("/tmp/schema.json", { platform: "linux" });
+
+    try {
+      const runPromise = agent.run("test prompt", "/work/dir");
+      proc.stdout.emit(
+        "data",
+        Buffer.from(
+          `${JSON.stringify({
+            type: "item.completed",
+            item: {
+              type: "agent_message",
+              text: JSON.stringify({
+                success: true,
+                summary: "done",
+                key_changes_made: [],
+                key_learnings: [],
+              }),
+            },
+          })}\n`,
+        ),
+      );
+      proc.emit("close", 0);
+
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(runPromise).resolves.toMatchObject({
+        output: { success: true, summary: "done" },
+      });
     } finally {
       processKill.mockRestore();
       vi.useRealTimers();

@@ -174,17 +174,17 @@ describe("PiAgent", () => {
       const runPromise = agent.run("test prompt", "/work/dir", {
         signal: controller.signal,
       });
+      const rejection = expect(runPromise).rejects.toThrow("Agent was aborted");
       controller.abort();
-      await expect(runPromise).rejects.toThrow("Agent was aborted");
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGTERM");
 
       proc.emit("close", null);
-      const closePromise = agent.close();
       await vi.advanceTimersByTimeAsync(3_000);
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
 
       await vi.advanceTimersByTimeAsync(100);
-      await closePromise;
+      await rejection;
+      await agent.close();
     } finally {
       processKill.mockRestore();
       vi.useRealTimers();
@@ -306,6 +306,53 @@ describe("PiAgent", () => {
       cacheCreationTokens: 0,
       tokensAvailable: true,
     });
+  });
+
+  it("maps live totals and terminal cost receipts", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const onUsage = vi.fn();
+    const agent = new PiAgent();
+    const usage = {
+      input: 4,
+      output: 2,
+      cacheRead: 3,
+      cacheWrite: 1,
+      totalTokens: 12,
+      cost: { total: 0.4 },
+    };
+
+    const promise = agent.run("test prompt", "/work/dir", { onUsage });
+    emitJson(proc, {
+      type: "message_update",
+      message: { role: "assistant", responseId: "r1" },
+      usage,
+    });
+    emitJson(proc, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        responseId: "r1",
+        usage,
+        content: [{ type: "text", text: finalOutput() }],
+      },
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      usage: {
+        inputTokens: 4,
+        outputTokens: 2,
+        cacheReadTokens: 3,
+        cacheCreationTokens: 1,
+        totalTokens: 12,
+        reportedCostUsd: 0.4,
+        tokensAvailable: true,
+      },
+    });
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ totalTokens: 12, reportedCostUsd: 0.4 }),
+    );
   });
 
   it("marks aggregate usage unavailable when a completed message omits usage", async () => {

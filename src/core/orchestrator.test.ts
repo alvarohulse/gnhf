@@ -19,7 +19,9 @@ vi.mock("./run.js", async (importOriginal) => {
     ...actual,
     appendNotes: vi.fn(),
     clearWorkspaceRecovery: vi.fn(),
+    readRunUsageState: vi.fn(() => null),
     readWorkspaceRecovery: vi.fn(() => null),
+    writeRunUsageState: vi.fn(),
     writeWorkspaceRecovery: vi.fn(),
   };
 });
@@ -47,7 +49,9 @@ import {
 import {
   appendNotes,
   clearWorkspaceRecovery,
+  readRunUsageState,
   readWorkspaceRecovery,
+  writeRunUsageState,
   writeWorkspaceRecovery,
 } from "./run.js";
 import { appendDebugLog } from "./debug-log.js";
@@ -66,7 +70,9 @@ const mockCommitAll = vi.mocked(commitAll);
 const mockPushCurrentBranch = vi.mocked(pushCurrentBranch);
 const mockAppendNotes = vi.mocked(appendNotes);
 const mockClearWorkspaceRecovery = vi.mocked(clearWorkspaceRecovery);
+const mockReadRunUsageState = vi.mocked(readRunUsageState);
 const mockReadWorkspaceRecovery = vi.mocked(readWorkspaceRecovery);
+const mockWriteRunUsageState = vi.mocked(writeRunUsageState);
 const mockWriteWorkspaceRecovery = vi.mocked(writeWorkspaceRecovery);
 const mockResetHard = vi.mocked(resetHard);
 const mockAppendDebugLog = vi.mocked(appendDebugLog);
@@ -356,6 +362,84 @@ describe("Orchestrator stop limits", () => {
     expect(orchestrator.getState().status).toBe("aborted");
   });
 
+  it("restores cumulative usage before enforcing resumed caps", async () => {
+    mockReadRunUsageState.mockReturnValueOnce({
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn(),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      2,
+      { maxTokens: 10 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(agent.run).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith("max tokens reached (12/10)");
+    expect(orchestrator.getState()).toMatchObject({
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      reportedCostUsd: 0.4,
+    });
+  });
+
+  it("persists cumulative authoritative usage after a completed turn", async () => {
+    const agent: Agent = {
+      name: "pi",
+      run: vi.fn(async () => ({
+        ...createSuccessResult(),
+        usage: {
+          inputTokens: 4,
+          outputTokens: 2,
+          cacheReadTokens: 3,
+          cacheCreationTokens: 1,
+          totalTokens: 12,
+          reportedCostUsd: 0.4,
+          tokensAvailable: true,
+        },
+      })),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(mockWriteRunUsageState).toHaveBeenCalledWith(runInfo, {
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    });
+  });
+
   it("aborts after completing the configured number of iterations", async () => {
     const agent: Agent = {
       name: "claude",
@@ -518,9 +602,9 @@ describe("Orchestrator stop limits", () => {
             });
             options?.onUsage?.({
               inputTokens: 7,
-              outputTokens: 4,
+              outputTokens: 2,
               cacheReadTokens: 0,
-              cacheCreationTokens: 0,
+              cacheCreationTokens: 2,
               tokensAvailable: true,
             });
           }),
@@ -558,6 +642,44 @@ describe("Orchestrator stop limits", () => {
       totalOutputTokens: 0,
       tokensAvailable: false,
     });
+  });
+
+  it("uses provider-authoritative totals for live token caps", async () => {
+    const agent: Agent = {
+      name: "pi",
+      close: vi.fn(async () => undefined),
+      run: vi.fn(
+        (_prompt, _cwd, options) =>
+          new Promise<AgentResult>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              reject(new Error("Agent was aborted"));
+            });
+            options?.onUsage?.({
+              inputTokens: 4,
+              outputTokens: 2,
+              cacheReadTokens: 3,
+              cacheCreationTokens: 1,
+              totalTokens: 12,
+              tokensAvailable: true,
+            });
+          }),
+      ),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxTokens: 10 },
+    );
+    const abort = vi.fn();
+    orchestrator.on("abort", abort);
+
+    await orchestrator.start();
+
+    expect(abort).toHaveBeenCalledWith("max tokens reached (12/10)");
   });
 
   it("does not enforce a zero token cap before receiving usage", async () => {

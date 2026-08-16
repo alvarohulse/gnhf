@@ -263,14 +263,16 @@ export class CopilotAgent implements Agent {
           this.activeChild = null;
         }
       });
+      const finalizeRun = () =>
+        this.shutdowns.finalizeOwnedProcessGroup(child, this.detached, () =>
+          shutdownCopilotProcess(child, this.platform, this.detached),
+        );
+      const shutdownRun = () =>
+        this.shutdowns.start(() =>
+          shutdownCopilotProcess(child, this.platform, this.detached),
+        );
 
-      if (
-        setupAbortHandler(signal, child, reject, () => {
-          void this.shutdowns.start(() =>
-            shutdownCopilotProcess(child, this.platform, this.detached),
-          );
-        })
-      ) {
+      if (setupAbortHandler(signal, child, reject, shutdownRun)) {
         return;
       }
 
@@ -312,27 +314,34 @@ export class CopilotAgent implements Agent {
         }
       });
 
-      setupChildProcessHandlers(child, "copilot", logStream, reject, () => {
-        if (!lastAgentMessage) {
-          reject(new Error("copilot returned no agent message"));
-          return;
-        }
+      setupChildProcessHandlers(
+        child,
+        "copilot",
+        logStream,
+        reject,
+        () => {
+          if (!lastAgentMessage) {
+            reject(new Error("copilot returned no agent message"));
+            return;
+          }
 
-        try {
-          const output = parseAgentOutput(
-            lastAgentMessage,
-            this.schema,
-            "copilot",
-          );
-          resolve({ output, usage: cumulative });
-        } catch (err) {
-          reject(
-            new Error(
-              `Failed to parse copilot output: ${err instanceof Error ? err.message : err}`,
-            ),
-          );
-        }
-      });
+          try {
+            const output = parseAgentOutput(
+              lastAgentMessage,
+              this.schema,
+              "copilot",
+            );
+            resolve({ output, usage: cumulative });
+          } catch (err) {
+            reject(
+              new Error(
+                `Failed to parse copilot output: ${err instanceof Error ? err.message : err}`,
+              ),
+            );
+          }
+        },
+        finalizeRun,
+      );
     });
   }
 

@@ -33,6 +33,17 @@ export class ChildProcessShutdownTracker {
       await Promise.all(this.pending);
     }
   }
+
+  async finalizeOwnedProcessGroup(
+    child: ChildProcess,
+    detached: boolean,
+    startShutdown: () => Promise<void>,
+  ): Promise<void> {
+    if (!detached || child.pid === undefined) {
+      return;
+    }
+    await this.start(startShutdown);
+  }
 }
 
 export function shouldDetachAgentProcess(

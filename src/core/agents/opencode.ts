@@ -35,6 +35,7 @@ interface OpenCodeMessagePart {
 interface OpenCodeTokens {
   input?: number;
   output?: number;
+  total?: number;
   cache?: {
     read?: number;
     write?: number;
@@ -46,6 +47,7 @@ interface OpenCodeMessageResponse {
     id?: string;
     role?: string;
     structured?: AgentOutput;
+    cost?: number;
     tokens?: OpenCodeTokens;
   };
   parts?: OpenCodeMessagePart[];
@@ -79,6 +81,7 @@ interface OpenCodeStreamEvent {
         messageID?: string;
         type?: string;
         text?: string;
+        cost?: number;
         tokens?: OpenCodeTokens;
         metadata?: {
           openai?: {
@@ -90,6 +93,7 @@ interface OpenCodeStreamEvent {
         id?: string;
         role?: string;
         structured?: AgentOutput;
+        cost?: number;
         tokens?: OpenCodeTokens;
       };
     };
@@ -299,7 +303,7 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function toUsage(tokens?: OpenCodeTokens): TokenUsage {
+function toUsage(tokens?: OpenCodeTokens, cost?: number): TokenUsage {
   const inputTokens = tokens?.input;
   const outputTokens = tokens?.output;
   return {
@@ -307,9 +311,79 @@ function toUsage(tokens?: OpenCodeTokens): TokenUsage {
     outputTokens: outputTokens ?? 0,
     cacheReadTokens: tokens?.cache?.read ?? 0,
     cacheCreationTokens: tokens?.cache?.write ?? 0,
+    ...(isValidTokenCount(tokens?.total) ? { totalTokens: tokens.total } : {}),
+    ...(isValidTokenCount(cost) ? { reportedCostUsd: cost } : {}),
     tokensAvailable:
       isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
   };
+}
+
+function combineUsage(receipts: TokenUsage[]): TokenUsage {
+  const combined: TokenUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    tokensAvailable:
+      receipts.length > 0 &&
+      receipts.every((receipt) => receipt.tokensAvailable === true),
+  };
+  for (const receipt of receipts) {
+    combined.inputTokens += receipt.inputTokens;
+    combined.outputTokens += receipt.outputTokens;
+    combined.cacheReadTokens += receipt.cacheReadTokens;
+    combined.cacheCreationTokens += receipt.cacheCreationTokens;
+  }
+  if (
+    receipts.length > 0 &&
+    receipts.every((receipt) => isValidTokenCount(receipt.totalTokens))
+  ) {
+    combined.totalTokens = receipts.reduce(
+      (total, receipt) => total + receipt.totalTokens!,
+      0,
+    );
+  }
+  if (
+    receipts.length > 0 &&
+    receipts.every((receipt) => isValidTokenCount(receipt.reportedCostUsd))
+  ) {
+    combined.reportedCostUsd = receipts.reduce(
+      (total, receipt) => total + receipt.reportedCostUsd!,
+      0,
+    );
+  }
+  return combined;
+}
+
+function mergeMessageUsage(
+  assistantUsage: TokenUsage | undefined,
+  stepUsage: TokenUsage | undefined,
+): TokenUsage {
+  if (assistantUsage === undefined) {
+    return stepUsage!;
+  }
+  if (stepUsage === undefined) {
+    return assistantUsage;
+  }
+  const assistantTotal = isValidTokenCount(assistantUsage.totalTokens)
+    ? assistantUsage.totalTokens
+    : assistantUsage.inputTokens +
+      assistantUsage.outputTokens +
+      assistantUsage.cacheCreationTokens;
+  const stepTotal = isValidTokenCount(stepUsage.totalTokens)
+    ? stepUsage.totalTokens
+    : stepUsage.inputTokens +
+      stepUsage.outputTokens +
+      stepUsage.cacheCreationTokens;
+  const merged =
+    assistantTotal >= stepTotal ? { ...assistantUsage } : { ...stepUsage };
+  const reportedCostUsd = isValidTokenCount(assistantUsage.reportedCostUsd)
+    ? assistantUsage.reportedCostUsd
+    : stepUsage.reportedCostUsd;
+  if (isValidTokenCount(reportedCostUsd)) {
+    merged.reportedCostUsd = reportedCostUsd;
+  }
+  return merged;
 }
 
 function withTimeoutSignal(
@@ -699,9 +773,11 @@ export class OpenCodeAgent implements Agent {
       tokensAvailable: false,
     };
     const usageByMessageId = new Map<string, TokenUsage>();
+    const assistantUsageByMessageId = new Map<string, TokenUsage>();
+    const stepUsageByMessageId = new Map<string, Map<string, TokenUsage>>();
     const textParts = new Map<string, OpenCodeTextPartState>();
     let lastFinalAnswerText: string | null = null;
-    let lastUsageSignature = "0:0:0:0:true";
+    let lastUsageSignature = "0:0:0:0:na:na:true";
     let structuredOutputFromSSE: AgentOutput | null = null;
     let streamErrorInfo: OpenCodeStreamErrorInfo | null = null;
 
@@ -816,45 +892,62 @@ export class OpenCodeAgent implements Agent {
     const updateUsage = (
       messageId: string | undefined,
       tokens?: OpenCodeTokens,
+      cost?: number,
       requireReceipt = false,
+      stepId?: string,
     ) => {
-      if (!messageId || (!tokens && !requireReceipt)) return;
-      usageByMessageId.set(
-        messageId,
-        tokens
-          ? toUsage(tokens)
-          : {
-              inputTokens: 0,
-              outputTokens: 0,
-              cacheReadTokens: 0,
-              cacheCreationTokens: 0,
-              tokensAvailable: false,
-            },
-      );
-
-      let nextInputTokens = 0;
-      let nextOutputTokens = 0;
-      let nextCacheReadTokens = 0;
-      let nextCacheCreationTokens = 0;
-      for (const messageUsage of usageByMessageId.values()) {
-        nextInputTokens += messageUsage.inputTokens;
-        nextOutputTokens += messageUsage.outputTokens;
-        nextCacheReadTokens += messageUsage.cacheReadTokens;
-        nextCacheCreationTokens += messageUsage.cacheCreationTokens;
+      if (!messageId || (!tokens && cost === undefined && !requireReceipt)) {
+        return;
+      }
+      const nextUsage = toUsage(tokens, cost);
+      if (stepId !== undefined) {
+        const stepUsage =
+          stepUsageByMessageId.get(messageId) ?? new Map<string, TokenUsage>();
+        stepUsage.set(stepId, nextUsage);
+        stepUsageByMessageId.set(messageId, stepUsage);
+        const combinedStepUsage = combineUsage([...stepUsage.values()]);
+        usageByMessageId.set(
+          messageId,
+          mergeMessageUsage(
+            assistantUsageByMessageId.get(messageId),
+            combinedStepUsage,
+          ),
+        );
+      } else {
+        assistantUsageByMessageId.set(messageId, nextUsage);
+        const stepUsage = stepUsageByMessageId.get(messageId);
+        usageByMessageId.set(
+          messageId,
+          mergeMessageUsage(
+            nextUsage,
+            stepUsage ? combineUsage([...stepUsage.values()]) : undefined,
+          ),
+        );
       }
 
-      usage.inputTokens = nextInputTokens;
-      usage.outputTokens = nextOutputTokens;
-      usage.cacheReadTokens = nextCacheReadTokens;
-      usage.cacheCreationTokens = nextCacheCreationTokens;
-      usage.tokensAvailable = [...usageByMessageId.values()].every(
-        (messageUsage) => messageUsage.tokensAvailable,
-      );
+      const combined = combineUsage([...usageByMessageId.values()]);
+      usage.inputTokens = combined.inputTokens;
+      usage.outputTokens = combined.outputTokens;
+      usage.cacheReadTokens = combined.cacheReadTokens;
+      usage.cacheCreationTokens = combined.cacheCreationTokens;
+      usage.tokensAvailable = combined.tokensAvailable;
+      if (combined.totalTokens === undefined) {
+        delete usage.totalTokens;
+      } else {
+        usage.totalTokens = combined.totalTokens;
+      }
+      if (combined.reportedCostUsd === undefined) {
+        delete usage.reportedCostUsd;
+      } else {
+        usage.reportedCostUsd = combined.reportedCostUsd;
+      }
       const signature = [
-        nextInputTokens,
-        nextOutputTokens,
-        nextCacheReadTokens,
-        nextCacheCreationTokens,
+        usage.inputTokens,
+        usage.outputTokens,
+        usage.cacheReadTokens,
+        usage.cacheCreationTokens,
+        usage.totalTokens ?? "na",
+        usage.reportedCostUsd ?? "na",
         usage.tokensAvailable,
       ].join(":");
       if (signature !== lastUsageSignature) {
@@ -921,7 +1014,7 @@ export class OpenCodeAgent implements Agent {
         }
 
         if (part.type === "step-finish") {
-          updateUsage(part.messageID, part.tokens);
+          updateUsage(part.messageID, part.tokens, part.cost, false, part.id);
           return false;
         }
 
@@ -930,7 +1023,12 @@ export class OpenCodeAgent implements Agent {
 
       if (payload?.type === "message.updated") {
         if (properties.info?.role === "assistant") {
-          updateUsage(properties.info.id, properties.info.tokens, true);
+          updateUsage(
+            properties.info.id,
+            properties.info.tokens,
+            properties.info.cost,
+            true,
+          );
         }
         if (properties.info?.structured) {
           structuredOutputFromSSE = properties.info.structured;

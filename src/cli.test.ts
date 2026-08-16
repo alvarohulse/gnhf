@@ -3481,6 +3481,44 @@ describe("cli", () => {
     expect(removeWorktree).not.toHaveBeenCalled();
   });
 
+  it("preserves a clean worktree with interrupted recovery pending", async () => {
+    const removeWorktree = vi.fn();
+
+    await runCliWithMocks(
+      ["ship it", "--worktree"],
+      {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: false,
+      },
+      {
+        removeWorktree,
+        orchestratorGetState: vi.fn(() => ({
+          status: "stopped" as const,
+          gracefulStopRequested: false,
+          currentIteration: 1,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          commitCount: 0,
+          iterations: [],
+          successCount: 0,
+          failCount: 0,
+          consecutiveFailures: 0,
+          startTime: new Date("2026-01-01T00:00:00Z"),
+          waitingUntil: null,
+          lastMessage: null,
+          hasPendingCommitFailure: false,
+          hasPendingWorkspaceRecovery: true,
+        })),
+      },
+    );
+
+    expect(removeWorktree).not.toHaveBeenCalled();
+  });
+
   it("preserves a worktree when git refuses final removal", async () => {
     const consoleErrorSink: unknown[][] = [];
     const removeWorktree = vi.fn(() => {

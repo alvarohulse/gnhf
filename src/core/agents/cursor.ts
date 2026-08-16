@@ -388,17 +388,28 @@ export class CursorAgent implements Agent {
           this.activeChild = null;
         }
       });
+      const finalizeRun = () =>
+        this.shutdowns.finalizeOwnedProcessGroup(child, this.detached, () =>
+          shutdownCursorProcess(child, this.platform, this.detached),
+        );
+      const shutdownRun = () =>
+        this.shutdowns.start(() =>
+          shutdownCursorProcess(child, this.platform, this.detached),
+        );
+      const rejectAfterFinalize = (error: Error) => {
+        void (async () => {
+          try {
+            await finalizeRun();
+          } finally {
+            reject(error);
+          }
+        })();
+      };
 
       child.stdin?.write(buildCursorPrompt(prompt, this.schema));
       child.stdin?.end();
 
-      if (
-        setupAbortHandler(signal, child, reject, () => {
-          void this.shutdowns.start(() =>
-            shutdownCursorProcess(child, this.platform, this.detached),
-          );
-        })
-      ) {
+      if (setupAbortHandler(signal, child, reject, shutdownRun)) {
         return;
       }
 
@@ -421,7 +432,9 @@ export class CursorAgent implements Agent {
       });
 
       child.on("error", (err) => {
-        reject(new Error(`Failed to spawn cursor: ${err.message}`));
+        rejectAfterFinalize(
+          new Error(`Failed to spawn cursor: ${err.message}`),
+        );
       });
 
       parseJSONLStream<CursorEvent>(child.stdout!, logStream, (event) => {
@@ -477,6 +490,7 @@ export class CursorAgent implements Agent {
           clearTimeout(finalResultCleanupTimer);
         }
         logStream?.end();
+        await finalizeRun();
         if (closedAfterFinalCleanup) {
           await this.shutdowns.waitForAll();
         }

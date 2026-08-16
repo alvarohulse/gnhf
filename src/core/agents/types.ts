@@ -150,6 +150,7 @@ export interface TokenUsage {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  totalTokens?: number;
   reportedCostUsd?: number;
   tokensAvailable?: boolean;
   // Marks provisional counts for display. tokensAvailable independently
@@ -165,6 +166,12 @@ export function hasCompleteTokenUsage(
   usage: TokenUsage,
 ): usage is TokenUsage & { tokensAvailable: true } {
   return usage.tokensAvailable === true;
+}
+
+export function getTokenUsageTotal(usage: TokenUsage): number {
+  return isValidTokenCount(usage.totalTokens)
+    ? usage.totalTokens
+    : usage.inputTokens + usage.outputTokens + usage.cacheCreationTokens;
 }
 
 export interface AgentResult {

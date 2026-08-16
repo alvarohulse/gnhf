@@ -187,14 +187,16 @@ export class CodexAgent implements Agent {
           this.activeChild = null;
         }
       });
+      const finalizeRun = () =>
+        this.shutdowns.finalizeOwnedProcessGroup(child, this.detached, () =>
+          shutdownCodexProcess(child, this.platform, this.detached),
+        );
+      const shutdownRun = () =>
+        this.shutdowns.start(() =>
+          shutdownCodexProcess(child, this.platform, this.detached),
+        );
 
-      if (
-        setupAbortHandler(signal, child, reject, () => {
-          void this.shutdowns.start(() =>
-            shutdownCodexProcess(child, this.platform, this.detached),
-          );
-        })
-      ) {
+      if (setupAbortHandler(signal, child, reject, shutdownRun)) {
         return;
       }
 
@@ -241,23 +243,30 @@ export class CodexAgent implements Agent {
         }
       });
 
-      setupChildProcessHandlers(child, "codex", logStream, reject, () => {
-        if (!lastAgentMessage) {
-          reject(new Error("codex returned no agent message"));
-          return;
-        }
+      setupChildProcessHandlers(
+        child,
+        "codex",
+        logStream,
+        reject,
+        () => {
+          if (!lastAgentMessage) {
+            reject(new Error("codex returned no agent message"));
+            return;
+          }
 
-        try {
-          const output = JSON.parse(lastAgentMessage) as AgentOutput;
-          resolve({ output, usage: cumulative });
-        } catch (err) {
-          reject(
-            new Error(
-              `Failed to parse codex output: ${err instanceof Error ? err.message : err}`,
-            ),
-          );
-        }
-      });
+          try {
+            const output = JSON.parse(lastAgentMessage) as AgentOutput;
+            resolve({ output, usage: cumulative });
+          } catch (err) {
+            reject(
+              new Error(
+                `Failed to parse codex output: ${err instanceof Error ? err.message : err}`,
+              ),
+            );
+          }
+        },
+        finalizeRun,
+      );
     });
   }
 

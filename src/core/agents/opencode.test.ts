@@ -835,6 +835,45 @@ describe("OpenCodeAgent", () => {
     });
   });
 
+  it("uses exact assistant totals and aggregates live step costs", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(
+        sseResponse([
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-1","messageID":"msg-1","type":"step-finish","cost":0.1,"tokens":{"input":2,"output":1,"total":5,"cache":{"read":1,"write":1}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-2","messageID":"msg-1","type":"step-finish","cost":0.2,"tokens":{"input":3,"output":2,"total":7,"cache":{"read":1,"write":1}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"part-final","type":"text","text":"{\\"success\\":true,\\"summary\\":\\"done\\",\\"key_changes_made\\":[],\\"key_learnings\\":[]}","metadata":{"openai":{"phase":"final_answer"}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-1","role":"assistant","cost":0.3,"structured":{"success":true,"summary":"done","key_changes_made":[],"key_learnings":[]},"tokens":{"input":5,"output":3,"total":12,"cache":{"read":2,"write":2}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"session.idle","properties":{"sessionID":"session-123"}}}\n\n',
+        ]),
+      )
+      .mockResolvedValueOnce(promptAsyncResponse())
+      .mockResolvedValueOnce(jsonResponse(true));
+
+    const onUsage = vi.fn();
+    const result = await agent.run("test", "/repo", { onUsage });
+
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        totalTokens: 12,
+        reportedCostUsd: 0.30000000000000004,
+      }),
+    );
+    expect(result.usage).toEqual({
+      inputTokens: 5,
+      outputTokens: 3,
+      cacheReadTokens: 2,
+      cacheCreationTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.3,
+      tokensAvailable: true,
+    });
+  });
+
   it("marks usage unavailable when an assistant message omits tokens", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);

@@ -395,14 +395,25 @@ export class ClaudeAgent implements Agent {
           this.activeChild = null;
         }
       });
+      const finalizeRun = () =>
+        this.shutdowns.finalizeOwnedProcessGroup(child, this.detached, () =>
+          shutdownClaudeProcess(child, this.platform, this.detached),
+        );
+      const shutdownRun = () =>
+        this.shutdowns.start(() =>
+          shutdownClaudeProcess(child, this.platform, this.detached),
+        );
+      const rejectAfterFinalize = (error: Error) => {
+        void (async () => {
+          try {
+            await finalizeRun();
+          } finally {
+            reject(error);
+          }
+        })();
+      };
 
-      if (
-        setupAbortHandler(signal, child, reject, () => {
-          void this.shutdowns.start(() =>
-            shutdownClaudeProcess(child, this.platform, this.detached),
-          );
-        })
-      ) {
+      if (setupAbortHandler(signal, child, reject, shutdownRun)) {
         return;
       }
 
@@ -450,7 +461,9 @@ export class ClaudeAgent implements Agent {
       });
 
       child.on("error", (err) => {
-        reject(new Error(`Failed to spawn claude: ${err.message}`));
+        rejectAfterFinalize(
+          new Error(`Failed to spawn claude: ${err.message}`),
+        );
       });
 
       parseJSONLStream<ClaudeEvent>(child.stdout!, logStream, (event) => {
@@ -584,6 +597,7 @@ export class ClaudeAgent implements Agent {
           clearTimeout(finalResultCleanupTimer);
         }
         logStream?.end();
+        await finalizeRun();
         if (closedAfterFinalCleanup) {
           await this.shutdowns.waitForAll();
         }

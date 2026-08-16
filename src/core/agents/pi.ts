@@ -147,11 +147,16 @@ function toTokenUsage(usage: JsonRecord | undefined): TokenUsage | null {
 
   const inputTokens = numberField(usage, ["input"]);
   const outputTokens = numberField(usage, ["output"]);
+  const totalTokens = numberField(usage, ["totalTokens", "total_tokens"]);
+  const cost = isRecord(usage.cost) ? usage.cost : undefined;
+  const reportedCostUsd = cost ? numberField(cost, ["total"]) : undefined;
   return {
     inputTokens: inputTokens ?? 0,
     outputTokens: outputTokens ?? 0,
     cacheReadTokens: numberField(usage, ["cacheRead"]) ?? 0,
     cacheCreationTokens: numberField(usage, ["cacheWrite"]) ?? 0,
+    ...(isValidTokenCount(totalTokens) ? { totalTokens } : {}),
+    ...(isValidTokenCount(reportedCostUsd) ? { reportedCostUsd } : {}),
     tokensAvailable:
       isValidTokenCount(inputTokens) && isValidTokenCount(outputTokens),
   };
@@ -163,6 +168,8 @@ function isSameUsage(a: TokenUsage, b: TokenUsage): boolean {
     a.outputTokens === b.outputTokens &&
     a.cacheReadTokens === b.cacheReadTokens &&
     a.cacheCreationTokens === b.cacheCreationTokens &&
+    a.totalTokens === b.totalTokens &&
+    a.reportedCostUsd === b.reportedCostUsd &&
     a.tokensAvailable === b.tokensAvailable
   );
 }
@@ -268,17 +275,19 @@ export class PiAgent implements Agent {
           this.activeChild = null;
         }
       });
+      const finalizeRun = () =>
+        this.shutdowns.finalizeOwnedProcessGroup(child, this.detached, () =>
+          shutdownPiProcess(child, this.platform, this.detached),
+        );
+      const shutdownRun = () =>
+        this.shutdowns.start(() =>
+          shutdownPiProcess(child, this.platform, this.detached),
+        );
 
       child.stdin?.write(buildPiPrompt(prompt, this.schema));
       child.stdin?.end();
 
-      if (
-        setupAbortHandler(signal, child, reject, () => {
-          void this.shutdowns.start(() =>
-            shutdownPiProcess(child, this.platform, this.detached),
-          );
-        })
-      ) {
+      if (setupAbortHandler(signal, child, reject, shutdownRun)) {
         return;
       }
 
@@ -300,10 +309,12 @@ export class PiAgent implements Agent {
         message: JsonRecord,
         streaming = false,
         requireReceipt = false,
+        usageOverride?: JsonRecord,
       ) => {
-        const usage = isRecord(message.usage)
-          ? toTokenUsage(message.usage)
-          : null;
+        const usage = toTokenUsage(
+          usageOverride ??
+            (isRecord(message.usage) ? message.usage : undefined),
+        );
         if (!usage && !requireReceipt) return;
 
         let key = messageKey(message);
@@ -339,9 +350,30 @@ export class PiAgent implements Agent {
           cumulative.cacheReadTokens += entry.cacheReadTokens;
           cumulative.cacheCreationTokens += entry.cacheCreationTokens;
         }
-        cumulative.tokensAvailable = [...usageByMessageKey.values()].every(
+        const usageReceipts = [...usageByMessageKey.values()];
+        cumulative.tokensAvailable = usageReceipts.every(
           (entry) => entry.tokensAvailable,
         );
+        delete cumulative.totalTokens;
+        delete cumulative.reportedCostUsd;
+        if (
+          usageReceipts.every((entry) => isValidTokenCount(entry.totalTokens))
+        ) {
+          cumulative.totalTokens = usageReceipts.reduce(
+            (total, entry) => total + entry.totalTokens!,
+            0,
+          );
+        }
+        if (
+          usageReceipts.every((entry) =>
+            isValidTokenCount(entry.reportedCostUsd),
+          )
+        ) {
+          cumulative.reportedCostUsd = usageReceipts.reduce(
+            (total, entry) => total + entry.reportedCostUsd!,
+            0,
+          );
+        }
 
         if (!isSameUsage(cumulative, lastEmittedUsage)) {
           lastEmittedUsage = cumulative;
@@ -353,17 +385,23 @@ export class PiAgent implements Agent {
         message: unknown,
         streaming = false,
         requireReceipt = false,
+        usageOverride?: JsonRecord,
       ) => {
         if (!isRecord(message) || roleOf(message) !== "assistant") return;
         latestAssistantMessage = message;
-        updateUsage(message, streaming, requireReceipt);
+        updateUsage(message, streaming, requireReceipt, usageOverride);
       };
 
       parseJSONLStream<JsonRecord>(child.stdout!, logStream, (event) => {
         if (!isRecord(event)) return;
 
         if (event.type === "message_update") {
-          rememberAssistantMessage(event.message, true);
+          rememberAssistantMessage(
+            event.message,
+            true,
+            false,
+            isRecord(event.usage) ? event.usage : undefined,
+          );
 
           if (isRecord(event.assistantMessageEvent)) {
             const assistantEvent = event.assistantMessageEvent;
@@ -416,45 +454,52 @@ export class PiAgent implements Agent {
         }
       });
 
-      setupChildProcessHandlers(child, "pi", logStream, reject, () => {
-        if (latestAssistantMessage) {
-          const stopReason = latestAssistantMessage.stopReason;
-          if (stopReason === "error" || stopReason === "aborted") {
-            const errorMessage =
-              stringField(latestAssistantMessage, [
-                "errorMessage",
-                "error",
-                "message",
-              ]) ?? compactJson(latestAssistantMessage);
-            reject(new Error(`pi reported error: ${errorMessage}`));
+      setupChildProcessHandlers(
+        child,
+        "pi",
+        logStream,
+        reject,
+        () => {
+          if (latestAssistantMessage) {
+            const stopReason = latestAssistantMessage.stopReason;
+            if (stopReason === "error" || stopReason === "aborted") {
+              const errorMessage =
+                stringField(latestAssistantMessage, [
+                  "errorMessage",
+                  "error",
+                  "message",
+                ]) ?? compactJson(latestAssistantMessage);
+              reject(new Error(`pi reported error: ${errorMessage}`));
+              return;
+            }
+          }
+
+          const finalText =
+            textFromAssistantMessage(latestAssistantMessage).trim() ||
+            textByIndexToString(completeTextByIndex).trim() ||
+            textByIndexToString(streamTextByIndex).trim();
+
+          if (!finalText) {
+            reject(new Error("pi returned no text output"));
             return;
           }
-        }
 
-        const finalText =
-          textFromAssistantMessage(latestAssistantMessage).trim() ||
-          textByIndexToString(completeTextByIndex).trim() ||
-          textByIndexToString(streamTextByIndex).trim();
+          let output: AgentOutput;
+          try {
+            output = parseAgentOutput(finalText, this.schema, "pi");
+          } catch (err) {
+            const message =
+              err instanceof SyntaxError
+                ? `Failed to parse pi output: ${err.message}`
+                : `Invalid pi output: ${err instanceof Error ? err.message : err}`;
+            reject(new Error(message));
+            return;
+          }
 
-        if (!finalText) {
-          reject(new Error("pi returned no text output"));
-          return;
-        }
-
-        let output: AgentOutput;
-        try {
-          output = parseAgentOutput(finalText, this.schema, "pi");
-        } catch (err) {
-          const message =
-            err instanceof SyntaxError
-              ? `Failed to parse pi output: ${err.message}`
-              : `Invalid pi output: ${err instanceof Error ? err.message : err}`;
-          reject(new Error(message));
-          return;
-        }
-
-        resolve({ output, usage: lastEmittedUsage });
-      });
+          resolve({ output, usage: lastEmittedUsage });
+        },
+        finalizeRun,
+      );
     });
   }
 

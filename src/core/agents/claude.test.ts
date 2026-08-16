@@ -278,16 +278,16 @@ describe("ClaudeAgent", () => {
       const runPromise = unixAgent.run("test prompt", "/work/dir", {
         signal: controller.signal,
       });
+      const rejection = expect(runPromise).rejects.toThrow("Agent was aborted");
       controller.abort();
-      await expect(runPromise).rejects.toThrow("Agent was aborted");
       proc.emit("close", null);
 
-      const closePromise = unixAgent.close();
       await vi.advanceTimersByTimeAsync(3_000);
 
       expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
       await vi.advanceTimersByTimeAsync(100);
-      await closePromise;
+      await rejection;
+      await unixAgent.close();
     } finally {
       processKill.mockRestore();
       vi.useRealTimers();

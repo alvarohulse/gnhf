@@ -51,10 +51,22 @@ export type WorkspaceRecovery = {
   detail: string;
 };
 
+export interface RunUsageState {
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalTokens: number;
+  reportedCostUsd: number | null;
+  tokensUnavailable: boolean;
+  reportedCostUnavailable: boolean;
+  tokensEstimated: boolean;
+  hasAuthoritativeTokenReceipt: boolean;
+}
+
 const LOG_FILENAME = "gnhf.log";
 const STOP_WHEN_FILENAME = "stop-when";
 const COMMIT_MESSAGE_FILENAME = "commit-message";
 const WORKSPACE_RECOVERY_FILENAME = "workspace-recovery.json";
+const USAGE_STATE_FILENAME = "usage.json";
 const LOCAL_METADATA_EXCLUDES = [".gnhf/runs/", ".gnhf/setup-failures/"];
 
 function writeSchemaFile(
@@ -415,6 +427,64 @@ export function writeWorkspaceRecovery(
 
 export function clearWorkspaceRecovery(runInfo: Pick<RunInfo, "runDir">): void {
   rmSync(join(runInfo.runDir, WORKSPACE_RECOVERY_FILENAME), { force: true });
+}
+
+export function readRunUsageState(
+  runInfo: Pick<RunInfo, "runDir">,
+): RunUsageState | null {
+  const usagePath = join(runInfo.runDir, USAGE_STATE_FILENAME);
+  if (!existsSync(usagePath)) {
+    return null;
+  }
+
+  const value = JSON.parse(readFileSync(usagePath, "utf-8")) as unknown;
+  if (!isRunUsageState(value)) {
+    throw new Error(`Invalid run usage metadata: ${usagePath}`);
+  }
+  return value;
+}
+
+export function writeRunUsageState(
+  runInfo: Pick<RunInfo, "runDir">,
+  usageState: RunUsageState,
+): void {
+  const usagePath = join(runInfo.runDir, USAGE_STATE_FILENAME);
+  const temporaryPath = join(
+    runInfo.runDir,
+    `.${USAGE_STATE_FILENAME}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(usageState, null, 2)}\n`, {
+      encoding: "utf-8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    renameSync(temporaryPath, usagePath);
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
+}
+
+function isRunUsageState(value: unknown): value is RunUsageState {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const state = value as Record<string, unknown>;
+  return (
+    isNonNegativeFiniteNumber(state.totalInputTokens) &&
+    isNonNegativeFiniteNumber(state.totalOutputTokens) &&
+    isNonNegativeFiniteNumber(state.totalTokens) &&
+    (state.reportedCostUsd === null ||
+      isNonNegativeFiniteNumber(state.reportedCostUsd)) &&
+    typeof state.tokensUnavailable === "boolean" &&
+    typeof state.reportedCostUnavailable === "boolean" &&
+    typeof state.tokensEstimated === "boolean" &&
+    typeof state.hasAuthoritativeTokenReceipt === "boolean"
+  );
+}
+
+function isNonNegativeFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 export function toStringArray(value: unknown): string[] {

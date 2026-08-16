@@ -782,6 +782,7 @@ describe("CursorAgent", () => {
       });
 
       const promise = agent.run("test prompt", "/work/dir");
+      const rejection = expect(promise).rejects.toThrow("auth failed");
       emitJson(proc, {
         type: "result",
         subtype: "error",
@@ -793,7 +794,8 @@ describe("CursorAgent", () => {
       expect(processKill).not.toHaveBeenCalled();
 
       proc.emit("close", 0);
-      await expect(promise).rejects.toThrow("auth failed");
+      await vi.advanceTimersByTimeAsync(3_100);
+      await rejection;
     } finally {
       processKill.mockRestore();
       vi.useRealTimers();

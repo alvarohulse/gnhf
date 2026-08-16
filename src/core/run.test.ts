@@ -8,6 +8,7 @@ vi.mock("node:fs", () => ({
   readFileSync: vi.fn(() => ""),
   readdirSync: vi.fn(() => []),
   existsSync: vi.fn(() => false),
+  renameSync: vi.fn(),
   rmSync: vi.fn(),
 }));
 
@@ -27,6 +28,7 @@ import {
   appendFileSync,
   existsSync,
   readFileSync,
+  renameSync,
 } from "node:fs";
 import { findLegacyRunBaseCommit, getHeadCommit } from "./git.js";
 import {
@@ -34,7 +36,9 @@ import {
   appendNotes,
   resumeRun,
   peekRunMetadata,
+  readRunUsageState,
   toStringArray,
+  writeRunUsageState,
 } from "./run.js";
 import { CONVENTIONAL_COMMIT_MESSAGE } from "./commit-message.js";
 
@@ -45,6 +49,7 @@ const mockWriteFileSync = vi.mocked(writeFileSync);
 const mockAppendFileSync = vi.mocked(appendFileSync);
 const mockExistsSync = vi.mocked(existsSync);
 const mockReadFileSync = vi.mocked(readFileSync);
+const mockRenameSync = vi.mocked(renameSync);
 const mockExecFileSync = vi.mocked(execFileSync);
 const mockFindLegacyRunBaseCommit = vi.mocked(findLegacyRunBaseCommit);
 const mockGetHeadCommit = vi.mocked(getHeadCommit);
@@ -599,6 +604,69 @@ describe("peekRunMetadata", () => {
       "Run directory not found",
     );
     expect(mockWriteFileSync).not.toHaveBeenCalled();
+  });
+});
+
+describe("run usage state", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("reads persisted cumulative usage", () => {
+    const usageState = {
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: 0.4,
+      tokensUnavailable: false,
+      reportedCostUnavailable: false,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    };
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(JSON.stringify(usageState));
+
+    expect(readRunUsageState({ runDir: "/run" })).toEqual(usageState);
+  });
+
+  it("rejects partial cumulative usage metadata", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ totalInputTokens: 4, totalOutputTokens: 2 }),
+    );
+
+    expect(() => readRunUsageState({ runDir: "/run" })).toThrow(
+      "Invalid run usage metadata",
+    );
+  });
+
+  it("publishes cumulative usage atomically", () => {
+    const usageState = {
+      totalInputTokens: 4,
+      totalOutputTokens: 2,
+      totalTokens: 12,
+      reportedCostUsd: null,
+      tokensUnavailable: false,
+      reportedCostUnavailable: true,
+      tokensEstimated: false,
+      hasAuthoritativeTokenReceipt: true,
+    };
+
+    writeRunUsageState({ runDir: "/run" }, usageState);
+
+    expect(mockWriteFileSync).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/run\/\.usage\.json\..+\.tmp$/),
+      `${JSON.stringify(usageState, null, 2)}\n`,
+      {
+        encoding: "utf-8",
+        flag: "wx",
+        mode: 0o600,
+      },
+    );
+    expect(mockRenameSync).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/run\/\.usage\.json\..+\.tmp$/),
+      "/run/usage.json",
+    );
   });
 });
 
