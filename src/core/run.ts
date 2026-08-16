@@ -293,6 +293,14 @@ export function resumeRun(
   };
 }
 
+export function peekRunBaseCommit(runId: string, cwd: string): string {
+  const baseCommitPath = join(cwd, ".gnhf", "runs", runId, "base-commit");
+  if (existsSync(baseCommitPath)) {
+    return readFileSync(baseCommitPath, "utf-8").trim();
+  }
+  return findLegacyRunBaseCommit(runId, cwd) ?? getHeadCommit(cwd);
+}
+
 export function peekRunMetadata(runId: string, cwd: string): RunMetadata {
   const runDir = join(cwd, ".gnhf", "runs", runId);
   if (!existsSync(runDir)) {
@@ -319,7 +327,7 @@ function backfillLegacyBaseCommit(
   baseCommitPath: string,
   cwd: string,
 ): string {
-  const baseCommit = findLegacyRunBaseCommit(runId, cwd) ?? getHeadCommit(cwd);
+  const baseCommit = peekRunBaseCommit(runId, cwd);
   writeFileSync(baseCommitPath, `${baseCommit}\n`, "utf-8");
   return baseCommit;
 }

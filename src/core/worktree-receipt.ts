@@ -6,17 +6,17 @@ import {
   writeFileSync,
 } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-import type { RunInfo } from "./run.js";
-
 type WriteConfiguredWorktreeReceiptParams = {
+  runId: string;
+  baseCommit: string;
   environment?: NodeJS.ProcessEnv;
-  runInfo: RunInfo;
   worktreePath: string;
 };
 
 export function writeConfiguredWorktreeReceipt({
+  runId,
+  baseCommit,
   environment = process.env,
-  runInfo,
   worktreePath,
 }: WriteConfiguredWorktreeReceiptParams): void {
   const configuredPath = environment.GNHF_WORKTREE_RECEIPT_PATH;
@@ -38,8 +38,8 @@ export function writeConfiguredWorktreeReceipt({
       `${JSON.stringify(
         {
           schemaVersion: 1,
-          runId: runInfo.runId,
-          baseCommit: runInfo.baseCommit,
+          runId,
+          baseCommit,
           worktreePath: resolve(worktreePath),
         },
         null,

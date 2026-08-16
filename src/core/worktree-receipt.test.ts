@@ -2,7 +2,6 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { RunInfo } from "./run.js";
 import { writeConfiguredWorktreeReceipt } from "./worktree-receipt.js";
 
 const temporaryDirectories: string[] = [];
@@ -20,8 +19,9 @@ describe("writeConfiguredWorktreeReceipt", () => {
     const receiptPath = join(directory, "worktree.json");
 
     writeConfiguredWorktreeReceipt({
+      runId: "fixture-run",
+      baseCommit: "a".repeat(40),
       environment: { GNHF_WORKTREE_RECEIPT_PATH: receiptPath },
-      runInfo: createRunInfo(),
       worktreePath: join(directory, "worktree"),
     });
 
@@ -39,8 +39,9 @@ describe("writeConfiguredWorktreeReceipt", () => {
     temporaryDirectories.push(directory);
     const receiptPath = join(directory, "worktree.json");
     const params = {
+      runId: "fixture-run",
+      baseCommit: "a".repeat(40),
       environment: { GNHF_WORKTREE_RECEIPT_PATH: receiptPath },
-      runInfo: createRunInfo(),
       worktreePath: join(directory, "worktree"),
     };
 
@@ -49,20 +50,3 @@ describe("writeConfiguredWorktreeReceipt", () => {
     expect(() => writeConfiguredWorktreeReceipt(params)).toThrow();
   });
 });
-
-function createRunInfo(): RunInfo {
-  return {
-    runId: "fixture-run",
-    runDir: "/run",
-    promptPath: "/run/prompt.md",
-    notesPath: "/run/notes.md",
-    schemaPath: "/run/output-schema.json",
-    logPath: "/run/gnhf.log",
-    baseCommit: "a".repeat(40),
-    baseCommitPath: "/run/base-commit",
-    stopWhenPath: "/run/stop-when",
-    stopWhen: undefined,
-    commitMessagePath: "/run/commit-message",
-    commitMessage: undefined,
-  };
-}

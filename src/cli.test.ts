@@ -68,6 +68,7 @@ interface CliMockOverrides {
   getBranchDiffStats?: ReturnType<typeof vi.fn>;
   getBranchCommitCount?: ReturnType<typeof vi.fn>;
   hasWorkingTreeChanges?: ReturnType<typeof vi.fn>;
+  peekRunBaseCommit?: ReturnType<typeof vi.fn>;
   peekRunMetadata?: ReturnType<typeof vi.fn>;
   resumeRun?: ReturnType<typeof vi.fn>;
   getLastIterationNumber?: ReturnType<typeof vi.fn>;
@@ -130,6 +131,8 @@ async function runCliWithMocks(
   let consoleErrorCalls: unknown[][] = [];
   let stdoutWriteCalls: unknown[][] = [];
   const setupRun = overrides.setupRun ?? vi.fn(() => stubRunInfo);
+  const peekRunBaseCommit =
+    overrides.peekRunBaseCommit ?? vi.fn(() => stubRunInfo.baseCommit);
   const peekRunMetadata = overrides.peekRunMetadata ?? vi.fn(() => stubRunInfo);
   const resumeRun = overrides.resumeRun ?? vi.fn();
   const getLastIterationNumber =
@@ -213,6 +216,7 @@ async function runCliWithMocks(
   }));
   vi.doMock("./core/run.js", () => ({
     setupRun,
+    peekRunBaseCommit,
     peekRunMetadata,
     resumeRun,
     getLastIterationNumber,
@@ -309,6 +313,7 @@ async function runCliWithMocks(
     loadConfig,
     createAgent,
     setupRun,
+    peekRunBaseCommit,
     peekRunMetadata,
     resumeRun,
     getLastIterationNumber,
@@ -1392,7 +1397,8 @@ describe("cli", () => {
     );
 
     expect(writeConfiguredWorktreeReceipt).toHaveBeenCalledWith({
-      runInfo: stubRunInfo,
+      runId: expect.stringMatching(/^ship-it-[0-9a-f]+$/),
+      baseCommit: "abc123",
       worktreePath: expect.stringMatching(
         /^\/repo-gnhf-worktrees\/ship-it-[0-9a-f]+$/,
       ),
@@ -3278,6 +3284,10 @@ describe("cli", () => {
     const repoRoot = join(tempDir, "repo");
     const consoleErrorSink: unknown[][] = [];
     let createdWorktreePath: string | null = null;
+    const setupRun = vi.fn(() => {
+      throw new Error("metadata disk full");
+    });
+    const writeConfiguredWorktreeReceipt = vi.fn();
     const createWorktree = vi.fn((_repo, worktreePath: string) => {
       createdWorktreePath = worktreePath;
       mkdirSync(worktreePath, { recursive: true });
@@ -3299,14 +3309,21 @@ describe("cli", () => {
             consoleErrorSink,
             createWorktree,
             getRepoRootDir: vi.fn(() => repoRoot),
-            setupRun: vi.fn(() => {
-              throw new Error("metadata disk full");
-            }),
+            setupRun,
+            writeConfiguredWorktreeReceipt,
           },
         ),
       ).rejects.toThrow("process.exit unexpectedly called with 1");
 
       expect(createdWorktreePath).not.toBeNull();
+      expect(writeConfiguredWorktreeReceipt).toHaveBeenCalledWith({
+        runId: basename(createdWorktreePath!),
+        baseCommit: "abc123",
+        worktreePath: createdWorktreePath,
+      });
+      expect(
+        writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0],
+      ).toBeLessThan(setupRun.mock.invocationCallOrder[0]!);
       expect(consoleErrorSink.flat().join("\n")).toContain(
         `worktree preserved at ${createdWorktreePath}`,
       );
@@ -3491,6 +3508,62 @@ describe("cli", () => {
       );
       expect(createWorktree).not.toHaveBeenCalled();
       expect(orchestratorCtor.mock.calls[0]?.[4]).toBe(suffixedWorktreePath);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("records a preserved worktree before run metadata resume fails", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "gnhf-resume-failure-"));
+    const repoRoot = join(tempDir, "repo");
+    const hash = createHash("sha256")
+      .update("ship it")
+      .digest("hex")
+      .slice(0, 6);
+    const runId = `ship-it-${hash}`;
+    const branch = `gnhf/${runId}`;
+    const worktreePath = join(tempDir, "repo-gnhf-worktrees", runId);
+    mkdirSync(join(worktreePath, ".gnhf", "runs", runId), {
+      recursive: true,
+    });
+    const resumeRun = vi.fn(() => {
+      throw new Error("resume metadata unreadable");
+    });
+    const writeConfiguredWorktreeReceipt = vi.fn();
+
+    try {
+      await expect(
+        runCliWithMocks(
+          ["ship it", "--worktree"],
+          {
+            agent: "claude",
+            agentPathOverride: {},
+            agentArgsOverride: {},
+            acpRegistryOverrides: {},
+            maxConsecutiveFailures: 3,
+            preventSleep: false,
+          },
+          {
+            getRepoRootDir: vi.fn(() => repoRoot),
+            getCurrentBranch: vi.fn((cwd: string) =>
+              cwd === worktreePath ? branch : "main",
+            ),
+            listWorktreePaths: vi.fn(() => new Set([worktreePath])),
+            peekRunBaseCommit: vi.fn(() => "b".repeat(40)),
+            resumeRun,
+            writeConfiguredWorktreeReceipt,
+          },
+        ),
+      ).rejects.toThrow("process.exit unexpectedly called with 1");
+
+      expect(writeConfiguredWorktreeReceipt).toHaveBeenCalledWith({
+        runId,
+        baseCommit: "b".repeat(40),
+        worktreePath,
+      });
+      expect(
+        writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0],
+      ).toBeLessThan(resumeRun.mock.invocationCallOrder[0]!);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

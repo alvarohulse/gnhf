@@ -46,6 +46,7 @@ import {
   type RunSchemaOptions,
   setupRun,
   resumeRun,
+  peekRunBaseCommit,
   peekRunMetadata,
   getLastIterationNumber,
 } from "./core/run.js";
@@ -410,6 +411,11 @@ function initializeWorktreeRun(
           `"git worktree remove ${candidateWorktreePath}" to start fresh.`,
       );
     }
+    writeConfiguredWorktreeReceipt({
+      runId: candidateRunId,
+      baseCommit: peekRunBaseCommit(candidateRunId, candidateWorktreePath),
+      worktreePath: candidateWorktreePath,
+    });
     const runInfo = resumeRun(
       candidateRunId,
       candidateWorktreePath,
@@ -449,13 +455,19 @@ function initializeWorktreeRun(
     if (resumed) return resumed;
     try {
       createWorktree(repoRoot, createdWorktreePath, createdBranchName);
-      break;
     } catch (error) {
       if (!isCollisionError(error)) throw error;
       if (suffix === 99) {
         throw new Error(`Unable to create a unique worktree for ${branchName}`);
       }
+      continue;
     }
+    writeConfiguredWorktreeReceipt({
+      runId: createdRunId,
+      baseCommit,
+      worktreePath: createdWorktreePath,
+    });
+    break;
   }
   let runInfo: RunInfo;
   try {
@@ -1069,10 +1081,6 @@ program
         }
 
         runInfo = initializeNewBranch(prompt, cwd, schemaOptions);
-      }
-
-      if (worktreePath !== null) {
-        writeConfiguredWorktreeReceipt({ runInfo, worktreePath });
       }
 
       await startConfiguredSleepPrevention();
