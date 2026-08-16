@@ -1290,8 +1290,9 @@ describe("ClaudeAgent", () => {
   it("rejects when process fails to spawn", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
+    const unixAgent = new ClaudeAgent({ platform: "linux" });
 
-    const promise = agent.run("prompt", "/cwd");
+    const promise = unixAgent.run("prompt", "/cwd");
 
     proc.emit("error", new Error("ENOENT"));
     proc.emit("close", null, null);

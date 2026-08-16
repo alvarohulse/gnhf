@@ -238,6 +238,7 @@ describe("OpenCodeAgent", () => {
     agent = new OpenCodeAgent({
       fetch: fetchMock as typeof fetch,
       getPort,
+      platform: "linux",
     });
   });
 
@@ -446,7 +447,7 @@ describe("OpenCodeAgent", () => {
       ["serve", "--hostname", "127.0.0.1", "--port", "8765", "--print-logs"],
       expect.objectContaining({
         cwd: "/repo",
-        detached: process.platform !== "win32",
+        detached: true,
         stdio: ["ignore", "pipe", "pipe"],
         env: process.env,
       }),

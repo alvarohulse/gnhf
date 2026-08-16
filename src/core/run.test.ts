@@ -661,14 +661,14 @@ describe("persistRunEvidence", () => {
 
     const persisted = persistRunEvidence(runInfo, "/repo");
     const temporaryPath = mockCpSync.mock.calls[0]![1] as string;
-    const persistedRunDir = "/repo/.gnhf/runs/run-abc";
+    const persistedRunDir = join("/repo", ".gnhf", "runs", "run-abc");
 
     expect(mockCpSync).toHaveBeenCalledWith(runDir, temporaryPath, {
       recursive: true,
       errorOnExist: true,
       force: false,
     });
-    expect(dirname(temporaryPath)).toBe("/repo/.gnhf/runs");
+    expect(dirname(temporaryPath)).toBe(dirname(persistedRunDir));
     expect(basename(temporaryPath)).toMatch(/^\.run-abc\..+\.tmp$/);
     expect(mockRmSync).toHaveBeenCalledWith(persistedRunDir, {
       recursive: true,

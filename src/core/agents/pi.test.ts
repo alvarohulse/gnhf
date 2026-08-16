@@ -767,7 +767,7 @@ describe("PiAgent", () => {
   it("rejects spawn errors", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new PiAgent();
+    const agent = new PiAgent({ platform: "linux" });
 
     const promise = agent.run("test prompt", "/work/dir");
     proc.emit("error", new Error("ENOENT"));
