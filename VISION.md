@@ -16,7 +16,7 @@ A change that can lose user work in an edge case is a bug of the highest class a
 ## The user holds the leash
 
 An unattended loop earns trust through explicit limits, live control, and staying alive until morning.
-Iteration caps, token caps, harness-reported cost caps, and natural-language stop conditions bound every run, and stop conditions survive resume.
+Iteration caps and natural-language stop conditions bound every run; token caps require complete harness-reported input/output totals, cost caps require concrete reported cost, and stop conditions survive resume.
 The first interrupt is graceful and lets the iteration finish; the second is immediate.
 Steering a live run and reviewing a finished run's commits are user control, not scope creep.
 The run defends itself against whatever would end the night early: machine sleep, a closed terminal, transient agent failures.
@@ -38,7 +38,7 @@ More operating systems and more install channels are welcome, and a shipped plat
 
 ## Nothing identifiable leaves the machine
 
-Prompts, notes, run metadata, and logs live under `.gnhf/runs/` and stay local, so the branch only contains intentional work.
+Prompts, notes, run metadata, and logs live under `.gnhf/` and stay local, so the branch only contains intentional work.
 Telemetry is anonymous, never carrying prompts, paths, or branch names, and a single env var turns it off.
 Richer diagnostics are welcome when they are opt-in, stay anonymous, and change nothing for anyone who does not enable them.
 Raw agent commands are redacted from logs, errors, and telemetry so local paths and secrets are never written out.

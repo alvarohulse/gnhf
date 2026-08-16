@@ -1,0 +1,83 @@
+Target: c73d2c9ee4c68a2740fbbb40f05e8b4d42f8fabb
+Built CLI: dist/cli.mjs
+Environment: disposable local Git repositories and local agent/inhibitor harnesses only; no install, deployment, or human-observed canary
+
+=== Forced shutdown preserves dirty work and exact process ownership ===
+Command: gnhf "slow cleanup dirty current evidence" --agent opencode --prevent-sleep off --worktree, with GNHF_SUPERVISED_PROCESS_GROUP=1, then two SIGINT signals
+Exit code: 130
+
+CLI permanent summary:
+  gnhf wrapped
+  opencode worked for 0s on gnhf/slow-cleanup-dirty-c-0ee8bc
+  iterations      1 total       0 good       0 failed
+  tokens          unavailable
+  branch diff     0 commits     +0           -0
+  gnhf: worktree preserved at <fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-c-0ee8bc
+
+Published receipt:
+{"schemaVersion":1,"receiptId":"42dd4ed2-cba8-44d0-af94-191e62fa3072","runId":"slow-cleanup-dirty-c-0ee8bc","state":"created","worktreePath":"<fixture>/repo-gnhf-worktrees/slow-cleanup-dirty-c-0ee8bc","baseCommit":"a79967c6a6e1f589c82cde3120309a70b62f3019"}
+
+Preserved Git status: M README.md
+Preserved marker: - mock change 1786866955699
+Managed agent process alive after shutdown: no
+Unrelated sibling process alive after shutdown: yes
+Lifecycle receipts:
+{"event":"signal:SIGINT"}
+{"event":"signal:SIGINT"}
+{"event":"run:complete","signal":"SIGINT","status":"stopped","iterations":1,"successCount":0,"failCount":0,"totalInputTokens":null,"totalOutputTokens":null,"tokensAvailable":false,"reportedCostUsd":null,"commitCount":0}
+{"event":"worktree:preserved","reason":"dirty"}
+
+=== Linux inhibitor re-exec publishes atomic worktree identity ===
+Command: gnhf "linux reexec current evidence" --agent opencode --max-iterations 0 --prevent-sleep on --worktree --preserve-worktree
+Inhibitor invocation: systemd-inhibit --what=idle:sleep --mode=block --who=gnhf --why=Prevent sleep while gnhf is running <node> <repo>/dist/cli.mjs linux reexec current evidence --agent opencode --max-iterations 0 --prevent-sleep on --worktree --preserve-worktree
+Exit code: 0
+
+CLI permanent summary:
+  gnhf stopped
+  opencode ran for 0s before: max iterations reached (0)
+  iterations      0 total       0 good       0 failed
+  tokens          0 in          0 out
+  branch diff     0 commits     +0           -0
+  gnhf: worktree preserved at <fixture>/repo-gnhf-worktrees/linux-reexec-current-8243a2
+
+Atomic receipt:
+{"schemaVersion":1,"receiptId":"95cb20fb-7b1f-4173-bca6-e5c6d9ae0d12","runId":"linux-reexec-current-8243a2","state":"created","worktreePath":"<fixture>/repo-gnhf-worktrees/linux-reexec-current-8243a2","baseCommit":"d7ecd75d3bed2db417bde03aa6745fb0bc12514c"}
+Receipt mode: 600
+Preserved branch: gnhf/linux-reexec-current-8243a2
+Preserved Git status: clean
+
+=== ACP unavailable usage does not enforce --max-tokens 0 ===
+Command: gnhf "acp unavailable receipt evidence" --agent acp:evidence --current-branch --max-tokens 0 --max-iterations 1 --prevent-sleep off
+Exit code: 0
+
+CLI permanent summary:
+  gnhf stopped
+  acp:evidence ran for 1s before: max iterations reached (1)
+  iterations      1 total       1 good       0 failed
+  tokens          unavailable
+  branch diff     1 commit      +1           -0
+
+Fixture commit count: 2 (initial commit plus the completed ACP iteration)
+Working tree status: clean
+Usage and stop receipts:
+{"event":"agent:run:end","iteration":1,"outcome":"completed","success":true,"inputTokens":null,"outputTokens":null,"cacheReadTokens":null,"cacheCreationTokens":null,"reportedCostUsd":null,"reportedCostAvailable":false,"tokensAvailable":false,"estimated":false}
+{"event":"orchestrator:end","status":"aborted","iterations":1,"successCount":1,"failCount":0,"totalInputTokens":null,"totalOutputTokens":null,"tokensAvailable":false,"reportedCostUsd":null,"reportedCostAvailable":false,"commitCount":1}
+{"event":"run:complete","signal":null,"status":"aborted","iterations":1,"successCount":1,"failCount":0,"totalInputTokens":null,"totalOutputTokens":null,"tokensAvailable":false,"reportedCostUsd":null,"commitCount":1,"worktreePath":null}
+
+=== Resume ignores runtime setup-failure metadata ===
+Setup: complete one current-branch iteration, add .gnhf/setup-failures/prior-run.json containing an absolute worktree path and setup error, then resume the same built-CLI run for a second iteration
+Status before resume: clean
+Ignore match: .git/info/exclude:.gnhf/setup-failures/ -> .gnhf/setup-failures/prior-run.json
+Resume exit code: 0
+
+CLI permanent summary:
+  gnhf stopped
+  opencode ran for 1s before: max iterations reached (2)
+  iterations      2 total       1 good       0 failed
+  tokens          10 in         5 out
+  branch diff     2 commits     +2           -0
+
+Fixture commit count: 3 (initial commit plus two completed iterations)
+Latest commit paths: README.md
+Tracked runtime metadata: none
+Working tree status: clean

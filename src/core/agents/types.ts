@@ -152,9 +152,8 @@ export interface TokenUsage {
   cacheCreationTokens: number;
   reportedCostUsd?: number;
   tokensAvailable?: boolean;
-  // True when the agent could not source authoritative usage from the model
-  // and the numbers are heuristic estimates. ACP adapters that don't emit
-  // usage_update notifications fall into this case.
+  // Marks provisional counts for display. tokensAvailable independently
+  // declares completeness; limits require available, non-estimated receipts.
   estimated?: boolean;
 }
 

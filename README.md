@@ -45,8 +45,8 @@ gnhf is a [ralph](https://ghuntley.com/ralph/), [autoresearch](https://github.co
 You wake up to a branch full of clean work and a log of everything that happened.
 
 - **Dead simple** - one command starts an autonomous loop that runs until you request stop or a configured runtime cap is reached
-- **Long running** - each iteration is committed on success and rolled back on failure, with sensible retries; [How It Works](#how-it-works) has the full failure-handling rules
-- **Live terminal title** - interactive runs keep your terminal title updated with live status, token totals, and commit count, then clear or restore it on exit depending on terminal support; token totals prefixed with `~` are estimates
+- **Long running** - each iteration is committed on success; failed work is rolled back unless protected for recovery, with sensible retries; [How It Works](#how-it-works) has the full failure-handling rules
+- **Live terminal title** - interactive runs keep your terminal title updated with live status, token availability or totals, and commit count, then clear or restore it on exit depending on terminal support; unavailable token counts are shown as `?`
 - **Exit summary** - every run ends with a permanent summary covering elapsed time, branch, iterations, tokens, branch diff stats, local notes/log paths, and review commands
 - **Agent-agnostic** - works with the popular coding agent CLIs plus any ACP target out of the box; see [Agents](#agents) for the roster
 
@@ -151,13 +151,13 @@ After installing from npm, the skill is available under the installed package di
 ```
 
 - **Incremental commits** - each successful iteration is a separate unsigned git commit, so you can cherry-pick or revert individual changes without GPG or SSH signing prompts blocking the run; if `git commit` fails, gnhf preserves the uncommitted work and asks the next agent iteration to repair it
-- **Failure handling** - failed iterations are rolled back with `git reset --hard` except commit failures, which preserve uncommitted work for repair; agent-reported failures proceed to the next iteration immediately, retryable hard agent errors use exponential backoff, and permanent agent errors such as Claude low credit balance abort immediately and print the run log path. Complete no-op iterations are reported as failures and count toward the consecutive-failure abort limit. If the run exits with a pending commit failure, the exit summary warns that uncommitted changes were left for repair.
-- **Runtime caps** - `--max-iterations` stops before the next iteration begins, `--max-tokens` can abort mid-iteration once the harness reports both input and output token totals, and `--max-reported-cost-usd` can abort when the harness reports a cumulative cost. Missing token totals stay unavailable and do not trigger the token cap; missing cost stays unknown and does not trigger the cost cap. `--stop-when` ends the loop after an iteration whose agent output reports the natural-language condition is met unless a commit failure needs repair first; resumed runs reuse it unless you pass a new value, or `--stop-when ""` to clear it. Pending commit-failure repair work is preserved and other uncommitted work is rolled back, and in the interactive TUI the final state remains visible until you press Ctrl+C to exit.
+- **Failure handling** - failed iterations are rolled back with `git reset --hard` unless recovery metadata protects the workspace, including after a commit failure or an interrupted worktree run; agent-reported failures proceed to the next iteration immediately, retryable hard agent errors use exponential backoff, and permanent agent errors such as Claude low credit balance abort immediately and print the run log path. Complete no-op iterations are reported as failures and count toward the consecutive-failure abort limit. If the run exits with a pending commit failure, the exit summary warns that uncommitted changes were left for repair.
+- **Runtime caps** - `--max-iterations` stops before the next iteration begins, `--max-tokens` can abort mid-iteration once the harness reports complete input and output token totals, and `--max-reported-cost-usd` can abort when the harness reports a cumulative cost. Missing token totals stay unavailable and do not trigger the token cap; missing cost stays unknown and does not trigger the cost cap. `--stop-when` ends the loop after an iteration whose agent output reports the natural-language condition is met unless a commit failure needs repair first; resumed runs reuse it unless you pass a new value, or `--stop-when ""` to clear it. Recovery-marked work is preserved; otherwise failed-iteration changes are rolled back. In the interactive TUI, the final state remains visible until you press Ctrl+C to exit.
 - **Iteration finalization** - agents are expected to finish validation, stop any background processes they started, and only then emit the final JSON result for the iteration. Workers must record exact PIDs or process handles when they start processes and stop only those owned identities. Process-name, pattern-wide, and port-wide cleanup, including `pkill`, `killall`, `taskkill`, and `Stop-Process -Name`, is forbidden. This guidance mitigates accidental cross-run cleanup; it is not a process-security boundary.
 - **Graceful interrupts** - in the interactive TUI, the first Ctrl+C requests a graceful stop and lets the current iteration finish (or ends backoff early), the second Ctrl+C force-stops immediately, and `SIGTERM` also force-stops immediately
-- **Exit summary** - after shutdown cleanup, gnhf prints a permanent stdout summary with the final branch, elapsed time, iteration and token totals, branch diff stats, notes/debug-log paths, and review commands
+- **Exit summary** - after shutdown cleanup, gnhf prints a permanent stdout summary with the final branch, elapsed time, iteration and token usage, branch diff stats, notes/debug-log paths, and review commands
 - **Shared memory** - the agent reads `notes.md` (built up from prior iterations) to communicate across iterations
-- **Local run metadata** - gnhf stores prompt, notes, stop conditions, and commit-message convention metadata under `.gnhf/runs/` and ignores it locally, so your branch only contains intentional work
+- **Local run metadata** - gnhf stores run and recovery state under `.gnhf/runs/`, plus worktree setup-failure diagnostics under `.gnhf/setup-failures/`; both paths are ignored locally so your branch only contains intentional work
 - **Resume support** - run `gnhf` while on an existing `gnhf/` branch to pick up where a previous run left off; if you provide a different prompt, gnhf asks whether to update the saved prompt and continue with the existing history, start a new branch, or quit. New runs whose generated branch already exists use a numeric suffix such as `gnhf/<slug>-1`.
 
 ### Live Branch Mode
@@ -183,9 +183,8 @@ Pass `--worktree` to run each agent in an isolated [git worktree](https://git-sc
   └── <run-slug-2>/                  ← worktree for agent 2
 ```
 
-- Worktrees with commits are **preserved** after the run so you can review, merge, or cherry-pick the work. gnhf prints the path and cleanup command.
 - Re-running the same prompt with `--worktree` resumes a preserved matching worktree when possible; otherwise gnhf creates a suffixed worktree such as `<run-slug>-1` if the original name is unavailable.
-- Worktrees are removed only when Git verifies that they are clean and have no commits. Committed, dirty, pending-repair, or uninspectable worktrees are preserved and reported, including during forced shutdown.
+- Worktrees are removed only when Git verifies that they are clean and have no commits. Committed, dirty, recovery-marked, or uninspectable worktrees are preserved and reported with the path and cleanup command, including during forced shutdown.
 - Add `--preserve-worktree` to keep the worktree on every exit path, including a zero-commit run. This flag requires `--worktree`; gnhf prints and records the retained path.
 - `--worktree` must be run from a non-gnhf branch (typically `main`).
 
@@ -206,7 +205,7 @@ If you run `gnhf` on an existing `gnhf/` branch with a different prompt, gnhf as
 | ---------------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------- |
 | `--agent <agent>`                  | Agent to use: a native agent name or `acp:<target-or-command>`; see [Agents](#agents)              | config file (`claude`) |
 | `--max-iterations <n>`             | Abort after `n` total iterations                                                                   | unlimited              |
-| `--max-tokens <n>`                 | Abort after `n` total input+output tokens                                                          | unlimited              |
+| `--max-tokens <n>`                 | Abort after `n` complete harness-reported input+output tokens                                      | unlimited              |
 | `--max-reported-cost-usd <amount>` | Abort after the harness reports this cumulative cost in USD                                        | unlimited              |
 | `--stop-when <cond>`               | End when the agent reports this condition, after any commit-failure repair; persists across resume | unlimited              |
 | `--prevent-sleep <mode>`           | Prevent system sleep during the run (`on`/`off` or `true`/`false`)                                 | config file (`on`)     |
