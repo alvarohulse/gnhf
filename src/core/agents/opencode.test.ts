@@ -958,6 +958,40 @@ describe("OpenCodeAgent", () => {
     });
   });
 
+  it("keeps step cost provisional when terminal usage omits cost", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ healthy: true, version: "1.3.13" }))
+      .mockResolvedValueOnce(jsonResponse({ id: "session-123" }))
+      .mockResolvedValueOnce(
+        sseResponse([
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"finish-1","messageID":"msg-1","type":"step-finish","cost":0.4,"tokens":{"input":5,"output":3,"total":12,"cache":{"read":2,"write":2}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.part.updated","properties":{"sessionID":"session-123","part":{"id":"part-final","messageID":"msg-1","type":"text","text":"{\\"success\\":true,\\"summary\\":\\"done\\",\\"key_changes_made\\":[],\\"key_learnings\\":[]}","metadata":{"openai":{"phase":"final_answer"}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"message.updated","properties":{"sessionID":"session-123","info":{"id":"msg-1","role":"assistant","structured":{"success":true,"summary":"done","key_changes_made":[],"key_learnings":[]},"tokens":{"input":5,"output":3,"total":12,"cache":{"read":2,"write":2}}}}}}\n\n',
+          'data: {"directory":"/repo","payload":{"type":"session.idle","properties":{"sessionID":"session-123"}}}\n\n',
+        ]),
+      )
+      .mockResolvedValueOnce(promptAsyncResponse())
+      .mockResolvedValueOnce(jsonResponse(true));
+
+    const onUsage = vi.fn();
+    const result = await agent.run("test", "/repo", { onUsage });
+
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ reportedCostUsd: 0.4 }),
+    );
+    expect(result.usage).toEqual({
+      inputTokens: 5,
+      outputTokens: 3,
+      cacheReadTokens: 2,
+      cacheCreationTokens: 2,
+      totalTokens: 12,
+      tokensAvailable: true,
+    });
+  });
+
   it("derives an exact total from every OpenCode token component", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);

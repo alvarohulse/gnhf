@@ -2310,7 +2310,7 @@ describe("Orchestrator stop limits", () => {
     });
   });
 
-  it("resets pending commit failure state after a default force stop", async () => {
+  it("preserves pending commit failure state after a default force stop", async () => {
     vi.useFakeTimers();
 
     let rejectRepair!: (error: Error) => void;
@@ -2353,8 +2353,12 @@ describe("Orchestrator stop limits", () => {
     rejectRepair(new Error("Agent was aborted"));
     await startPromise;
 
-    expect(mockResetHard).toHaveBeenCalled();
-    expect(orchestrator.getState().hasPendingCommitFailure).toBe(false);
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(orchestrator.getState().hasPendingCommitFailure).toBe(true);
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "commit-failure",
+      detail: expect.stringContaining("hook failed"),
+    });
   });
 
   it("preserves pending commit failure state for a worktree force stop", async () => {
