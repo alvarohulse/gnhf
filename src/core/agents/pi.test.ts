@@ -510,6 +510,55 @@ describe("PiAgent", () => {
     });
   });
 
+  it("replaces anonymous streamed cost with the identified terminal receipt", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent();
+
+    const promise = agent.run("test prompt", "/work/dir");
+    emitJson(proc, {
+      type: "message_update",
+      usage: {
+        input: 4,
+        output: 2,
+        totalTokens: 6,
+        cost: { total: 0.4 },
+      },
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: finalOutput(),
+      },
+    });
+    emitJson(proc, {
+      type: "agent_end",
+      messages: [
+        {
+          role: "assistant",
+          responseId: "r1",
+          usage: {
+            input: 4,
+            output: 2,
+            totalTokens: 6,
+            cost: { total: 0.5 },
+          },
+          content: finalOutput(),
+        },
+      ],
+    });
+    proc.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      output: { success: true },
+      usage: {
+        inputTokens: 4,
+        outputTokens: 2,
+        totalTokens: 6,
+        reportedCostUsd: 0.5,
+      },
+    });
+  });
+
   it("marks aggregate usage unavailable when a completed message omits usage", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
