@@ -14,6 +14,13 @@ interface ShutdownChildProcessOptions {
 
 const POST_SIGKILL_GRACE_MS = 100;
 
+export function shouldDetachAgentProcess(
+  platform: NodeJS.Platform,
+  supervisedProcessGroup = process.env.GNHF_SUPERVISED_PROCESS_GROUP === "1",
+): boolean {
+  return platform !== "win32" && !supervisedProcessGroup;
+}
+
 export function signalChildProcess(
   child: ChildProcess,
   options: SignalChildProcessOptions,

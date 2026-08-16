@@ -98,6 +98,23 @@ describe("ClaudeAgent", () => {
     );
   });
 
+  it("stays inside an external supervisor process group", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const supervisedAgent = new ClaudeAgent({
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+
+    supervisedAgent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "claude",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
+    );
+  });
+
   it("does not use a shell for direct Windows launches", () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
@@ -1152,18 +1169,20 @@ describe("ClaudeAgent", () => {
   it("rejects when response has is_error flag", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
+    const onUsage = vi.fn();
 
-    const promise = agent.run("prompt", "/cwd");
+    const promise = agent.run("prompt", "/cwd", { onUsage });
 
     emitLine(proc, {
       type: "result",
       subtype: "error",
       is_error: true,
+      total_cost_usd: 0.42,
       usage: {
-        input_tokens: 0,
-        cache_read_input_tokens: 0,
-        cache_creation_input_tokens: 0,
-        output_tokens: 0,
+        input_tokens: 10,
+        cache_read_input_tokens: 4,
+        cache_creation_input_tokens: 2,
+        output_tokens: 3,
       },
       structured_output: null,
     });
@@ -1171,6 +1190,13 @@ describe("ClaudeAgent", () => {
     proc.emit("close", 0);
 
     await expect(promise).rejects.toThrow("claude reported error");
+    expect(onUsage).toHaveBeenCalledWith({
+      inputTokens: 14,
+      outputTokens: 3,
+      cacheReadTokens: 4,
+      cacheCreationTokens: 2,
+      reportedCostUsd: 0.42,
+    });
   });
 
   it("rejects when structured_output is null", async () => {

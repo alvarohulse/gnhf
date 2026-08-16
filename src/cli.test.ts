@@ -767,6 +767,58 @@ describe("cli", () => {
     expect(stdout).toContain("git push no-mistakes");
   });
 
+  it("does not publish unavailable token totals as exact", async () => {
+    const { appendDebugLog, stdoutWriteCalls, telemetry } =
+      await runCliWithMocks(
+        ["ship it"],
+        {
+          agent: "cursor",
+          agentPathOverride: {},
+          agentArgsOverride: {},
+          acpRegistryOverrides: {},
+          maxConsecutiveFailures: 3,
+          preventSleep: false,
+        },
+        {
+          orchestratorGetState: vi.fn(() => ({
+            status: "stopped" as const,
+            gracefulStopRequested: false,
+            currentIteration: 1,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+            tokensAvailable: false,
+            tokensEstimated: false,
+            commitCount: 1,
+            iterations: [],
+            successCount: 1,
+            failCount: 0,
+            consecutiveFailures: 0,
+            startTime: new Date("2026-01-01T00:00:00Z"),
+            waitingUntil: null,
+            lastMessage: null,
+          })),
+        },
+      );
+
+    expect(stdoutWriteCalls.flat().join("")).toContain("unavailable");
+    expect(appendDebugLog).toHaveBeenCalledWith(
+      "run:complete",
+      expect.objectContaining({
+        totalInputTokens: null,
+        totalOutputTokens: null,
+        tokensAvailable: false,
+      }),
+    );
+    expect(telemetry.track).toHaveBeenCalledWith(
+      "run",
+      expect.objectContaining({
+        total_input_tokens: null,
+        total_output_tokens: null,
+        tokens_available: false,
+      }),
+    );
+  });
+
   it("redacts raw ACP command specs in the exit summary", async () => {
     const rawAgent = "acp:./bin/dev-acp --profile ci --token secret";
     const { stdoutWriteCalls } = await runCliWithMocks(
@@ -1381,8 +1433,9 @@ describe("cli", () => {
     );
   });
 
-  it("records the worktree before creating the agent", async () => {
-    const writeConfiguredWorktreeReceipt = vi.fn();
+  it("publishes pending worktree identity before invoking git", async () => {
+    const createWorktree = vi.fn();
+    const writeConfiguredWorktreeReceipt = vi.fn(() => "receipt-1");
     const { createAgent } = await runCliWithMocks(
       ["ship it", "--worktree", "--preserve-worktree"],
       {
@@ -1393,18 +1446,31 @@ describe("cli", () => {
         maxConsecutiveFailures: 3,
         preventSleep: false,
       },
-      { writeConfiguredWorktreeReceipt },
+      { createWorktree, writeConfiguredWorktreeReceipt },
     );
 
-    expect(writeConfiguredWorktreeReceipt).toHaveBeenCalledWith({
+    expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(1, {
       runId: expect.stringMatching(/^ship-it-[0-9a-f]+$/),
       baseCommit: "abc123",
+      state: "pending",
       worktreePath: expect.stringMatching(
         /^\/repo-gnhf-worktrees\/ship-it-[0-9a-f]+$/,
       ),
     });
     expect(
       writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0],
+    ).toBeLessThan(createWorktree.mock.invocationCallOrder[0]!);
+    expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(2, {
+      runId: expect.stringMatching(/^ship-it-[0-9a-f]+$/),
+      baseCommit: "abc123",
+      receiptId: "receipt-1",
+      state: "created",
+      worktreePath: expect.stringMatching(
+        /^\/repo-gnhf-worktrees\/ship-it-[0-9a-f]+$/,
+      ),
+    });
+    expect(
+      writeConfiguredWorktreeReceipt.mock.invocationCallOrder[1],
     ).toBeLessThan(createAgent.mock.invocationCallOrder[0]!);
   });
 
@@ -3239,6 +3305,7 @@ describe("cli", () => {
         throw new Error("fatal: already exists");
       })
       .mockImplementationOnce(() => {});
+    const writeConfiguredWorktreeReceipt = vi.fn(() => "receipt-1");
 
     await runCliWithMocks(
       ["ship it", "--worktree"],
@@ -3250,7 +3317,7 @@ describe("cli", () => {
         maxConsecutiveFailures: 3,
         preventSleep: false,
       },
-      { createWorktree },
+      { createWorktree, writeConfiguredWorktreeReceipt },
     );
 
     const firstPath = createWorktree.mock.calls[0]?.[1] as string;
@@ -3258,6 +3325,17 @@ describe("cli", () => {
     expect(createWorktree).toHaveBeenCalledTimes(2);
     expect(createWorktree.mock.calls[1]?.[1]).toBe(`${firstPath}-1`);
     expect(createWorktree.mock.calls[1]?.[2]).toBe(`${firstBranch}-1`);
+    expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        receiptId: "receipt-1",
+        state: "pending",
+        worktreePath: `${firstPath}-1`,
+      }),
+    );
+    expect(
+      writeConfiguredWorktreeReceipt.mock.invocationCallOrder[1],
+    ).toBeLessThan(createWorktree.mock.invocationCallOrder[1]!);
   });
 
   it("queries git worktrees once when no preserved worktree exists", async () => {
@@ -3287,7 +3365,7 @@ describe("cli", () => {
     const setupRun = vi.fn(() => {
       throw new Error("metadata disk full");
     });
-    const writeConfiguredWorktreeReceipt = vi.fn();
+    const writeConfiguredWorktreeReceipt = vi.fn(() => "receipt-1");
     const createWorktree = vi.fn((_repo, worktreePath: string) => {
       createdWorktreePath = worktreePath;
       mkdirSync(worktreePath, { recursive: true });
@@ -3316,13 +3394,21 @@ describe("cli", () => {
       ).rejects.toThrow("process.exit unexpectedly called with 1");
 
       expect(createdWorktreePath).not.toBeNull();
-      expect(writeConfiguredWorktreeReceipt).toHaveBeenCalledWith({
+      expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(1, {
         runId: basename(createdWorktreePath!),
         baseCommit: "abc123",
+        state: "pending",
+        worktreePath: createdWorktreePath,
+      });
+      expect(writeConfiguredWorktreeReceipt).toHaveBeenNthCalledWith(2, {
+        runId: basename(createdWorktreePath!),
+        baseCommit: "abc123",
+        receiptId: "receipt-1",
+        state: "created",
         worktreePath: createdWorktreePath,
       });
       expect(
-        writeConfiguredWorktreeReceipt.mock.invocationCallOrder[0],
+        writeConfiguredWorktreeReceipt.mock.invocationCallOrder[1],
       ).toBeLessThan(setupRun.mock.invocationCallOrder[0]!);
       expect(consoleErrorSink.flat().join("\n")).toContain(
         `worktree preserved at ${createdWorktreePath}`,
@@ -3374,11 +3460,44 @@ describe("cli", () => {
           waitingUntil: null,
           lastMessage: null,
           hasPendingCommitFailure: true,
+          hasPendingWorkspaceRecovery: true,
         })),
       },
     );
 
     expect(removeWorktree).not.toHaveBeenCalled();
+  });
+
+  it("preserves a worktree when git refuses final removal", async () => {
+    const consoleErrorSink: unknown[][] = [];
+    const removeWorktree = vi.fn(() => {
+      throw new Error("worktree contains modified or untracked files");
+    });
+
+    await runCliWithMocks(
+      ["ship it", "--worktree"],
+      {
+        agent: "claude",
+        agentPathOverride: {},
+        agentArgsOverride: {},
+        acpRegistryOverrides: {},
+        maxConsecutiveFailures: 3,
+        preventSleep: false,
+      },
+      {
+        consoleErrorSink,
+        removeWorktree,
+        setupRun: vi.fn(() => ({
+          ...stubRunInfo,
+          baseCommit: "a".repeat(40),
+        })),
+      },
+    );
+
+    expect(removeWorktree).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSink.flat().join("\n")).toContain(
+      "worktree preserved at",
+    );
   });
 
   it("preserves a clean worktree when shutdown times out", async () => {
@@ -3562,6 +3681,7 @@ describe("cli", () => {
 
       expect(writeConfiguredWorktreeReceipt).toHaveBeenCalledWith({
         runId,
+        state: "created",
         worktreePath,
       });
       expect(

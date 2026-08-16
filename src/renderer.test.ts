@@ -93,6 +93,17 @@ describe("renderStats", () => {
     const plain = stripAnsi(renderStats("01:23:45", 12400, 8200, 12, false));
     expect(plain).not.toContain("~");
   });
+
+  it("does not render unavailable token totals as exact", () => {
+    const plain = stripAnsi(
+      renderStats("01:23:45", 12400, 8200, 12, false, false),
+    );
+
+    expect(plain).toContain("? in");
+    expect(plain).toContain("? out");
+    expect(plain).not.toContain("12K in");
+    expect(plain).not.toContain("8K out");
+  });
 });
 
 describe("renderAgentMessage", () => {

@@ -92,6 +92,23 @@ describe("PiAgent", () => {
     );
   });
 
+  it("stays inside an external supervisor process group", () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const agent = new PiAgent({
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+
+    agent.run("test prompt", "/work/dir");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "pi",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
+    );
+  });
+
   it("uses a shell on Windows for cmd wrapper paths", () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);

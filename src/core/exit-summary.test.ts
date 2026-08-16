@@ -68,6 +68,20 @@ describe("renderExitSummary", () => {
     expect(summary).toContain("tokens          ~12.4M in     ~96K out");
   });
 
+  it("does not render unavailable token totals as exact", () => {
+    const summary = stripExitSummaryAnsi(
+      renderExitSummary({
+        ...baseSummary,
+        tokensAvailable: false,
+        color: false,
+      }),
+    );
+
+    expect(summary).toContain("tokens          unavailable");
+    expect(summary).not.toContain("12.4M in");
+    expect(summary).not.toContain("96K out");
+  });
+
   it("uses a stopped header for aborted runs", () => {
     const summary = stripExitSummaryAnsi(
       renderExitSummary({

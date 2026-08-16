@@ -5,6 +5,8 @@ import {
   fsyncSync,
   linkSync,
   openSync,
+  readFileSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -14,13 +16,17 @@ type WriteConfiguredWorktreeReceiptParams = {
   runId: string;
   baseCommit?: string;
   environment?: NodeJS.ProcessEnv;
+  receiptId?: string;
+  state: "created" | "pending";
   worktreePath: string;
 };
 
 type WorktreeReceipt = {
   schemaVersion: 1;
+  receiptId: string;
   runId: string;
   baseCommit?: string;
+  state: "created" | "pending";
   worktreePath: string;
 };
 
@@ -28,19 +34,24 @@ export function writeConfiguredWorktreeReceipt({
   runId,
   baseCommit,
   environment = process.env,
+  receiptId,
+  state,
   worktreePath,
-}: WriteConfiguredWorktreeReceiptParams): void {
+}: WriteConfiguredWorktreeReceiptParams): string | undefined {
   const configuredPath = environment.GNHF_WORKTREE_RECEIPT_PATH;
   if (configuredPath === undefined) {
-    return;
+    return undefined;
   }
   if (!isAbsolute(configuredPath)) {
     throw new Error("GNHF_WORKTREE_RECEIPT_PATH must be absolute");
   }
 
+  const activeReceiptId = receiptId ?? randomUUID();
   const receipt: WorktreeReceipt = {
     schemaVersion: 1,
+    receiptId: activeReceiptId,
     runId,
+    state,
     worktreePath: resolve(worktreePath),
   };
   if (baseCommit !== undefined) {
@@ -52,7 +63,6 @@ export function writeConfiguredWorktreeReceipt({
     directory,
     `.${basename(configuredPath)}.${process.pid}.${randomUUID()}.tmp`,
   );
-  let published = false;
   try {
     const descriptor = openSync(
       temporaryPath,
@@ -70,19 +80,35 @@ export function writeConfiguredWorktreeReceipt({
       closeSync(descriptor);
     }
 
-    linkSync(temporaryPath, configuredPath);
-    published = true;
-    unlinkSync(temporaryPath);
+    if (receiptId === undefined) {
+      linkSync(temporaryPath, configuredPath);
+      unlinkSync(temporaryPath);
+    } else {
+      assertReceiptOwnership(configuredPath, receiptId);
+      renameSync(temporaryPath, configuredPath);
+    }
     fsyncDirectory(directory);
+    return activeReceiptId;
   } catch (error) {
-    if (published) {
-      unlinkIfPresent(configuredPath);
-    }
     unlinkIfPresent(temporaryPath);
-    if (published) {
-      fsyncDirectory(directory);
-    }
     throw error;
+  }
+}
+
+function assertReceiptOwnership(path: string, receiptId: string): void {
+  let existing: unknown;
+  try {
+    existing = JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    throw new Error("Configured worktree receipt is not owned by this run");
+  }
+  if (
+    typeof existing !== "object" ||
+    existing === null ||
+    !("receiptId" in existing) ||
+    existing.receiptId !== receiptId
+  ) {
+    throw new Error("Configured worktree receipt is not owned by this run");
   }
 }
 

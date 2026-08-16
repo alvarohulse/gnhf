@@ -10,7 +10,10 @@ import {
   type TokenUsage,
   PermanentAgentError,
 } from "./types.js";
-import { shutdownChildProcess } from "./managed-process.js";
+import {
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+} from "./managed-process.js";
 import { parseJSONLStream, setupAbortHandler } from "./stream-utils.js";
 
 const DEFAULT_FINAL_RESULT_EXIT_GRACE_MS = 15_000;
@@ -41,11 +44,11 @@ interface ClaudeResultEvent {
   subtype: string;
   is_error?: boolean;
   total_cost_usd?: number;
-  usage: {
-    input_tokens: number;
-    cache_read_input_tokens: number;
-    cache_creation_input_tokens: number;
-    output_tokens: number;
+  usage?: {
+    input_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+    output_tokens?: number;
   };
   structured_output: AgentOutput | null;
 }
@@ -58,6 +61,7 @@ interface ClaudeAgentDeps {
   finalResultGraceMs?: number;
   platform?: NodeJS.Platform;
   schema?: AgentOutputSchema;
+  supervisedProcessGroup?: boolean;
 }
 
 function shouldUseWindowsShell(
@@ -94,6 +98,7 @@ function shouldUseWindowsShell(
 function terminateClaudeProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
+  detached: boolean,
 ): void {
   if (platform === "win32" && child.pid) {
     try {
@@ -106,7 +111,7 @@ function terminateClaudeProcess(
     return;
   }
 
-  if (child.pid) {
+  if (detached && child.pid) {
     try {
       process.kill(-child.pid, "SIGTERM");
       return;
@@ -121,14 +126,15 @@ function terminateClaudeProcess(
 async function shutdownClaudeProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
+  detached: boolean,
 ): Promise<void> {
   if (platform === "win32") {
-    terminateClaudeProcess(child, platform);
+    terminateClaudeProcess(child, platform, detached);
     return;
   }
 
   await shutdownChildProcess(child, {
-    detached: true,
+    detached,
   });
 }
 
@@ -179,6 +185,42 @@ function toTokenUsage(usage: {
     cacheReadTokens: usage.cache_read_input_tokens ?? 0,
     cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
   };
+}
+
+function toResultUsage(event: ClaudeResultEvent): TokenUsage | null {
+  const inputTokens = event.usage?.input_tokens;
+  const outputTokens = event.usage?.output_tokens;
+  const cacheReadTokens = event.usage?.cache_read_input_tokens;
+  const cacheCreationTokens = event.usage?.cache_creation_input_tokens;
+  const reportedCostUsd = event.total_cost_usd;
+  const tokensAvailable =
+    isNonNegativeFiniteNumber(inputTokens) &&
+    isNonNegativeFiniteNumber(outputTokens);
+  const reportedCostAvailable = isNonNegativeFiniteNumber(reportedCostUsd);
+
+  if (!tokensAvailable && !reportedCostAvailable) {
+    return null;
+  }
+
+  return {
+    inputTokens: tokensAvailable
+      ? inputTokens +
+        (isNonNegativeFiniteNumber(cacheReadTokens) ? cacheReadTokens : 0)
+      : 0,
+    outputTokens: tokensAvailable ? outputTokens : 0,
+    cacheReadTokens: isNonNegativeFiniteNumber(cacheReadTokens)
+      ? cacheReadTokens
+      : 0,
+    cacheCreationTokens: isNonNegativeFiniteNumber(cacheCreationTokens)
+      ? cacheCreationTokens
+      : 0,
+    ...(reportedCostAvailable ? { reportedCostUsd } : {}),
+    ...(tokensAvailable ? {} : { tokensAvailable: false }),
+  };
+}
+
+function isNonNegativeFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 function isSameUsage(a: TokenUsage, b: TokenUsage): boolean {
@@ -307,6 +349,7 @@ export class ClaudeAgent implements Agent {
   private bin: string;
   private extraArgs?: string[];
   private finalResultGraceMs: number;
+  private detached: boolean;
   private platform: NodeJS.Platform;
   private schema: AgentOutputSchema;
 
@@ -317,6 +360,10 @@ export class ClaudeAgent implements Agent {
     this.finalResultGraceMs =
       deps.finalResultGraceMs ?? DEFAULT_FINAL_RESULT_EXIT_GRACE_MS;
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.schema =
       deps.schema ?? buildAgentOutputSchema({ includeStopField: false });
   }
@@ -336,7 +383,7 @@ export class ClaudeAgent implements Agent {
         buildClaudeArgs(prompt, this.schema, this.extraArgs),
         {
           cwd,
-          detached: this.platform !== "win32",
+          detached: this.detached,
           shell: shouldUseWindowsShell(this.bin, this.platform),
           stdio: ["ignore", "pipe", "pipe"],
           env: process.env,
@@ -345,7 +392,7 @@ export class ClaudeAgent implements Agent {
 
       if (
         setupAbortHandler(signal, child, reject, () =>
-          terminateClaudeProcess(child, this.platform),
+          terminateClaudeProcess(child, this.platform, this.detached),
         )
       ) {
         return;
@@ -353,7 +400,7 @@ export class ClaudeAgent implements Agent {
 
       let resultEvent: ClaudeResultEvent | null = null;
       let finalStructuredResultEvent: ClaudeResultEvent | null = null;
-      let latestResultUsage: ClaudeResultEvent["usage"] | null = null;
+      let latestResultUsage: TokenUsage | null = null;
       let finalResultCleanupTimer: ReturnType<typeof setTimeout> | null = null;
       let closedAfterFinalCleanup = false;
       let stderr = "";
@@ -369,6 +416,21 @@ export class ClaudeAgent implements Agent {
       let lastAnonymousAssistantId: string | null = null;
       let lastAnonymousAssistantUsage: TokenUsage | null = null;
       let pendingAnonymousAssistantUsage: TokenUsage | null = null;
+
+      const getResultUsage = (): TokenUsage => {
+        if (latestResultUsage !== null) {
+          return latestResultUsage;
+        }
+        latestResultUsage = {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokensAvailable: false,
+        };
+        onUsage?.({ ...latestResultUsage });
+        return latestResultUsage;
+      };
 
       child.stderr!.on("data", (data: Buffer) => {
         stderr += data.toString();
@@ -473,7 +535,11 @@ export class ClaudeAgent implements Agent {
 
         if (event.type === "result") {
           const next = event as ClaudeResultEvent;
-          latestResultUsage = next.usage;
+          const nextUsage = toResultUsage(next);
+          if (nextUsage !== null) {
+            latestResultUsage = nextUsage;
+            onUsage?.({ ...nextUsage });
+          }
           if (isFinalStructuredResult(next)) {
             finalStructuredResultEvent = next;
             if (finalResultCleanupTimer) {
@@ -481,7 +547,7 @@ export class ClaudeAgent implements Agent {
             }
             finalResultCleanupTimer = setTimeout(() => {
               closedAfterFinalCleanup = true;
-              void shutdownClaudeProcess(child, this.platform);
+              void shutdownClaudeProcess(child, this.platform, this.detached);
             }, this.finalResultGraceMs);
           } else if (
             !finalStructuredResultEvent &&
@@ -500,6 +566,7 @@ export class ClaudeAgent implements Agent {
           clearTimeout(finalResultCleanupTimer);
         }
         logStream?.end();
+        const terminalUsage = getResultUsage();
         if (code !== 0 && !closedAfterFinalCleanup) {
           const failure = describeExitFailure(code, stdoutTail, stderr);
           reject(
@@ -538,19 +605,7 @@ export class ClaudeAgent implements Agent {
         }
 
         const output: AgentOutput = terminalResultEvent.structured_output;
-        const usage = toTokenUsage(
-          latestResultUsage ?? terminalResultEvent.usage,
-        );
-        if (
-          terminalResultEvent.total_cost_usd !== undefined &&
-          Number.isFinite(terminalResultEvent.total_cost_usd) &&
-          terminalResultEvent.total_cost_usd >= 0
-        ) {
-          usage.reportedCostUsd = terminalResultEvent.total_cost_usd;
-        }
-
-        onUsage?.(usage);
-        resolve({ output, usage });
+        resolve({ output, usage: terminalUsage });
       });
     });
   }

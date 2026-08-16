@@ -16,7 +16,10 @@ import {
   type TokenUsage,
 } from "./types.js";
 import { appendDebugLog, serializeError } from "../debug-log.js";
-import { shutdownChildProcess } from "./managed-process.js";
+import {
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+} from "./managed-process.js";
 
 interface OpenCodeMessagePart {
   type?: string;
@@ -140,6 +143,7 @@ interface OpenCodeDeps {
   platform?: NodeJS.Platform;
   schema?: AgentOutputSchema;
   spawn?: typeof spawn;
+  supervisedProcessGroup?: boolean;
 }
 
 interface OpenCodeServer {
@@ -317,6 +321,7 @@ export class OpenCodeAgent implements Agent {
   name = "opencode";
 
   private bin: string;
+  private detached: boolean;
   private extraArgs?: string[];
   private fetchFn: typeof fetch;
   private getPortFn: () => Promise<number>;
@@ -334,6 +339,10 @@ export class OpenCodeAgent implements Agent {
     this.getPortFn = deps.getPort ?? getAvailablePort;
     this.killProcessFn = deps.killProcess ?? process.kill.bind(process);
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.schema =
       deps.schema ?? buildAgentOutputSchema({ includeStopField: false });
     this.spawnFn = deps.spawn ?? spawn;
@@ -440,7 +449,7 @@ export class OpenCodeAgent implements Agent {
 
     const port = await this.getPortFn();
     const isWindows = this.platform === "win32";
-    const detached = !isWindows;
+    const detached = this.detached;
     const child = this.spawnFn(
       this.bin,
       [

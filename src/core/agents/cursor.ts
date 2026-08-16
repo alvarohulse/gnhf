@@ -17,7 +17,10 @@ import {
   type AgentRunOptions,
   type TokenUsage,
 } from "./types.js";
-import { shutdownChildProcess } from "./managed-process.js";
+import {
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+} from "./managed-process.js";
 import { parseJSONLStream, setupAbortHandler } from "./stream-utils.js";
 
 const DEFAULT_FINAL_RESULT_EXIT_GRACE_MS = 15_000;
@@ -351,10 +354,10 @@ export class CursorAgent implements Agent {
     this.finalResultGraceMs =
       deps.finalResultGraceMs ?? DEFAULT_FINAL_RESULT_EXIT_GRACE_MS;
     this.platform = deps.platform ?? process.platform;
-    const supervisedProcessGroup =
-      deps.supervisedProcessGroup ??
-      process.env.GNHF_SUPERVISED_PROCESS_GROUP === "1";
-    this.detached = this.platform !== "win32" && !supervisedProcessGroup;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.bin = deps.bin ?? resolveCursorBin(this.platform);
     this.schema =
       deps.schema ?? buildAgentOutputSchema({ includeStopField: false });

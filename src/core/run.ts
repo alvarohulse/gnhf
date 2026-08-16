@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   mkdirSync,
   writeFileSync,
@@ -5,6 +6,7 @@ import {
   readFileSync,
   readdirSync,
   existsSync,
+  renameSync,
   rmSync,
 } from "node:fs";
 import { join, dirname, isAbsolute } from "node:path";
@@ -44,9 +46,15 @@ export interface RunMetadata {
   commitMessage: CommitMessageConfig | undefined;
 }
 
+export type WorkspaceRecovery = {
+  kind: "commit-failure" | "interrupted";
+  detail: string;
+};
+
 const LOG_FILENAME = "gnhf.log";
 const STOP_WHEN_FILENAME = "stop-when";
 const COMMIT_MESSAGE_FILENAME = "commit-message";
+const WORKSPACE_RECOVERY_FILENAME = "workspace-recovery.json";
 
 function writeSchemaFile(
   schemaPath: string,
@@ -343,6 +351,53 @@ export function getLastIterationNumber(runInfo: RunInfo): number {
     }
   }
   return max;
+}
+
+export function readWorkspaceRecovery(
+  runInfo: Pick<RunInfo, "runDir">,
+): WorkspaceRecovery | null {
+  const recoveryPath = join(runInfo.runDir, WORKSPACE_RECOVERY_FILENAME);
+  if (!existsSync(recoveryPath)) {
+    return null;
+  }
+
+  const value = JSON.parse(readFileSync(recoveryPath, "utf-8")) as unknown;
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("kind" in value) ||
+    (value.kind !== "commit-failure" && value.kind !== "interrupted") ||
+    !("detail" in value) ||
+    typeof value.detail !== "string"
+  ) {
+    throw new Error(`Invalid workspace recovery metadata: ${recoveryPath}`);
+  }
+  return { kind: value.kind, detail: value.detail };
+}
+
+export function writeWorkspaceRecovery(
+  runInfo: Pick<RunInfo, "runDir">,
+  recovery: WorkspaceRecovery,
+): void {
+  const recoveryPath = join(runInfo.runDir, WORKSPACE_RECOVERY_FILENAME);
+  const temporaryPath = join(
+    runInfo.runDir,
+    `.${WORKSPACE_RECOVERY_FILENAME}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(recovery, null, 2)}\n`, {
+      encoding: "utf-8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    renameSync(temporaryPath, recoveryPath);
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
+}
+
+export function clearWorkspaceRecovery(runInfo: Pick<RunInfo, "runDir">): void {
+  rmSync(join(runInfo.runDir, WORKSPACE_RECOVERY_FILENAME), { force: true });
 }
 
 export function toStringArray(value: unknown): string[] {

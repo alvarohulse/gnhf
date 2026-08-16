@@ -70,6 +70,32 @@ describe("forced-stop preservation", () => {
     expect(
       getWorktreePreservationReason(fixture.baseCommit, fixture.cwd, false),
     ).toBe("dirty");
+
+    const recoveryAgent: Agent = {
+      name: "claude",
+      run: vi.fn().mockRejectedValue(new Error("network unavailable")),
+    };
+    const resumedOrchestrator = new Orchestrator(
+      config,
+      recoveryAgent,
+      fixture.runInfo,
+      "ship it",
+      fixture.cwd,
+      0,
+      { maxIterations: 1, preserveWorkspaceOnForceStop: true },
+    );
+
+    await resumedOrchestrator.start();
+
+    expect(recoveryAgent.run).toHaveBeenCalledWith(
+      expect.stringContaining("Interrupted Workspace Recovery"),
+      fixture.cwd,
+      expect.any(Object),
+    );
+    expect(existsSync(join(fixture.cwd, "result.txt"))).toBe(true);
+    expect(resumedOrchestrator.getState().hasPendingWorkspaceRecovery).toBe(
+      true,
+    );
   });
 
   it("preserves pending commit-repair work after force stop", async () => {
@@ -118,7 +144,7 @@ describe("forced-stop preservation", () => {
     expect(orchestrator.getState().hasPendingCommitFailure).toBe(true);
     expect(
       getWorktreePreservationReason(fixture.baseCommit, fixture.cwd, true),
-    ).toBe("pending-commit");
+    ).toBe("pending-recovery");
     expect(existsSync(join(fixture.cwd, "result.txt"))).toBe(true);
   });
 

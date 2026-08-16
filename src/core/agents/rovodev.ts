@@ -15,7 +15,10 @@ import type {
 import { validateAgentOutput } from "./types.js";
 import { appendDebugLog, serializeError } from "../debug-log.js";
 import { parseAgentJson } from "./json-extract.js";
-import { shutdownChildProcess } from "./managed-process.js";
+import {
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+} from "./managed-process.js";
 
 interface RovoDevRequestUsageEvent {
   input_tokens?: number;
@@ -36,6 +39,7 @@ interface RovoDevDeps {
   killProcess?: typeof process.kill;
   platform?: NodeJS.Platform;
   spawn?: typeof spawn;
+  supervisedProcessGroup?: boolean;
 }
 
 interface RovoDevServer {
@@ -174,6 +178,7 @@ export class RovoDevAgent implements Agent {
   name = "rovodev";
 
   private bin: string;
+  private detached: boolean;
   private extraArgs?: string[];
   private schemaPath: string;
   private fetchFn: typeof fetch;
@@ -192,6 +197,10 @@ export class RovoDevAgent implements Agent {
     this.getPortFn = deps.getPort ?? getAvailablePort;
     this.killProcessFn = deps.killProcess ?? process.kill.bind(process);
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.spawnFn = deps.spawn ?? spawn;
   }
 
@@ -297,7 +306,7 @@ export class RovoDevAgent implements Agent {
     }
 
     const port = await this.getPortFn();
-    const detached = this.platform !== "win32";
+    const detached = this.detached;
     const child = this.spawnFn(
       this.bin,
       [

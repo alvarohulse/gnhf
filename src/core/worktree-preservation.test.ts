@@ -39,7 +39,7 @@ describe("getWorktreePreservationReason", () => {
     const baseCommit = git(cwd, ["rev-parse", "HEAD"]);
 
     expect(getWorktreePreservationReason(baseCommit, cwd, true)).toBe(
-      "pending-commit",
+      "pending-recovery",
     );
   });
 

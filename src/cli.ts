@@ -392,6 +392,7 @@ function initializeWorktreeRun(
 
     writeConfiguredWorktreeReceipt({
       runId: candidateRunId,
+      state: "created",
       worktreePath: candidateWorktreePath,
     });
     let worktreeBranch: string;
@@ -430,6 +431,7 @@ function initializeWorktreeRun(
   let createdBranchName = branchName;
   let createdRunId = runId;
   let createdWorktreePath = worktreePath;
+  let worktreeReceiptId: string | undefined;
   for (let suffix = 0; suffix < 100; suffix += 1) {
     const candidateBranchName = branchNameWithSuffix(branchName, suffix);
     const candidateRunId = candidateBranchName.split("/")[1]!;
@@ -451,6 +453,15 @@ function initializeWorktreeRun(
       createdWorktreePath,
     );
     if (resumed) return resumed;
+    worktreeReceiptId = writeConfiguredWorktreeReceipt({
+      runId: createdRunId,
+      baseCommit,
+      ...(worktreeReceiptId === undefined
+        ? {}
+        : { receiptId: worktreeReceiptId }),
+      state: "pending",
+      worktreePath: createdWorktreePath,
+    });
     try {
       createWorktree(repoRoot, createdWorktreePath, createdBranchName);
     } catch (error) {
@@ -463,6 +474,10 @@ function initializeWorktreeRun(
     writeConfiguredWorktreeReceipt({
       runId: createdRunId,
       baseCommit,
+      ...(worktreeReceiptId === undefined
+        ? {}
+        : { receiptId: worktreeReceiptId }),
+      state: "created",
       worktreePath: createdWorktreePath,
     });
     break;
@@ -835,14 +850,14 @@ program
       const cwd = process.cwd();
       let effectiveCwd = cwd;
       let worktreePath: string | null = null;
-      let worktreeCleanup: (() => void) | null = null;
+      let worktreeCleanup: (() => boolean) | null = null;
       let worktreePreservationReason:
         | WorktreePreservationReason
         | "requested"
         | "resumed"
         | null = null;
       let worktreePreservationNoticeEmitted = false;
-      let readPendingCommitFailure = () => false;
+      let readPendingWorkspaceRecovery = () => false;
       const preserveWorktree = (
         preservationReason:
           | WorktreePreservationReason
@@ -945,8 +960,10 @@ program
           worktreeCleanup = () => {
             try {
               removeWorktree(cwd, wt.worktreePath);
+              return true;
             } catch {
-              // Best-effort cleanup
+              preserveWorktree("uncertain");
+              return false;
             }
           };
 
@@ -961,7 +978,7 @@ program
             const preservationReason = getWorktreePreservationReason(
               runInfo.baseCommit,
               wt.worktreePath,
-              readPendingCommitFailure(),
+              readPendingWorkspaceRecovery(),
             );
             if (preservationReason !== null) {
               preserveWorktree(preservationReason);
@@ -1154,8 +1171,8 @@ program
           ...(options.worktree ? { preserveWorkspaceOnForceStop: true } : {}),
         },
       );
-      readPendingCommitFailure = () =>
-        orchestrator.getState().hasPendingCommitFailure === true;
+      readPendingWorkspaceRecovery = () =>
+        orchestrator.getState().hasPendingWorkspaceRecovery === true;
       let shutdownSignal: NodeJS.Signals | null = null;
       let forceShutdownRequested = false;
 
@@ -1283,6 +1300,7 @@ program
           failCount: finalState.failCount,
           totalInputTokens: finalState.totalInputTokens,
           totalOutputTokens: finalState.totalOutputTokens,
+          tokensAvailable: finalState.tokensAvailable,
           tokensEstimated: finalState.tokensEstimated,
           commitCount: finalState.commitCount,
           notesPath: runInfo.notesPath,
@@ -1300,8 +1318,15 @@ program
           iterations: finalState.currentIteration,
           successCount: finalState.successCount,
           failCount: finalState.failCount,
-          totalInputTokens: finalState.totalInputTokens,
-          totalOutputTokens: finalState.totalOutputTokens,
+          totalInputTokens:
+            finalState.tokensAvailable === false
+              ? null
+              : finalState.totalInputTokens,
+          totalOutputTokens:
+            finalState.tokensAvailable === false
+              ? null
+              : finalState.totalOutputTokens,
+          tokensAvailable: finalState.tokensAvailable !== false,
           reportedCostUsd: finalState.reportedCostUsd,
           commitCount: finalState.commitCount,
           worktreePath,
@@ -1316,8 +1341,15 @@ program
           success_count: finalState.successCount,
           fail_count: finalState.failCount,
           commit_count: finalState.commitCount,
-          total_input_tokens: finalState.totalInputTokens,
-          total_output_tokens: finalState.totalOutputTokens,
+          total_input_tokens:
+            finalState.tokensAvailable === false
+              ? null
+              : finalState.totalInputTokens,
+          total_output_tokens:
+            finalState.tokensAvailable === false
+              ? null
+              : finalState.totalOutputTokens,
+          tokens_available: finalState.tokensAvailable !== false,
           duration_ms: Date.now() - runStartedAt,
           prevent_sleep: config.preventSleep === true,
           push_each_iteration: options.push === true,
@@ -1336,16 +1368,18 @@ program
             getWorktreePreservationReason(
               runInfo.baseCommit,
               worktreePath,
-              finalState.hasPendingCommitFailure === true,
+              finalState.hasPendingWorkspaceRecovery === true,
             );
           if (preservationReason !== null) {
             preserveWorktree(preservationReason);
           } else {
-            worktreeCleanup?.();
+            const cleanedUp = worktreeCleanup?.() === true;
             worktreeCleanup = null;
-            appendDebugLog("worktree:cleaned-up", {
-              worktreePath,
-            });
+            if (cleanedUp) {
+              appendDebugLog("worktree:cleaned-up", {
+                worktreePath,
+              });
+            }
           }
         }
 

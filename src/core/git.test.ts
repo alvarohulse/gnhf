@@ -455,12 +455,7 @@ describe("git utilities", () => {
   describe("removeWorktree", () => {
     it("passes the worktree path as its own argv entry", () => {
       removeWorktree("/repo", "/tmp/wt");
-      expect(argsOfCall(0)).toEqual([
-        "worktree",
-        "remove",
-        "--force",
-        "/tmp/wt",
-      ]);
+      expect(argsOfCall(0)).toEqual(["worktree", "remove", "/tmp/wt"]);
     });
   });
 

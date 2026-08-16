@@ -583,6 +583,28 @@ describe("OpenCodeAgent", () => {
     );
   });
 
+  it("stays inside an external supervisor process group", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const supervisedAgent = new OpenCodeAgent({
+      fetch: fetchMock as typeof fetch,
+      getPort,
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ healthy: true, version: "1.3.13" }),
+    );
+
+    await supervisedAgent["ensureServer"]("/repo");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "opencode",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
+    );
+  });
+
   it("uses a shell on Windows so PATH-resolved .cmd shims can launch", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);

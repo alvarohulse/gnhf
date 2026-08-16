@@ -18,6 +18,9 @@ vi.mock("./run.js", async (importOriginal) => {
   return {
     ...actual,
     appendNotes: vi.fn(),
+    clearWorkspaceRecovery: vi.fn(),
+    readWorkspaceRecovery: vi.fn(() => null),
+    writeWorkspaceRecovery: vi.fn(),
   };
 });
 
@@ -41,7 +44,12 @@ import {
   pushCurrentBranch,
   resetHard,
 } from "./git.js";
-import { appendNotes } from "./run.js";
+import {
+  appendNotes,
+  clearWorkspaceRecovery,
+  readWorkspaceRecovery,
+  writeWorkspaceRecovery,
+} from "./run.js";
 import { appendDebugLog } from "./debug-log.js";
 import { Orchestrator } from "./orchestrator.js";
 import {
@@ -56,6 +64,9 @@ import type { RunInfo } from "./run.js";
 const mockCommitAll = vi.mocked(commitAll);
 const mockPushCurrentBranch = vi.mocked(pushCurrentBranch);
 const mockAppendNotes = vi.mocked(appendNotes);
+const mockClearWorkspaceRecovery = vi.mocked(clearWorkspaceRecovery);
+const mockReadWorkspaceRecovery = vi.mocked(readWorkspaceRecovery);
+const mockWriteWorkspaceRecovery = vi.mocked(writeWorkspaceRecovery);
 const mockResetHard = vi.mocked(resetHard);
 const mockAppendDebugLog = vi.mocked(appendDebugLog);
 
@@ -571,6 +582,7 @@ describe("Orchestrator stop limits", () => {
     expect(orchestrator.getState()).toMatchObject({
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      tokensAvailable: false,
     });
   });
 
@@ -1350,6 +1362,41 @@ describe("Orchestrator stop limits", () => {
 
     expect(mockResetHard).not.toHaveBeenCalled();
     expect(orchestrator.getState().hasPendingCommitFailure).toBe(true);
+    expect(mockWriteWorkspaceRecovery).toHaveBeenCalledWith(runInfo, {
+      kind: "commit-failure",
+      detail: expect.stringContaining("hook failed"),
+    });
+  });
+
+  it("hydrates interrupted workspace recovery before running an agent", async () => {
+    mockReadWorkspaceRecovery.mockReturnValueOnce({
+      kind: "interrupted",
+      detail: "previous invocation stopped",
+    });
+    const agent: Agent = {
+      name: "claude",
+      run: vi.fn().mockRejectedValueOnce(new Error("network down")),
+    };
+    const orchestrator = new Orchestrator(
+      config,
+      agent,
+      runInfo,
+      "ship it",
+      "/repo",
+      0,
+      { maxIterations: 1 },
+    );
+
+    await orchestrator.start();
+
+    expect(agent.run).toHaveBeenCalledWith(
+      expect.stringContaining("Interrupted Workspace Recovery"),
+      "/repo",
+      expect.any(Object),
+    );
+    expect(mockResetHard).not.toHaveBeenCalled();
+    expect(mockClearWorkspaceRecovery).not.toHaveBeenCalled();
+    expect(orchestrator.getState().hasPendingWorkspaceRecovery).toBe(true);
   });
 
   it("preserves pending commit failure state when a repair iteration errors", async () => {

@@ -312,7 +312,7 @@ export function createWorktree(
 }
 
 export function removeWorktree(baseCwd: string, worktreePath: string): void {
-  git(["worktree", "remove", "--force", worktreePath], baseCwd);
+  git(["worktree", "remove", worktreePath], baseCwd);
 }
 
 export function listWorktreePaths(baseCwd: string): Set<string> {

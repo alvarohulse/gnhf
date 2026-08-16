@@ -1,7 +1,11 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { shutdownChildProcess, signalChildProcess } from "./managed-process.js";
+import {
+  shouldDetachAgentProcess,
+  shutdownChildProcess,
+  signalChildProcess,
+} from "./managed-process.js";
 
 function createChildProcess(pid = 1234): ChildProcess {
   return Object.assign(new EventEmitter(), {
@@ -14,6 +18,20 @@ function createChildProcess(pid = 1234): ChildProcess {
     signalCode: null,
   }) as unknown as ChildProcess;
 }
+
+describe("shouldDetachAgentProcess", () => {
+  it("keeps agents inside an external supervisor process group", () => {
+    expect(shouldDetachAgentProcess("linux", true)).toBe(false);
+  });
+
+  it("creates an owned process group for unsupervised Unix agents", () => {
+    expect(shouldDetachAgentProcess("linux", false)).toBe(true);
+  });
+
+  it("does not detach Windows agents", () => {
+    expect(shouldDetachAgentProcess("win32", false)).toBe(false);
+  });
+});
 
 describe("signalChildProcess", () => {
   beforeEach(() => {

@@ -15,12 +15,14 @@ import {
   setupAbortHandler,
   setupChildProcessHandlers,
 } from "./stream-utils.js";
+import { shouldDetachAgentProcess } from "./managed-process.js";
 
 interface PiAgentDeps {
   bin?: string;
   extraArgs?: string[];
   platform?: NodeJS.Platform;
   schema?: AgentOutputSchema;
+  supervisedProcessGroup?: boolean;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -59,6 +61,7 @@ function shouldUseWindowsShell(
 function terminatePiProcess(
   child: ReturnType<typeof spawn>,
   platform: NodeJS.Platform,
+  detached: boolean,
 ): void {
   if (platform === "win32" && child.pid) {
     try {
@@ -71,7 +74,7 @@ function terminatePiProcess(
     return;
   }
 
-  if (child.pid) {
+  if (detached && child.pid) {
     try {
       process.kill(-child.pid, "SIGTERM");
       return;
@@ -201,6 +204,7 @@ export class PiAgent implements Agent {
   name = "pi";
 
   private bin: string;
+  private detached: boolean;
   private extraArgs?: string[];
   private platform: NodeJS.Platform;
   private schema: AgentOutputSchema;
@@ -209,6 +213,10 @@ export class PiAgent implements Agent {
     this.bin = deps.bin ?? "pi";
     this.extraArgs = deps.extraArgs;
     this.platform = deps.platform ?? process.platform;
+    this.detached = shouldDetachAgentProcess(
+      this.platform,
+      deps.supervisedProcessGroup,
+    );
     this.schema =
       deps.schema ?? buildAgentOutputSchema({ includeStopField: false });
   }
@@ -224,7 +232,7 @@ export class PiAgent implements Agent {
       const logStream = logPath ? createWriteStream(logPath) : null;
       const child = spawn(this.bin, buildPiArgs(this.extraArgs), {
         cwd,
-        detached: this.platform !== "win32",
+        detached: this.detached,
         shell: shouldUseWindowsShell(this.bin, this.platform),
         stdio: ["pipe", "pipe", "pipe"],
         env: process.env,
@@ -235,7 +243,7 @@ export class PiAgent implements Agent {
 
       if (
         setupAbortHandler(signal, child, reject, () =>
-          terminatePiProcess(child, this.platform),
+          terminatePiProcess(child, this.platform, this.detached),
         )
       ) {
         return;

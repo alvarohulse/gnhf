@@ -7,8 +7,14 @@ import {
   type TokenUsage,
 } from "./agents/types.js";
 import { redactAgentSpecForLogs, type Config } from "./config.js";
-import type { RunInfo } from "./run.js";
-import { appendNotes, toStringArray } from "./run.js";
+import type { RunInfo, WorkspaceRecovery } from "./run.js";
+import {
+  appendNotes,
+  clearWorkspaceRecovery,
+  readWorkspaceRecovery,
+  toStringArray,
+  writeWorkspaceRecovery,
+} from "./run.js";
 import { appendDebugLog, serializeError } from "./debug-log.js";
 import {
   CommitFailedError,
@@ -47,6 +53,7 @@ export interface OrchestratorState {
   totalInputTokens: number;
   totalOutputTokens: number;
   reportedCostUsd: number | null;
+  tokensAvailable?: boolean;
   // Sticky flag: true when at least one iteration's usage was reported as
   // estimated (e.g. an ACP adapter that doesn't emit usage_update). Once set,
   // it stays set for the rest of the run so totals are presented honestly.
@@ -62,6 +69,7 @@ export interface OrchestratorState {
   lastMessage: string | null;
   lastAgentError?: string | null;
   hasPendingCommitFailure?: boolean;
+  hasPendingWorkspaceRecovery?: boolean;
 }
 
 export interface OrchestratorEvents {
@@ -115,7 +123,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private activeIterationPromise: Promise<RunIterationResult> | null = null;
   private activeAbortController: AbortController | null = null;
   private pendingAbortReason: string | null = null;
-  private pendingCommitFailure: string | null = null;
+  private pendingWorkspaceRecovery: WorkspaceRecovery | null = null;
+  private activeWorkspaceRecoveryMarker = false;
   private activeIterationTokensEstimated = false;
   private tokensUnavailable = false;
   private reportedCostUnavailable = false;
@@ -124,7 +133,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
   private state: Omit<
     OrchestratorState,
-    "interruptHint" | "hasPendingCommitFailure"
+    "interruptHint" | "hasPendingCommitFailure" | "hasPendingWorkspaceRecovery"
   > = {
     status: "running",
     gracefulStopRequested: false,
@@ -166,6 +175,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       this.runInfo.baseCommit,
       this.cwd,
     );
+    this.pendingWorkspaceRecovery = readWorkspaceRecovery(this.runInfo);
   }
 
   getState(): OrchestratorState {
@@ -173,8 +183,13 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       ...this.state,
       tokensEstimated:
         this.state.tokensEstimated || this.activeIterationTokensEstimated,
+      tokensAvailable: !this.tokensUnavailable,
       interruptHint: getInterruptHint(this.state),
-      hasPendingCommitFailure: this.pendingCommitFailure !== null,
+      hasPendingCommitFailure:
+        this.pendingWorkspaceRecovery?.kind === "commit-failure",
+      hasPendingWorkspaceRecovery:
+        this.pendingWorkspaceRecovery !== null ||
+        this.activeWorkspaceRecoveryMarker,
     };
   }
 
@@ -250,8 +265,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         await this.closeAgent();
       }
       if (this.limits.preserveWorkspaceOnForceStop !== true) {
-        resetHard(this.cwd);
-        this.pendingCommitFailure = null;
+        this.resetWorkspace();
       }
       this.state.status = "stopped";
       this.emit("state", this.getState());
@@ -302,16 +316,24 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           stopWhen: this.limits.stopWhen,
           commitMessage: this.config.commitMessage,
         });
-        const iterationPrompt = this.pendingCommitFailure
-          ? this.buildCommitRepairPrompt(baseIterationPrompt)
+        const iterationPrompt = this.pendingWorkspaceRecovery
+          ? this.buildWorkspaceRecoveryPrompt(
+              baseIterationPrompt,
+              this.pendingWorkspaceRecovery,
+            )
           : baseIterationPrompt;
 
         appendDebugLog("iteration:start", {
           iteration: this.state.currentIteration,
           promptLength: iterationPrompt.length,
           consecutiveFailures: this.state.consecutiveFailures,
-          totalInputTokens: this.state.totalInputTokens,
-          totalOutputTokens: this.state.totalOutputTokens,
+          totalInputTokens: this.tokensUnavailable
+            ? null
+            : this.state.totalInputTokens,
+          totalOutputTokens: this.tokensUnavailable
+            ? null
+            : this.state.totalOutputTokens,
+          tokensAvailable: !this.tokensUnavailable,
           reportedCostUsd: this.state.reportedCostUsd,
           git: this.snapshotGitState(),
         });
@@ -352,8 +374,13 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           keyChanges: record.keyChanges.length,
           keyLearnings: record.keyLearnings.length,
           consecutiveFailures: this.state.consecutiveFailures,
-          totalInputTokens: this.state.totalInputTokens,
-          totalOutputTokens: this.state.totalOutputTokens,
+          totalInputTokens: this.tokensUnavailable
+            ? null
+            : this.state.totalInputTokens,
+          totalOutputTokens: this.tokensUnavailable
+            ? null
+            : this.state.totalOutputTokens,
+          tokensAvailable: !this.tokensUnavailable,
           tokensEstimated: this.state.tokensEstimated,
           commitCount: this.state.commitCount,
         });
@@ -462,6 +489,18 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     let latestUsage: TokenUsage | null = null;
     let agentRunReceiptWritten = false;
 
+    if (
+      this.limits.preserveWorkspaceOnForceStop === true &&
+      this.pendingWorkspaceRecovery === null
+    ) {
+      writeWorkspaceRecovery(this.runInfo, {
+        kind: "interrupted",
+        detail:
+          "The previous invocation stopped before the active iteration completed.",
+      });
+      this.activeWorkspaceRecoveryMarker = true;
+    }
+
     this.activeAbortController = new AbortController();
     this.pendingAbortReason = null;
     this.activeIterationTokensEstimated = false;
@@ -472,6 +511,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       if (tokensAvailable) {
         this.state.totalInputTokens = baseInputTokens + usage.inputTokens;
         this.state.totalOutputTokens = baseOutputTokens + usage.outputTokens;
+      } else {
+        this.tokensUnavailable = true;
       }
       if (
         usage.reportedCostUsd !== undefined &&
@@ -609,8 +650,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           elapsedMs,
           reason: this.pendingAbortReason,
         });
-        if (this.pendingCommitFailure === null) {
-          resetHard(this.cwd);
+        if (this.pendingWorkspaceRecovery === null) {
+          this.resetWorkspace();
         }
         return { type: "aborted", reason: this.pendingAbortReason };
       }
@@ -634,8 +675,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       });
 
       if (err instanceof PermanentAgentError) {
-        if (this.pendingCommitFailure === null) {
-          resetHard(this.cwd);
+        if (this.pendingWorkspaceRecovery === null) {
+          this.resetWorkspace();
         }
         this.state.lastAgentError = err.detail;
         return { type: "aborted", reason: err.message };
@@ -697,7 +738,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       throw error;
     }
 
-    this.pendingCommitFailure = null;
+    this.clearWorkspaceRecovery();
     appendNotes(
       this.runInfo.notesPath,
       this.state.currentIteration,
@@ -723,7 +764,20 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     };
   }
 
-  private buildCommitRepairPrompt(basePrompt: string): string {
+  private buildWorkspaceRecoveryPrompt(
+    basePrompt: string,
+    recovery: WorkspaceRecovery,
+  ): string {
+    if (recovery.kind === "interrupted") {
+      return `${basePrompt}
+
+## Interrupted Workspace Recovery
+
+The previous invocation stopped while an iteration was active, so the workspace may contain incomplete changes.
+Do not start unrelated work.
+Inspect and finish or repair the existing changes, validate them, then report success.`;
+    }
+
     return `${basePrompt}
 
 ## Previous Commit Failure
@@ -735,12 +789,17 @@ Inspect and fix the existing uncommitted changes so the commit can pass, then re
 Git commit output:
 
 \`\`\`
-${this.pendingCommitFailure}
+${recovery.detail}
 \`\`\``;
   }
 
   private recordCommitFailure(error: CommitFailedError): IterationRecord {
-    this.pendingCommitFailure = error.detail;
+    this.pendingWorkspaceRecovery = {
+      kind: "commit-failure",
+      detail: error.detail,
+    };
+    this.activeWorkspaceRecoveryMarker = false;
+    writeWorkspaceRecovery(this.runInfo, this.pendingWorkspaceRecovery);
     const summary = "git commit failed; asking agent to repair the workspace";
     appendNotes(
       this.runInfo.notesPath,
@@ -786,7 +845,7 @@ ${this.pendingCommitFailure}
     learnings: string[],
     kind: "reported" | "error",
   ): IterationRecord {
-    const hadPendingCommitFailure = this.pendingCommitFailure !== null;
+    const hadPendingWorkspaceRecovery = this.pendingWorkspaceRecovery !== null;
     appendNotes(
       this.runInfo.notesPath,
       this.state.currentIteration,
@@ -794,8 +853,8 @@ ${this.pendingCommitFailure}
       [],
       toStringArray(learnings),
     );
-    if (!hadPendingCommitFailure) {
-      resetHard(this.cwd);
+    if (!hadPendingWorkspaceRecovery) {
+      this.resetWorkspace();
     }
     this.state.failCount++;
     this.state.consecutiveFailures++;
@@ -834,6 +893,17 @@ ${this.pendingCommitFailure}
         resolve();
       });
     });
+  }
+
+  private clearWorkspaceRecovery(): void {
+    clearWorkspaceRecovery(this.runInfo);
+    this.pendingWorkspaceRecovery = null;
+    this.activeWorkspaceRecoveryMarker = false;
+  }
+
+  private resetWorkspace(): void {
+    resetHard(this.cwd);
+    this.clearWorkspaceRecovery();
   }
 
   private getPreIterationAbortReason(): string | null {

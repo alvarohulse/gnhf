@@ -244,6 +244,26 @@ describe("RovoDevAgent", () => {
     );
   });
 
+  it("stays inside an external supervisor process group", async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const supervisedAgent = new RovoDevAgent(schemaPath, {
+      fetch: fetchMock as typeof fetch,
+      getPort,
+      platform: "linux",
+      supervisedProcessGroup: true,
+    });
+    fetchMock.mockResolvedValueOnce(jsonResponse({ status: "healthy" }));
+
+    await supervisedAgent["ensureServer"]("/repo");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "acli",
+      expect.any(Array),
+      expect.objectContaining({ detached: false }),
+    );
+  });
+
   it("uses a shell on Windows when a bare override resolves to a cmd wrapper", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);

@@ -15,6 +15,7 @@ export interface ExitSummaryOptions {
   failCount: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  tokensAvailable?: boolean;
   tokensEstimated: boolean;
   commitCount: number;
   notesPath: string;
@@ -174,16 +175,17 @@ export function renderExitSummary(options: ExitSummaryOptions): string {
   const cardContents = [title, `  ${subtitle}`];
   const cardWidth = resolveCardWidth(cardContents, options.terminalColumns);
   const failed = `${options.failCount} failed`;
-  const inputTokens = formatTokenCount(
-    options.totalInputTokens,
-    "in",
-    options.tokensEstimated,
-  );
-  const outputTokens = formatTokenCount(
-    options.totalOutputTokens,
-    "out",
-    options.tokensEstimated,
-  );
+  const tokensAvailable = options.tokensAvailable !== false;
+  const inputTokens = tokensAvailable
+    ? formatTokenCount(options.totalInputTokens, "in", options.tokensEstimated)
+    : "unavailable";
+  const outputTokens = tokensAvailable
+    ? formatTokenCount(
+        options.totalOutputTokens,
+        "out",
+        options.tokensEstimated,
+      )
+    : "";
   const commits = plural(options.commitCount, "commit");
   const linesAdded = `+${formatNumber(options.diffStats.linesAdded)}`;
   const linesDeleted = `-${formatNumber(options.diffStats.linesDeleted)}`;
