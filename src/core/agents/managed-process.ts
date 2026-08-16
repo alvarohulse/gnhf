@@ -4,6 +4,7 @@ import {
   type SpawnOptions,
 } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { appendDebugLog, serializeError } from "../debug-log.js";
 import { IncompleteAgentShutdownError } from "./types.js";
 
 interface SignalChildProcessOptions {
@@ -22,6 +23,7 @@ interface ShutdownWindowsProcessTreeOptions {
   killTree?: (pid: number) => void;
   ownershipLost?: boolean;
   timeoutMs?: number;
+  unverifiedReason?: "target-close" | "target-error";
 }
 
 const SHUTDOWN_CONFIRMATION_GRACE_MS = 100;
@@ -146,11 +148,14 @@ export function spawnManagedChildProcess(
   } | null = null;
   let settled = false;
 
-  const startManagedShutdown = (ownershipLost = false) => {
+  const startManagedShutdown = (
+    unverifiedReason?: "target-close" | "target-error",
+  ) => {
     const startShutdown = () =>
       platform === "win32"
         ? shutdownWindowsProcessTree(managed as unknown as ChildProcess, {
-            ownershipLost,
+            ownershipLost: unverifiedReason !== undefined,
+            unverifiedReason,
           })
         : shutdownChildProcess(managed as unknown as ChildProcess, {
             detached: true,
@@ -159,41 +164,73 @@ export function spawnManagedChildProcess(
     return shutdownTracker?.start(startShutdown) ?? startShutdown();
   };
 
+  const settleManagedProcess = (
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    managed.exitCode = code;
+    managed.signalCode = signal;
+    managed.emit("close", code, signal);
+  };
+
   supervisor.on("message", (message: unknown) => {
     if (!isSupervisorMessage(message)) {
       return;
     }
     if (message.type === "target-error") {
-      void startManagedShutdown().catch((error: unknown) => {
+      const cleanup = startManagedShutdown(
+        platform === "win32" ? "target-error" : undefined,
+      );
+      void cleanup.then(
+        () => {
+          if (platform === "win32") {
+            queueMicrotask(() => settleManagedProcess(1, null));
+          }
+        },
+        (error: unknown) => {
+          managed.emit(
+            "error",
+            error instanceof Error
+              ? error
+              : new IncompleteChildProcessShutdownError(managed.pid),
+          );
+        },
+      );
+      managed.emit("error", new Error(message.message));
+      return;
+    }
+    targetStatus = { code: message.code, signal: message.signal };
+    const cleanup = startManagedShutdown(
+      platform === "win32" ? "target-close" : undefined,
+    );
+    void cleanup.then(
+      () => {
+        if (platform === "win32") {
+          queueMicrotask(() =>
+            settleManagedProcess(message.code, message.signal),
+          );
+        }
+      },
+      (error: unknown) => {
         managed.emit(
           "error",
           error instanceof Error
             ? error
             : new IncompleteChildProcessShutdownError(managed.pid),
         );
-      });
-      managed.emit("error", new Error(message.message));
-      return;
-    }
-    targetStatus = { code: message.code, signal: message.signal };
-    void startManagedShutdown(platform === "win32").catch((error: unknown) => {
-      managed.emit(
-        "error",
-        error instanceof Error
-          ? error
-          : new IncompleteChildProcessShutdownError(managed.pid),
-      );
-    });
+      },
+    );
   });
   supervisor.on("error", (error) => managed.emit("error", error));
   supervisor.on("close", (code, signal) => {
-    if (settled) {
-      return;
-    }
-    settled = true;
-    managed.exitCode = targetStatus !== null ? targetStatus.code : code;
-    managed.signalCode = targetStatus !== null ? targetStatus.signal : signal;
-    managed.emit("close", managed.exitCode, managed.signalCode);
+    settleManagedProcess(
+      targetStatus !== null ? targetStatus.code : code,
+      targetStatus !== null ? targetStatus.signal : signal,
+    );
   });
 
   return managed as unknown as ChildProcess;
@@ -294,16 +331,41 @@ export function shutdownWindowsProcessTree(
   if (closedWindowsProcessTrees.has(child)) {
     return Promise.resolve();
   }
+  if (options.unverifiedReason !== undefined) {
+    appendDebugLog("agent-process:cleanup-unverified", {
+      platform: "win32",
+      pid: child.pid ?? null,
+      trigger: options.unverifiedReason,
+      mode: "best-effort",
+      descendantCleanup: "unverified",
+    });
+  }
   if (child.exitCode !== null || child.signalCode !== null) {
+    if (options.unverifiedReason !== undefined) {
+      return Promise.resolve();
+    }
     return Promise.reject(new IncompleteChildProcessShutdownError(child.pid));
   }
   if (child.pid === undefined) {
+    if (options.unverifiedReason !== undefined) {
+      try {
+        child.kill("SIGKILL");
+      } catch (error) {
+        appendDebugLog("agent-process:cleanup-best-effort-root-error", {
+          platform: "win32",
+          pid: null,
+          trigger: options.unverifiedReason,
+          error: serializeError(error),
+        });
+      }
+      return Promise.resolve();
+    }
     return Promise.reject(new IncompleteChildProcessShutdownError(undefined));
   }
 
   const pid = child.pid;
   let beginShutdown!: () => void;
-  const shutdown = new Promise<void>((resolve, reject) => {
+  const shutdownAttempt = new Promise<void>((resolve, reject) => {
     beginShutdown = () => {
       let rootClosed = false;
       let treeTerminationConfirmed = false;
@@ -366,6 +428,43 @@ export function shutdownWindowsProcessTree(
       }
     };
   });
+  const shutdown =
+    options.unverifiedReason === undefined
+      ? shutdownAttempt
+      : shutdownAttempt.catch((error: unknown) => {
+          appendDebugLog("agent-process:cleanup-best-effort", {
+            platform: "win32",
+            pid,
+            trigger: options.unverifiedReason,
+            descendantCleanup: "unverified",
+            error: serializeError(error),
+          });
+          if (child.exitCode === null && child.signalCode === null) {
+            try {
+              child.kill("SIGKILL");
+            } catch (fallbackError) {
+              appendDebugLog("agent-process:cleanup-best-effort-root-error", {
+                platform: "win32",
+                pid,
+                trigger: options.unverifiedReason,
+                error: serializeError(fallbackError),
+              });
+            }
+          }
+          if (child.exitCode !== null || child.signalCode !== null) {
+            return;
+          }
+          return new Promise<void>((resolve) => {
+            const timeout = setTimeout(finish, SHUTDOWN_CONFIRMATION_GRACE_MS);
+            child.once("close", finish);
+
+            function finish(): void {
+              clearTimeout(timeout);
+              child.off("close", finish);
+              resolve();
+            }
+          });
+        });
   activeWindowsTreeShutdowns.set(child, shutdown);
   beginShutdown();
   void shutdown.then(clearActiveShutdown, clearActiveShutdown);
