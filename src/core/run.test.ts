@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 vi.mock("node:fs", () => ({
   mkdirSync: vi.fn(),
@@ -653,9 +653,10 @@ describe("run usage state", () => {
     };
 
     writeRunUsageState({ runDir: "/run" }, usageState);
+    const temporaryPath = mockWriteFileSync.mock.calls[0][0] as string;
 
     expect(mockWriteFileSync).toHaveBeenCalledWith(
-      expect.stringMatching(/^\/run\/\.usage\.json\..+\.tmp$/),
+      temporaryPath,
       `${JSON.stringify(usageState, null, 2)}\n`,
       {
         encoding: "utf-8",
@@ -663,9 +664,11 @@ describe("run usage state", () => {
         mode: 0o600,
       },
     );
+    expect(dirname(temporaryPath)).toBe(join("/run"));
+    expect(basename(temporaryPath)).toMatch(/^\.usage\.json\..+\.tmp$/);
     expect(mockRenameSync).toHaveBeenCalledWith(
-      expect.stringMatching(/^\/run\/\.usage\.json\..+\.tmp$/),
-      "/run/usage.json",
+      temporaryPath,
+      join("/run", "usage.json"),
     );
   });
 });
