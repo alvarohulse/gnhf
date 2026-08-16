@@ -455,12 +455,25 @@ describe("gnhf e2e", () => {
         expect(agentError?.message).toBe(expected);
       }
 
-      // The morning-after trace: notes.md is what the user actually reads.
-      const notes = readFileSync(
-        join(dirname(debugLogPath), "notes.md"),
-        "utf-8",
-      );
-      expect(notes).toContain(`[ERROR] ${agentError?.message}`);
+      if (process.platform === "win32") {
+        const recovery = JSON.parse(
+          readFileSync(
+            join(dirname(debugLogPath), "workspace-recovery.json"),
+            "utf-8",
+          ),
+        ) as unknown;
+        expect(recovery).toEqual({
+          kind: "interrupted",
+          detail: agentError?.message,
+        });
+      } else {
+        // The morning-after trace: notes.md is what the user actually reads.
+        const notes = readFileSync(
+          join(dirname(debugLogPath), "notes.md"),
+          "utf-8",
+        );
+        expect(notes).toContain(`[ERROR] ${expected}`);
+      }
     },
     30_000,
   );

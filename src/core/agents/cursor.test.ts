@@ -48,6 +48,10 @@ function emitJson(proc: ReturnType<typeof createMockProcess>, event: unknown) {
   proc.stdout.emit("data", Buffer.from(`${JSON.stringify(event)}\n`));
 }
 
+function createAgent(): CursorAgent {
+  return new CursorAgent({ platform: "linux" });
+}
+
 function withTemporaryPath(candidates: string[], callback: () => void): void {
   const directory = mkdtempSync(join(tmpdir(), "gnhf-cursor-path-"));
   const originalPath = process.env.PATH;
@@ -76,7 +80,7 @@ describe("CursorAgent", () => {
   });
 
   it("has the cursor agent name", () => {
-    expect(new CursorAgent().name).toBe("cursor");
+    expect(createAgent().name).toBe("cursor");
   });
 
   it.each([
@@ -306,7 +310,7 @@ describe("CursorAgent", () => {
     mockSpawn.mockReturnValue(proc);
     const onMessage = vi.fn();
     const onUsage = vi.fn();
-    const agent = new CursorAgent();
+    const agent = createAgent();
     const draft = JSON.stringify({
       success: true,
       summary: "stale",
@@ -391,7 +395,7 @@ describe("CursorAgent", () => {
       key_changes_made: [],
       key_learnings: [],
     });
-    const promise = new CursorAgent().run("test prompt", "/work/dir");
+    const promise = createAgent().run("test prompt", "/work/dir");
     emitJson(proc, {
       type: "assistant",
       message: { content },
@@ -425,7 +429,7 @@ describe("CursorAgent", () => {
       key_changes_made: [],
       key_learnings: [],
     });
-    const promise = new CursorAgent().run("test prompt", "/work/dir");
+    const promise = createAgent().run("test prompt", "/work/dir");
     emitJson(proc, {
       type: "assistant",
       message: { content },
@@ -457,7 +461,7 @@ describe("CursorAgent", () => {
       key_changes_made: [],
       key_learnings: [],
     });
-    const promise = new CursorAgent().run("test prompt", "/work/dir");
+    const promise = createAgent().run("test prompt", "/work/dir");
     emitJson(proc, {
       type: "result",
       subtype: "success",
@@ -479,7 +483,7 @@ describe("CursorAgent", () => {
   it("rejects stale structured output when the last assistant message is prose", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
     const stale = JSON.stringify({
       success: true,
       summary: "stale",
@@ -516,7 +520,7 @@ describe("CursorAgent", () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
     const onMessage = vi.fn();
-    const agent = new CursorAgent();
+    const agent = createAgent();
     const content = JSON.stringify({
       success: true,
       summary: "ok",
@@ -544,7 +548,7 @@ describe("CursorAgent", () => {
   it("accepts a fenced JSON final answer", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {
@@ -566,7 +570,7 @@ describe("CursorAgent", () => {
   it("recovers JSON when cursor prepends prose before the final object", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {
@@ -602,7 +606,7 @@ describe("CursorAgent", () => {
   it("rejects when cursor returns no text output", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     proc.emit("close", 0);
@@ -613,7 +617,7 @@ describe("CursorAgent", () => {
   it("rejects when the result event reports an error", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {
@@ -630,7 +634,7 @@ describe("CursorAgent", () => {
   it("reports a signed-out cursor exit as permanent so it does not burn retries", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     proc.stderr.emit(
@@ -648,7 +652,7 @@ describe("CursorAgent", () => {
   it("reports a signed-out cursor result event as permanent", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {
@@ -665,7 +669,7 @@ describe("CursorAgent", () => {
   it("keeps an ordinary non-zero exit retryable", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     proc.stderr.emit("data", Buffer.from("upstream provider is overloaded\n"));
@@ -911,7 +915,7 @@ describe("CursorAgent", () => {
   it("rejects when the final answer is not valid JSON", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {
@@ -927,7 +931,7 @@ describe("CursorAgent", () => {
   it("rejects when the final answer misses required fields", async () => {
     const proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
-    const agent = new CursorAgent();
+    const agent = createAgent();
 
     const promise = agent.run("test prompt", "/work/dir");
     emitJson(proc, {

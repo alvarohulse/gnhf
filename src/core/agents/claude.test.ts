@@ -54,7 +54,7 @@ describe("ClaudeAgent", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    agent = new ClaudeAgent();
+    agent = new ClaudeAgent({ platform: "linux" });
   });
 
   it("has name 'claude'", () => {
