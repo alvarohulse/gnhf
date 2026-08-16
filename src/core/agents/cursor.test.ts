@@ -735,7 +735,7 @@ describe("CursorAgent", () => {
     }
   });
 
-  it("starts Windows tree cleanup before a successful target can exit", async () => {
+  it("allows a successful Windows target to exit before tree cleanup", async () => {
     vi.useFakeTimers();
     const proc = createMockProcess();
     Object.defineProperty(proc, "pid", { value: 5678 });
@@ -760,6 +760,14 @@ describe("CursorAgent", () => {
         result: content,
       });
 
+      await vi.advanceTimersByTimeAsync(24);
+      expect(vi.mocked(execFileSync)).not.toHaveBeenCalledWith(
+        "taskkill",
+        expect.any(Array),
+        expect.any(Object),
+      );
+
+      await vi.advanceTimersByTimeAsync(1);
       expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
         "taskkill",
         ["/T", "/F", "/PID", "5678"],
