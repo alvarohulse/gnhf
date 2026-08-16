@@ -539,11 +539,18 @@ describe("startSleepPrevention", () => {
     vi.useFakeTimers();
 
     const child = createChildProcess();
+    let processGroupPresent = true;
     const killProcess: typeof process.kill = vi.fn(
       (pid: number, signal?: string | number) => {
         if (pid === -1234 && signal === "SIGKILL") {
+          processGroupPresent = false;
           queueMicrotask(() => {
             child.emit("close", 0, null);
+          });
+        }
+        if (pid === -1234 && signal === 0 && !processGroupPresent) {
+          throw Object.assign(new Error("process group exited"), {
+            code: "ESRCH",
           });
         }
         return true as const;
