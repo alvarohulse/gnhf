@@ -183,7 +183,7 @@ Pass `--worktree` to run each agent in an isolated [git worktree](https://git-sc
 - Re-running the same prompt with `--worktree` resumes a preserved matching worktree when possible; otherwise gnhf creates a suffixed worktree such as `<run-slug>-1` if the original name is unavailable.
 - Worktrees are removed only when Git verifies that they are clean and have no commits. Committed, dirty, recovery-marked, setup-failed, or uninspectable worktrees are preserved and reported with the path and cleanup command, including during forced shutdown.
 - Before removing a clean zero-commit worktree, gnhf copies its run metadata and logs into `.gnhf/runs/` in the originating checkout without overwriting existing evidence. If that copy cannot complete safely, gnhf preserves the worktree.
-- Add `--preserve-worktree` to keep the worktree and its local run or setup-failure evidence on every exit path, including a zero-commit run. This flag requires `--worktree`; gnhf prints and records the retained path.
+- Add `--preserve-worktree` to keep the worktree and all local run and setup-failure evidence on every exit path, including a zero-commit run. This flag requires `--worktree`; gnhf prints and records the retained path.
 - `--worktree` must be run from a non-gnhf branch (typically `main`).
 
 ## CLI Reference
