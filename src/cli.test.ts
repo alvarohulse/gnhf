@@ -1454,7 +1454,7 @@ describe("cli", () => {
       baseCommit: "abc123",
       state: "pending",
       worktreePath: expect.stringMatching(
-        /^\/repo-gnhf-worktrees\/ship-it-[0-9a-f]+$/,
+        /^[/\\]repo-gnhf-worktrees[/\\]ship-it-[0-9a-f]+$/,
       ),
     });
     expect(
@@ -1466,7 +1466,7 @@ describe("cli", () => {
       receiptId: "receipt-1",
       state: "created",
       worktreePath: expect.stringMatching(
-        /^\/repo-gnhf-worktrees\/ship-it-[0-9a-f]+$/,
+        /^[/\\]repo-gnhf-worktrees[/\\]ship-it-[0-9a-f]+$/,
       ),
     });
     expect(

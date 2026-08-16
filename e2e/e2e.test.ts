@@ -3,6 +3,7 @@ import {
   chmodSync,
   existsSync,
   mkdtempSync,
+  realpathSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -49,7 +50,7 @@ function git(args: string[], cwd: string): string {
 }
 
 function createRepo(): string {
-  const cwd = mkdtempSync(join(tmpdir(), "gnhf-e2e-"));
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gnhf-e2e-")));
   git(["init", "-b", "main"], cwd);
   git(["config", "user.name", "gnhf tests"], cwd);
   git(["config", "user.email", "tests@example.com"], cwd);
